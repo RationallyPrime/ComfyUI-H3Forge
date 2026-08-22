@@ -6,7 +6,8 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
 3. **Synchronized audio/video context windows** with overlap-add blending and absolute H3 RoPE preservation.
 4. **Pipe-delimited timeline prompting** with independently encoded, equal-time prompt segments.
-5. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
+5. **Reference-aware pipe prompting** that reuses ComfyUI's native Ref2VA encoder for every segment.
+6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
@@ -72,6 +73,12 @@ Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 
 
 Every segment is encoded independently. Write each segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`), and repeat concrete identity, wardrobe, location, lighting, voice, and style anchors inside every segment. Do not use cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; those words refer to context the segment encoder cannot see. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.
 
+### H3 Forge — Reference Pipe Timeline Prompt
+
+This is the image-reference counterpart to the text-only pipe node. It splits on `|`, invokes ComfyUI's native `MiniMaxH3ReferenceToVideo` encoder independently for every self-contained segment with the same one-to-four reference images, validates that their multimodal token-tag structure matches, and returns both the combined positive conditioning and native AV latent. The first segment's identical native reference payload supplies the global reference prefix; every local context window receives the complete reference-aware Qwen encoding selected for its midpoint.
+
+Use full Ref2VA prompt grammar inside **every** segment (`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`) and keep reference labels and subject definitions identical. This node intentionally does not expose reference video or reference audio inputs yet; use the native node directly when those modalities matter.
+
 ### H3 Forge — Normalized Attention Guidance (experimental)
 
 H3's released checkpoints are guidance-distilled: a normal `BasicGuider` workflow already runs one forward per step and pays no CFG cost, but negative prompts do nothing at CFG 1. This node restores meaningful negative-prompt control **without a second complete H3 transformer pass**.
@@ -112,14 +119,15 @@ git clone https://github.com/RationallyPrime/ComfyUI-H3Forge.git
 
 or place the extracted `ComfyUI-H3Forge/` directory there, then restart ComfyUI.
 
-Four nodes should appear:
+Five nodes should appear:
 
 - `H3 Forge — Sliding Attention + FETA`
 - `H3 Forge — Chained A/V Context Windows`
 - `H3 Forge — Pipe Timeline Prompt`
+- `H3 Forge — Reference Pipe Timeline Prompt`
 - `H3 Forge — Normalized Attention Guidance` (experimental)
 
-The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The pipe-timeline node accepts MiniMax's `CLIP` and returns the positive `CONDITIONING` used by the guider; the NAG node additionally takes the negative `CONDITIONING`.
+The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the video/audio VAEs and one-to-four images, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
 
 ## First Blackwell bring-up
 

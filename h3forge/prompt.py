@@ -119,13 +119,16 @@ def make_segmented_extra_conds(
     return extra_conds
 
 
-def encode_pipe_prompt(clip, prompt: str):
-    """Encode each pipe segment independently and return one annotated conditioning."""
-    texts = split_pipe_prompt(prompt)
+def combine_conditioning_segments(conditionings: Sequence):
+    """Combine independently encoded MiniMax conditionings into one timeline.
+
+    Each input may already contain native reference-aware Qwen context and DiT
+    payload metadata. The first entry supplies the shared payload while every
+    padded context remains available for per-window selection.
+    """
     encoded = []
     metadata = []
-    for text in texts:
-        conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(text))
+    for conditioning in conditionings:
         if len(conditioning) != 1:
             raise ValueError("pipe prompt segments must each encode to one conditioning entry")
         encoded.append(conditioning[0][0])
@@ -155,3 +158,13 @@ def encode_pipe_prompt(clip, prompt: str):
     primary_meta["h3forge_prompt_segments"] = tuple(padded)
     primary_meta["h3forge_prompt_segment_count"] = len(padded)
     return [[padded[0], primary_meta]]
+
+
+def encode_pipe_prompt(clip, prompt: str):
+    """Encode each text-only pipe segment and return one annotated conditioning."""
+    texts = split_pipe_prompt(prompt)
+    conditionings = [
+        clip.encode_from_tokens_scheduled(clip.tokenize(text))
+        for text in texts
+    ]
+    return combine_conditioning_segments(conditionings)

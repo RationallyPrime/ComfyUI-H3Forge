@@ -4,6 +4,7 @@ import torch
 from h3forge.context import assert_full_coverage, audio_overlap_frames, blend_weights, window_starts
 from h3forge.layout import expand_audio_range, padded_spatial_shape
 from h3forge.prompt import (
+    combine_conditioning_segments,
     encode_pipe_prompt,
     make_segmented_extra_conds,
     pad_segment_contexts,
@@ -151,6 +152,25 @@ def test_pipe_segments_are_encoded_independently_and_annotated():
     assert metadata["h3forge_prompt_segment_count"] == 2
     assert [tuple(x.shape) for x in metadata["h3forge_prompt_segments"]] == [(1, 4, 2), (1, 4, 2)]
     assert torch.equal(metadata["minimax_token_tags"], torch.ones(4, dtype=torch.long))
+
+
+def test_reference_conditioning_segments_retain_shared_native_payload():
+    reference = {"kind": "image", "latent": torch.ones(1, 2, 3)}
+    first = [[
+        torch.ones(1, 2, 4),
+        {"minimax_token_tags": torch.tensor([2, 1]), "minimax_refs": [reference]},
+    ]]
+    second = [[
+        torch.full((1, 4, 4), 2.0),
+        {"minimax_token_tags": torch.tensor([2, 1, 1, 1]), "minimax_refs": [reference]},
+    ]]
+
+    combined = combine_conditioning_segments([first, second])
+    context, metadata = combined[0]
+    assert tuple(context.shape) == (1, 4, 4)
+    assert metadata["minimax_refs"] is first[0][1]["minimax_refs"]
+    assert metadata["h3forge_prompt_segment_count"] == 2
+    assert torch.equal(metadata["h3forge_prompt_segments"][1], second[0][0])
 
 
 def test_pipe_prompt_rejects_divergent_token_tags():

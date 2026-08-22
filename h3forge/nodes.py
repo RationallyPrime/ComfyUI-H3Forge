@@ -6,7 +6,12 @@ from .attention import LOG, make_attention_override
 from .context import ContextPolicy, make_context_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
-from .prompt import encode_pipe_prompt, make_segmented_extra_conds
+from .prompt import (
+    combine_conditioning_segments,
+    encode_pipe_prompt,
+    make_segmented_extra_conds,
+    split_pipe_prompt,
+)
 from .state import AttentionPolicy, RuntimeState, resolve_sigma, resolve_step
 
 ATTN_KEY = "h3forge_attention"
@@ -292,15 +297,91 @@ class H3ForgePipePrompt:
             raise ValueError(f"{LOG} {exc}") from exc
 
 
+class H3ForgeReferencePipePrompt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "ref_image_1": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "width": ("INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 16384, "step": 32}),
+                "length": ("INT", {"default": 124, "min": 5, "max": 3600, "step": 17}),
+                "ref_image_size": (["match", "max"], {"default": "match"}),
+            },
+            "optional": {
+                "ref_image_2": ("IMAGE",),
+                "ref_image_3": ("IMAGE",),
+                "ref_image_4": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "LATENT")
+    FUNCTION = "encode"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Encode | separated MiniMax-H3 Ref2VA prompts independently with the same one-to-four "
+        "reference images. Returns native reference conditioning plus the H3 AV latent for use "
+        "with H3Forge context windows. Reference video/audio inputs are not supported by this node."
+    )
+
+    def encode(self, clip, vae, audio_vae, ref_image_1, prompt, width, height, length,
+               ref_image_size, ref_image_2=None, ref_image_3=None, ref_image_4=None):
+        texts = split_pipe_prompt(prompt)
+        if len(texts) < 2:
+            raise ValueError(f"{LOG} reference pipe prompt requires at least two | separated segments")
+        if len(texts) > 8:
+            raise ValueError(f"{LOG} reference pipe prompt supports at most eight segments")
+
+        try:
+            from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+        except Exception as exc:
+            raise RuntimeError(f"{LOG} native MiniMaxH3ReferenceToVideo is required") from exc
+
+        images = [ref_image_1, ref_image_2, ref_image_3, ref_image_4]
+        ref_images = {
+            f"ref_image_{index}": image
+            for index, image in enumerate(image for image in images if image is not None)
+        }
+        conditionings = []
+        latent = None
+        for text in texts:
+            result = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                prompt=text,
+                width=width,
+                height=height,
+                length=length,
+                ref_image_size=ref_image_size,
+                ref_images=ref_images,
+            )
+            conditionings.append(result[0])
+            if latent is None:
+                latent = result[1]
+
+        try:
+            return combine_conditioning_segments(conditionings), latent
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
     "H3ForgePipePrompt": H3ForgePipePrompt,
+    "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
+    "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
 }

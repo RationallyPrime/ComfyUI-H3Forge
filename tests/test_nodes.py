@@ -181,3 +181,37 @@ def test_bound_forward_wrapper_survives_runtime_option_reconstruction(monkeypatc
 
     assert run(with_both) == ("flex_sliding", True)
     assert run(nag_only) == ("dense", True)
+
+
+def test_reference_pipe_node_reuses_native_ref2va_for_each_segment(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+    core = types.ModuleType("comfy_extras.nodes_minimax_h3")
+    calls = []
+
+    class MiniMaxH3ReferenceToVideo:
+        @classmethod
+        def execute(cls, **kwargs):
+            calls.append(kwargs)
+            token_count = len(kwargs["prompt"].split())
+            context = torch.full((1, token_count, 3), float(token_count))
+            tags = torch.ones(token_count, dtype=torch.long)
+            metadata = {"minimax_token_tags": tags, "minimax_refs": ["shared-ref"]}
+            return [[context, metadata]], {"samples": "native-latent"}
+
+    core.MiniMaxH3ReferenceToVideo = MiniMaxH3ReferenceToVideo
+    comfy_extras = types.ModuleType("comfy_extras")
+    comfy_extras.nodes_minimax_h3 = core
+    monkeypatch.setitem(sys.modules, "comfy_extras", comfy_extras)
+    monkeypatch.setitem(sys.modules, "comfy_extras.nodes_minimax_h3", core)
+
+    image = object()
+    conditioning, latent = nodes.H3ForgeReferencePipePrompt().encode(
+        clip=object(), vae=object(), audio_vae=object(), ref_image_1=image,
+        prompt="short segment | a deliberately longer segment",
+        width=864, height=480, length=124, ref_image_size="match",
+    )
+
+    assert len(calls) == 2
+    assert all(call["ref_images"] == {"ref_image_0": image} for call in calls)
+    assert conditioning[0][1]["h3forge_prompt_segment_count"] == 2
+    assert latent == {"samples": "native-latent"}
