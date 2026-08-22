@@ -61,6 +61,11 @@ def _video_cumulative_time(frame_idx):
     return (cycle * 17 + prefix).to(torch.float32) * (5.0 / 3.0)
 
 
+def _runtime_int(value: int, *, device):
+    """Capture a changing mask scalar as data, not a Dynamo guard value."""
+    return torch.tensor(int(value), dtype=torch.int64, device=device)
+
+
 def _make_block_mask(state, q, *, device):
     from torch.nn.attention.flex_attention import create_block_mask
 
@@ -88,12 +93,19 @@ def _make_block_mask(state, q, *, device):
     video_start, video_stop = seg.video_start, seg.video_stop
     audio_t = int(audio_t)
     frame_rows = int(frame_rows)
+    # Context staggering changes absolute offsets while preserving the compiled
+    # window shape. Python integer closures make Dynamo specialize flex_attention
+    # once per offset and eventually fall back to its eager S^2 implementation.
+    # Tensor captures are runtime data, so offset values can change without a
+    # kernel recompile while each concrete BlockMask remains separately cached.
+    video_offset_runtime = _runtime_int(video_offset, device=device)
+    audio_offset_runtime = _runtime_int(audio_offset, device=device)
 
     def token_time(idx):
         in_audio = (idx >= audio_start) & (idx < audio_stop)
         in_video = (idx >= video_start) & (idx < video_stop)
-        audio_rel = torch.remainder(idx - audio_start, audio_t) + audio_offset
-        video_frame = torch.div(idx - video_start, frame_rows, rounding_mode="floor") + video_offset
+        audio_rel = torch.remainder(idx - audio_start, audio_t) + audio_offset_runtime
+        video_frame = torch.div(idx - video_start, frame_rows, rounding_mode="floor") + video_offset_runtime
         video_t = _video_cumulative_time(video_frame)
         return torch.where(in_audio, audio_rel, torch.where(in_video, video_t, torch.zeros_like(idx)))
 
@@ -144,7 +156,10 @@ def _run_flex(state, q, k, v):
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Compile once so
     # CUDA uses the fused block-sparse kernel instead of materializing S².
     if _COMPILED_FLEX is None:
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
+        # Window lengths and captured offset tensors may vary across context
+        # configurations. Compile dynamically so those supported variations do
+        # not exhaust Dynamo's per-code-object recompilation budget.
+        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=True)
     mask = _make_block_mask(state, q, device=q.device)
     return _COMPILED_FLEX(q, k, v, block_mask=mask)
 
