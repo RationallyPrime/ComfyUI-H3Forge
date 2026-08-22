@@ -42,6 +42,9 @@ class FakePatcher:
     def add_wrapper_with_key(self, kind, key, wrapper):
         self.wrappers.append((kind, key, wrapper))
 
+    def remove_wrappers_with_key(self, kind, key):
+        self.wrappers = [entry for entry in self.wrappers if entry[:2] != (kind, key)]
+
     def set_model_patch_replace(self, fn, *keys):
         self.replacements[keys] = fn
 
@@ -133,3 +136,48 @@ def test_forward_wrapper_resolves_config_from_the_sampled_clone(monkeypatch):
     # ComfyUI reused a cached upstream output) must not inherit stale NAG state.
     plain = {key: value for key, value in both_opts.items() if key != nodes.NAG_KEY}
     assert run(plain) == ("flex_sliding", False)
+
+
+def test_bound_forward_wrapper_survives_runtime_option_reconstruction(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+
+    class MiniMaxH3Model:
+        def __init__(self):
+            self.blocks = [object()] * 4
+
+    model = FakePatcher()
+    model.model = SimpleNamespace(diffusion_model=MiniMaxH3Model())
+
+    negative = [[torch.zeros(1, 5, 8), {}]]
+    (nag_only,) = nodes.H3ForgeNAG().patch(
+        model, negative, "lite", 3.0, 2.5, 0.15, 0.70, 8, 28, 1.0, 0.5, False)
+    (with_both,) = nodes.H3ForgeAttention().patch(
+        nag_only, "flex_sliding", 40.0, 8.0, 40, 2, 0.15,
+        False, 2.0, 1.15, 6, 42, False)
+
+    state = with_both.model_options["transformer_options"][nodes.STATE_GETTER]()
+    layout = object()
+
+    def run(patcher):
+        wrappers = [
+            wrapper for kind, key, wrapper in patcher.wrappers
+            if kind == "diffusion" and key == nodes.ATTN_KEY
+        ]
+        assert len(wrappers) == 1
+
+        def executor(x, timestep, context, transformer_options, **kwargs):
+            return state.policy.mode, state.nag is not None
+
+        # Mirrors ComfyUI's conditioned runtime path: machinery such as the
+        # wrapper survives, while arbitrary H3Forge config keys may be absent.
+        return wrappers[0](
+            executor,
+            [None, None],
+            None,
+            None,
+            {},
+            minimax_payload={"layout": layout},
+        )
+
+    assert run(with_both) == ("flex_sliding", True)
+    assert run(nag_only) == ("dense", True)
