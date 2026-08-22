@@ -6,7 +6,12 @@ from .attention import LOG, make_attention_override
 from .context import ContextPolicy, make_context_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
-from .prompt import encode_pipe_prompt, make_segmented_extra_conds
+from .prompt import (
+    combine_conditioning_segments,
+    encode_pipe_prompt,
+    make_segmented_extra_conds,
+    split_pipe_prompt,
+)
 from .state import AttentionPolicy, RuntimeState, resolve_sigma, resolve_step
 
 ATTN_KEY = "h3forge_attention"
@@ -37,6 +42,8 @@ def _acquire_runtime(model, diffusion):
     patched = model.clone()
     opts = patched.model_options.setdefault("transformer_options", {})
     if opts.get(STATE_GETTER) is not None:
+        state = opts[STATE_GETTER]()
+        _bind_forward_config(patched, state, opts)
         return patched, opts
 
     state = RuntimeState(AttentionPolicy(mode="dense", feta_enabled=False))
@@ -52,10 +59,29 @@ def _acquire_runtime(model, diffusion):
     opts["optimized_attention_override"] = make_attention_override(state)
     opts[STATE_GETTER] = lambda: state
     patched.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, ATTN_KEY, _run_wrapper(state))
-    patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, ATTN_KEY, _forward_wrapper(state))
+    _bind_forward_config(patched, state, opts)
     for i in range(len(diffusion.blocks)):
         patched.set_model_patch_replace(_stamp_block(state, i), "dit", "double_block", i)
     return patched, opts
+
+
+def _bind_forward_config(patched, state, configured_options):
+    """Bind one model clone's H3Forge configuration to its forward wrapper.
+
+    ComfyUI reconstructs the transformer-options dictionary for conditioned
+    model calls. Wrappers and attention overrides are explicitly propagated,
+    but arbitrary custom keys are not guaranteed to survive that path. Capture
+    this clone's options in the wrapper that ComfyUI does preserve, and replace
+    the inherited binding whenever another H3Forge config node creates a new
+    branch. This keeps sibling branches isolated without depending on runtime
+    option passthrough.
+    """
+    patched.remove_wrappers_with_key(WrappersMP.DIFFUSION_MODEL, ATTN_KEY)
+    patched.add_wrapper_with_key(
+        WrappersMP.DIFFUSION_MODEL,
+        ATTN_KEY,
+        _forward_wrapper(state, configured_options),
+    )
 
 
 class H3ForgeAttention:
@@ -172,14 +198,15 @@ def _run_wrapper(state):
     return wrapper
 
 
-def _forward_wrapper(state):
+def _forward_wrapper(state, configured_options=None):
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
-        # Configuration lives in this model clone's transformer_options and is
-        # resolved here on every forward: a sibling branch or a cached upstream
-        # output without the attention/NAG key must run with the dense default /
-        # without NAG, not with whatever a later node wrote into shared state.
-        state.policy = transformer_options.get(POLICY_KEY, state.default_policy or state.policy)
-        state.nag = transformer_options.get(NAG_KEY)
+        # Resolve configuration from the model clone whose wrapper ComfyUI
+        # preserved. Fall back to runtime options for direct/unit-test callers.
+        # A sibling branch therefore cannot inherit whatever another branch
+        # most recently wrote into the shared runtime state.
+        config = configured_options if configured_options is not None else transformer_options
+        state.policy = config.get(POLICY_KEY, state.default_policy or state.policy)
+        state.nag = config.get(NAG_KEY)
         # The token refiner can call optimized_attention before the first stamped
         # DiT block. Never let the previous forward's final block index make that
         # call look like block 49 (which can incorrectly activate FETA).
@@ -273,15 +300,91 @@ class H3ForgePipePrompt:
             raise ValueError(f"{LOG} {exc}") from exc
 
 
+class H3ForgeReferencePipePrompt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "ref_image_1": ("IMAGE",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+                "width": ("INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 32, "max": 16384, "step": 32}),
+                "length": ("INT", {"default": 124, "min": 5, "max": 3600, "step": 17}),
+                "ref_image_size": (["match", "max"], {"default": "match"}),
+            },
+            "optional": {
+                "ref_image_2": ("IMAGE",),
+                "ref_image_3": ("IMAGE",),
+                "ref_image_4": ("IMAGE",),
+            },
+        }
+
+    RETURN_TYPES = ("CONDITIONING", "LATENT")
+    RETURN_NAMES = ("positive", "LATENT")
+    FUNCTION = "encode"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Encode | separated MiniMax-H3 Ref2VA prompts independently with the same one-to-four "
+        "reference images. Returns native reference conditioning plus the H3 AV latent for use "
+        "with H3Forge context windows. Reference video/audio inputs are not supported by this node."
+    )
+
+    def encode(self, clip, vae, audio_vae, ref_image_1, prompt, width, height, length,
+               ref_image_size, ref_image_2=None, ref_image_3=None, ref_image_4=None):
+        texts = split_pipe_prompt(prompt)
+        if len(texts) < 2:
+            raise ValueError(f"{LOG} reference pipe prompt requires at least two | separated segments")
+        if len(texts) > 8:
+            raise ValueError(f"{LOG} reference pipe prompt supports at most eight segments")
+
+        try:
+            from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+        except Exception as exc:
+            raise RuntimeError(f"{LOG} native MiniMaxH3ReferenceToVideo is required") from exc
+
+        images = [ref_image_1, ref_image_2, ref_image_3, ref_image_4]
+        ref_images = {
+            f"ref_image_{index}": image
+            for index, image in enumerate(image for image in images if image is not None)
+        }
+        conditionings = []
+        latent = None
+        for text in texts:
+            result = MiniMaxH3ReferenceToVideo.execute(
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                prompt=text,
+                width=width,
+                height=height,
+                length=length,
+                ref_image_size=ref_image_size,
+                ref_images=ref_images,
+            )
+            conditionings.append(result[0])
+            if latent is None:
+                latent = result[1]
+
+        try:
+            return combine_conditioning_segments(conditionings), latent
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
     "H3ForgePipePrompt": H3ForgePipePrompt,
+    "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
+    "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
 }

@@ -42,6 +42,9 @@ class FakePatcher:
     def add_wrapper_with_key(self, kind, key, wrapper):
         self.wrappers.append((kind, key, wrapper))
 
+    def remove_wrappers_with_key(self, kind, key):
+        self.wrappers = [entry for entry in self.wrappers if entry[:2] != (kind, key)]
+
     def set_model_patch_replace(self, fn, *keys):
         self.replacements[keys] = fn
 
@@ -133,3 +136,82 @@ def test_forward_wrapper_resolves_config_from_the_sampled_clone(monkeypatch):
     # ComfyUI reused a cached upstream output) must not inherit stale NAG state.
     plain = {key: value for key, value in both_opts.items() if key != nodes.NAG_KEY}
     assert run(plain) == ("flex_sliding", False)
+
+
+def test_bound_forward_wrapper_survives_runtime_option_reconstruction(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+
+    class MiniMaxH3Model:
+        def __init__(self):
+            self.blocks = [object()] * 4
+
+    model = FakePatcher()
+    model.model = SimpleNamespace(diffusion_model=MiniMaxH3Model())
+
+    negative = [[torch.zeros(1, 5, 8), {}]]
+    (nag_only,) = nodes.H3ForgeNAG().patch(
+        model, negative, "lite", 3.0, 2.5, 0.15, 0.70, 8, 28, 1.0, 0.5, False)
+    (with_both,) = nodes.H3ForgeAttention().patch(
+        nag_only, "flex_sliding", 40.0, 8.0, 40, 2, 0.15,
+        False, 2.0, 1.15, 6, 42, False)
+
+    state = with_both.model_options["transformer_options"][nodes.STATE_GETTER]()
+    layout = object()
+
+    def run(patcher):
+        wrappers = [
+            wrapper for kind, key, wrapper in patcher.wrappers
+            if kind == "diffusion" and key == nodes.ATTN_KEY
+        ]
+        assert len(wrappers) == 1
+
+        def executor(x, timestep, context, transformer_options, **kwargs):
+            return state.policy.mode, state.nag is not None
+
+        # Mirrors ComfyUI's conditioned runtime path: machinery such as the
+        # wrapper survives, while arbitrary H3Forge config keys may be absent.
+        return wrappers[0](
+            executor,
+            [None, None],
+            None,
+            None,
+            {},
+            minimax_payload={"layout": layout},
+        )
+
+    assert run(with_both) == ("flex_sliding", True)
+    assert run(nag_only) == ("dense", True)
+
+
+def test_reference_pipe_node_reuses_native_ref2va_for_each_segment(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+    core = types.ModuleType("comfy_extras.nodes_minimax_h3")
+    calls = []
+
+    class MiniMaxH3ReferenceToVideo:
+        @classmethod
+        def execute(cls, **kwargs):
+            calls.append(kwargs)
+            token_count = len(kwargs["prompt"].split())
+            context = torch.full((1, token_count, 3), float(token_count))
+            tags = torch.ones(token_count, dtype=torch.long)
+            metadata = {"minimax_token_tags": tags, "minimax_refs": ["shared-ref"]}
+            return [[context, metadata]], {"samples": "native-latent"}
+
+    core.MiniMaxH3ReferenceToVideo = MiniMaxH3ReferenceToVideo
+    comfy_extras = types.ModuleType("comfy_extras")
+    comfy_extras.nodes_minimax_h3 = core
+    monkeypatch.setitem(sys.modules, "comfy_extras", comfy_extras)
+    monkeypatch.setitem(sys.modules, "comfy_extras.nodes_minimax_h3", core)
+
+    image = object()
+    conditioning, latent = nodes.H3ForgeReferencePipePrompt().encode(
+        clip=object(), vae=object(), audio_vae=object(), ref_image_1=image,
+        prompt="short segment | a deliberately longer segment",
+        width=864, height=480, length=124, ref_image_size="match",
+    )
+
+    assert len(calls) == 2
+    assert all(call["ref_images"] == {"ref_image_0": image} for call in calls)
+    assert conditioning[0][1]["h3forge_prompt_segment_count"] == 2
+    assert latent == {"samples": "native-latent"}
