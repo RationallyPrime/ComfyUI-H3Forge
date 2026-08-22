@@ -5,6 +5,7 @@ from comfy.patcher_extension import WrappersMP
 from .attention import LOG, make_attention_override
 from .context import ContextPolicy, make_context_wrapper
 from .layout import padded_spatial_shape
+from .prompt import encode_pipe_prompt, make_segmented_extra_conds
 from .state import AttentionPolicy, RuntimeState, resolve_step
 
 ATTN_KEY = "h3forge_attention"
@@ -59,7 +60,11 @@ class H3ForgeAttention:
         patched = model.clone()
         opts = patched.model_options.setdefault("transformer_options", {})
         if "optimized_attention_override" in opts:
-            print(f"{LOG} replacing an existing optimized_attention_override; do not stack SolAttnH3 with H3ForgeAttention", flush=True)
+            print(
+                f"{LOG} replacing an existing optimized_attention_override; "
+                "do not stack SolAttnH3 with H3ForgeAttention",
+                flush=True,
+            )
         opts["optimized_attention_override"] = make_attention_override(state)
         patched.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, ATTN_KEY, _run_wrapper(state))
         patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, ATTN_KEY, _forward_wrapper(state))
@@ -141,21 +146,52 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend, strict):
-        _require_h3(model)
+        diffusion = _require_h3(model)
         if overlap_frames >= window_frames:
             raise ValueError("overlap_frames must be smaller than window_frames")
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend, strict=strict)
         patched = model.clone()
+        base_model = patched.model
+        base_extra_conds = patched.get_model_object("extra_conds")
+        patched.add_object_patch(
+            "extra_conds",
+            make_segmented_extra_conds(base_extra_conds, base_model, diffusion),
+        )
         patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
         return (patched,)
+
+
+class H3ForgePipePrompt:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "clip": ("CLIP",),
+            "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+        }}
+
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "encode"
+    CATEGORY = "conditioning/minimax"
+    DESCRIPTION = (
+        "Encode | separated MiniMax-H3 prompts independently and map them in equal time spans "
+        "through H3Forge context windows. Escape a literal pipe as \\|."
+    )
+
+    def encode(self, clip, prompt):
+        try:
+            return (encode_pipe_prompt(clip, prompt),)
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
 
 
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
+    "H3ForgePipePrompt": H3ForgePipePrompt,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
+    "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
 }

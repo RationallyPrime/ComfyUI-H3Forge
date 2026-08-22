@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+
 import torch
 
 from .layout import audio_range_for_video_window, clone_window_layout, expand_audio_range, padded_spatial_shape
+from .prompt import blend_segment_contexts, segment_overlap_weights
 from .state import resolve_step
 
 LOG = "[H3Forge]"
@@ -71,13 +73,15 @@ def make_context_wrapper(policy: ContextPolicy):
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         payload = dict(kwargs.get("minimax_payload") or {})
+        prompt_segments = payload.get("h3forge_prompt_segments")
         full_layout = payload.get("layout")
         try:
             if full_layout is None:
                 from comfy.ldm.minimax.model import PackedLayout
                 model = executor.class_obj
                 full_layout = PackedLayout(context.shape[1], video_x.shape[2], video_x.shape[3], video_x.shape[4],
-                                           audio_x.shape[-1], keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+                                           audio_x.shape[-1], keyframes=payload.get("keyframes"),
+                                           refs=payload.get("refs"))
 
             step, _ = resolve_step(transformer_options)
             stride = policy.window_frames - policy.overlap_frames
@@ -96,6 +100,13 @@ def make_context_wrapper(policy: ContextPolicy):
             model = executor.class_obj
             padded_h, padded_w = padded_spatial_shape(video_x.shape[3], video_x.shape[4], model.patch_size)
 
+            if prompt_segments and not transformer_options.get("h3forge_pipe_prompt_announced", False):
+                print(
+                    f"{LOG} pipe prompt segments={len(prompt_segments)} mapped across {total_t} video latents",
+                    flush=True,
+                )
+                transformer_options["h3forge_pipe_prompt_announced"] = True
+
             video_acc = torch.zeros_like(video_x)
             video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
             audio_acc = torch.zeros_like(audio_x)
@@ -103,9 +114,13 @@ def make_context_wrapper(policy: ContextPolicy):
 
             for v0, (a0, a1) in zip(starts, audio_ranges):
                 v1 = min(v0 + policy.window_frames, total_t)
+                local_context = context
+                if prompt_segments:
+                    weights = segment_overlap_weights(v0, v1, total_t, len(prompt_segments))
+                    local_context = blend_segment_contexts(prompt_segments, weights)
                 local_layout = clone_window_layout(
                     full_layout=full_layout,
-                    text_len=context.shape[1],
+                    text_len=local_context.shape[1],
                     # MiniMax pads before validating payload["layout"]. Build the
                     # transplanted layout from those post-pad H/W dimensions so
                     # upstream cannot silently discard it on odd latent shapes.
@@ -127,7 +142,7 @@ def make_context_wrapper(policy: ContextPolicy):
                 previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
                 transformer_options["h3forge_active_layout"] = local_layout
                 try:
-                    v_out, a_out = executor(local_x, timestep, context, transformer_options, **local_kwargs)
+                    v_out, a_out = executor(local_x, timestep, local_context, transformer_options, **local_kwargs)
                 finally:
                     if previous_layout is sentinel:
                         transformer_options.pop("h3forge_active_layout", None)
@@ -153,7 +168,10 @@ def make_context_wrapper(policy: ContextPolicy):
         except Exception as exc:
             if policy.strict:
                 raise RuntimeError(f"{LOG} context windowing failed: {type(exc).__name__}: {exc}") from exc
-            print(f"{LOG} context windowing declined ({type(exc).__name__}: {exc}); dense full-context forward", flush=True)
+            print(
+                f"{LOG} context windowing declined ({type(exc).__name__}: {exc}); dense full-context forward",
+                flush=True,
+            )
             return executor(x, timestep, context, transformer_options, **kwargs)
 
     return wrapper

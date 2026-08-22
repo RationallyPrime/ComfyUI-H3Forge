@@ -10,6 +10,7 @@
 ./h3forge/context.py
 ./h3forge/layout.py
 ./h3forge/nodes.py
+./h3forge/prompt.py
 ./h3forge/state.py
 ./pyproject.toml
 ./tests/test_attention_math.py

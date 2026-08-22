@@ -2,6 +2,8 @@
 
 Use the same seed, prompt, input conditioning, resolution, frame count, sampler, steps, CFG/guidance, and model files for every row.
 
+For pipe-timeline tests, keep the exact segment count and delimiter placement fixed. Each segment is an independent encoding and occupies an equal portion of the target video timeline.
+
 | ID | Sparse | FETA | Context | Purpose |
 |---|---|---|---|---|
 | B0 | off | off | off | Native baseline |

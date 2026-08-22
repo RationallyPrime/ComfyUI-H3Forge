@@ -5,6 +5,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 1. **H3-native sliding/radial sparse attention** using PyTorch FlexAttention.
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
 3. **Synchronized audio/video context windows** with overlap-add blending and absolute H3 RoPE preservation.
+4. **Pipe-delimited timeline prompting** with independently encoded, equal-time prompt segments.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
@@ -56,6 +57,16 @@ For every denoising step it:
 
 That absolute-position transplant is important: a context window beginning at latent frame 26 must not pretend it begins at H3 frame zero and restart the `1,4,4,4,4` RoPE cadence.
 
+### H3 Forge — Pipe Timeline Prompt
+
+This node splits a prompt on `|`, encodes every segment independently with MiniMax's Qwen3-VL text encoder, and maps the segments in order across equal portions of the target timeline. It is not a decorative delimiter passed to one global text encoding.
+
+All segment embeddings are padded to one token length before sampling, preserving one compiled H3 context shape. Each synchronized A/V context window receives the weighted mixture of the prompt segments that physically overlap it, so a window crossing a prompt boundary blends the two contexts instead of imposing a hard latent seam.
+
+Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 AV Latent`. A single segment is valid and behaves like ordinary global conditioning. Escape a literal pipe as `\|`.
+
+Every segment is encoded independently. Repeat concrete identity, wardrobe, location, lighting, and style anchors inside every segment. Do not use cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; those words refer to context the segment encoder cannot see.
+
 ## Requirements
 
 - A recent native ComfyUI build with `MiniMaxH3Model` and `PackedLayout` under `comfy.ldm.minimax.model`.
@@ -76,12 +87,13 @@ git clone https://github.com/RationallyPrime/ComfyUI-H3Forge.git
 
 or place the extracted `ComfyUI-H3Forge/` directory there, then restart ComfyUI.
 
-Two nodes should appear:
+Three nodes should appear:
 
 - `H3 Forge — Sliding Attention + FETA`
 - `H3 Forge — Chained A/V Context Windows`
+- `H3 Forge — Pipe Timeline Prompt`
 
-They accept and return `MODEL`, so insert them after the H3 model loader and before sampling. They can be wired in either order.
+The attention and context nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in either order. The pipe-timeline node accepts MiniMax's `CLIP` and returns the positive `CONDITIONING` used by the guider.
 
 ## First Blackwell bring-up
 
