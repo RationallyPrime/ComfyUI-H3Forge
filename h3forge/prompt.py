@@ -60,36 +60,32 @@ def pad_text_tags(tags: torch.Tensor | None, tokens: int) -> torch.Tensor:
     return F.pad(tags, (0, tokens - tags.shape[0]), value=1)
 
 
-def segment_overlap_weights(v0: int, v1: int, total: int, count: int) -> list[float]:
-    """Return normalized equal-timeline overlap weights for one context window."""
+def select_segment_index(v0: int, v1: int, total: int, count: int) -> int:
+    """Pick the prompt segment whose equal-time span contains the window midpoint.
+
+    Contextualized hidden states from independently encoded prompts do not
+    share a common token basis, so a boundary window uses the one segment that
+    dominates it; adjacent windows generated under different prompts crossfade
+    in output space through the context-window overlap-add blend instead.
+    """
     if count < 1:
         raise ValueError("segment count must be positive")
     if not (0 <= v0 < v1 <= total):
         raise ValueError(f"invalid window [{v0}, {v1}) for total {total}")
-
-    weights = []
-    for index in range(count):
-        start = total * index / count
-        stop = total * (index + 1) / count
-        weights.append(max(0.0, min(float(v1), stop) - max(float(v0), start)))
-    denominator = sum(weights)
-    if denominator <= 0.0:
-        midpoint = (v0 + v1) * 0.5
-        selected = min(int(midpoint * count / total), count - 1)
-        return [1.0 if index == selected else 0.0 for index in range(count)]
-    return [weight / denominator for weight in weights]
+    midpoint = (v0 + v1) / 2.0
+    return min(int(midpoint * count / total), count - 1)
 
 
-def blend_segment_contexts(contexts: Sequence[torch.Tensor], weights: Sequence[float]) -> torch.Tensor:
-    if len(contexts) != len(weights) or not contexts:
-        raise ValueError("segment contexts and weights must have the same non-zero length")
-    active = [(context, weight) for context, weight in zip(contexts, weights) if weight > 0.0]
-    if len(active) == 1:
-        return active[0][0]
-    output = torch.zeros_like(active[0][0])
-    for context, weight in active:
-        output.add_(context, alpha=float(weight))
-    return output
+def unreachable_segments(starts: Sequence[int], window: int, total: int, count: int) -> list[int]:
+    """Return zero-based segment indices no context window would ever select.
+
+    Window midpoints are quantized to the scheduler's stride and confined to
+    [window/2, total - window/2], so when segments outnumber windows some
+    prompts are silently unreachable; callers surface that instead of letting
+    a prompt vanish without a trace.
+    """
+    selected = {select_segment_index(v0, min(v0 + window, total), total, count) for v0 in starts}
+    return sorted(set(range(count)) - selected)
 
 
 def make_segmented_extra_conds(
@@ -136,10 +132,26 @@ def encode_pipe_prompt(clip, prompt: str):
         metadata.append(conditioning[0][1])
 
     padded = pad_segment_contexts(encoded)
+    tokens = padded[0].shape[1]
+    padded_tags = [pad_text_tags(meta.get("minimax_token_tags"), tokens) for meta in metadata]
+    # The run carries one set of conditioning metadata, so it is only correct
+    # when every segment shares it. Refuse divergent multimodal structure
+    # instead of silently stamping segment 1's tags onto every window.
+    for index, tags in enumerate(padded_tags[1:], start=2):
+        if not torch.equal(tags, padded_tags[0]):
+            raise ValueError(
+                f"pipe prompt segments 1 and {index} produce different MiniMax token tags; "
+                "multimodal inserts and presentation tags must be identical across segments"
+            )
+    for index, meta in enumerate(metadata[1:], start=2):
+        if set(meta.keys()) != set(metadata[0].keys()):
+            raise ValueError(
+                f"pipe prompt segments 1 and {index} produce different conditioning metadata keys; "
+                "segments must use the same conditioning structure"
+            )
+
     primary_meta = metadata[0].copy()
-    primary_meta["minimax_token_tags"] = pad_text_tags(
-        primary_meta.get("minimax_token_tags"), padded[0].shape[1]
-    )
+    primary_meta["minimax_token_tags"] = padded_tags[0]
     primary_meta["h3forge_prompt_segments"] = tuple(padded)
     primary_meta["h3forge_prompt_segment_count"] = len(padded)
     return [[padded[0], primary_meta]]

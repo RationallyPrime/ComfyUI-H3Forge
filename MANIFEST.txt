@@ -9,10 +9,15 @@
 ./h3forge/attention.py
 ./h3forge/context.py
 ./h3forge/layout.py
+./h3forge/nag.py
 ./h3forge/nodes.py
 ./h3forge/prompt.py
 ./h3forge/state.py
 ./pyproject.toml
+./tests/fake_minimax.py
 ./tests/test_attention_math.py
 ./tests/test_context_math.py
+./tests/test_layout_windows.py
+./tests/test_nag.py
+./tests/test_nodes.py
 ./tests/test_state.py
