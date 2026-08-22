@@ -90,17 +90,21 @@ class RuntimeState:
         return " ".join(bits)
 
 
-def resolve_step(transformer_options: dict) -> tuple[int | None, int | None]:
-    """Best-effort sampler step resolution from ComfyUI transformer_options."""
+def resolve_step(transformer_options: dict, sigma: float | None = None) -> tuple[int | None, int | None]:
+    """Best-effort sampler step resolution from ComfyUI transformer_options.
+
+    Callers that already resolved the current sigma pass it in so the sigmas
+    tensor is read (one GPU→CPU sync) once per forward, not once per resolver.
+    """
     sample_sigmas = transformer_options.get("sample_sigmas")
-    current = transformer_options.get("sigmas")
     if sample_sigmas is None:
         return None, None
     total = max(int(sample_sigmas.shape[0]) - 1, 0)
-    if current is None or getattr(current, "numel", lambda: 0)() == 0:
+    if sigma is None:
+        sigma = resolve_sigma(transformer_options)
+    if sigma is None:
         return None, total
     try:
-        sigma = float(current.flatten()[0])
         vals = sample_sigmas.detach().float().flatten()
         idx = int((vals - sigma).abs().argmin())
         return min(idx, total), total

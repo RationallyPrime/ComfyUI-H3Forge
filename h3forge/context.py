@@ -111,7 +111,7 @@ def make_context_wrapper(policy: ContextPolicy):
                 )
                 if policy.strict:
                     raise RuntimeError(message)
-                if step == 0:
+                if step in (None, 0):
                     print(message, flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
@@ -130,7 +130,20 @@ def make_context_wrapper(policy: ContextPolicy):
                 phase = (step * max(stride // 3, 1)) % stride
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
             if prompt_segments:
-                missing = unreachable_segments(starts, policy.window_frames, total_t, len(prompt_segments))
+                # Validate reachability over every stagger phase the run can
+                # visit, not just this step's starts: a config that survives
+                # step 0 must not strict-abort or silently drop a segment once
+                # the window boundaries shift on later steps.
+                phases = {0}
+                if policy.stagger and stride > 2:
+                    increment = max(stride // 3, 1)
+                    phases = {min((s * increment) % stride, policy.overlap_frames) for s in range(stride)}
+                missing_union: set[int] = set()
+                for p in sorted(phases):
+                    missing_union.update(unreachable_segments(
+                        window_starts(total_t, policy.window_frames, policy.overlap_frames, p),
+                        policy.window_frames, total_t, len(prompt_segments)))
+                missing = sorted(missing_union)
                 if missing:
                     message = (
                         f"{LOG} pipe prompt segments {[m + 1 for m in missing]} are never selected by any "
@@ -139,7 +152,7 @@ def make_context_wrapper(policy: ContextPolicy):
                     )
                     if policy.strict:
                         raise RuntimeError(message)
-                    if step == 0:
+                    if step in (None, 0):
                         print(message, flush=True)
             raw_audio_ranges = [audio_range_for_video_window(full_layout, v0, min(v0 + policy.window_frames, total_t))
                                 for v0 in starts]
