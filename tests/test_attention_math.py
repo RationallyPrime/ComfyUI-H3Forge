@@ -47,7 +47,7 @@ def test_runtime_offsets_are_tensor_data():
     assert value.item() == 17
 
 
-def test_flex_attention_compiles_dynamically(monkeypatch):
+def test_flex_attention_uses_fixed_equalized_window_shape(monkeypatch):
     import h3forge.attention as attention
     import torch.nn.attention.flex_attention as flex_module
 
@@ -71,4 +71,4 @@ def test_flex_attention_compiles_dynamically(monkeypatch):
     q = torch.ones(1, 2, 3, 4)
     assert torch.equal(_run_flex(state, q, q, q), q * 3)
     assert len(compile_calls) == 1
-    assert compile_calls[0][1]["dynamic"] is True
+    assert compile_calls[0][1]["dynamic"] is False

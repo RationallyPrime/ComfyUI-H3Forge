@@ -156,10 +156,11 @@ def _run_flex(state, q, k, v):
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Compile once so
     # CUDA uses the fused block-sparse kernel instead of materializing S².
     if _COMPILED_FLEX is None:
-        # Window lengths and captured offset tensors may vary across context
-        # configurations. Compile dynamically so those supported variations do
-        # not exhaust Dynamo's per-code-object recompilation budget.
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=True)
+        # Context windows are equalized to one video/audio shape within a run.
+        # Fixed-shape compilation avoids PyTorch Inductor's symbolic BlockMask
+        # lowering path, while tensor-captured offsets can still vary at runtime
+        # without causing value-specialized recompiles.
+        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
     mask = _make_block_mask(state, q, device=q.device)
     return _COMPILED_FLEX(q, k, v, block_mask=mask)
 
