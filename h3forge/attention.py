@@ -3,9 +3,10 @@ from __future__ import annotations
 import torch
 
 from .layout import target_segments, video_shape_from_layout
+from .nag import apply_nag
 
 LOG = "[H3Forge]"
-_COMPILED_FLEX = None
+_COMPILED_FLEX_CACHE: dict = {}
 
 
 def _unwrap(x):
@@ -77,8 +78,18 @@ def _make_block_mask(state, q, *, device):
     grid_w = max(int(latent_w) // 2, 1)
     video_offset = int(getattr(layout, "_h3forge_video_offset", 0))
     audio_offset = int(getattr(layout, "_h3forge_audio_offset", 0))
-    key = (str(device), layout.seq_len, video_offset, audio_offset, p.temporal_window,
-           p.spatial_radius, p.bridge_stride)
+    # Two packed layouts can share one total sequence length while placing text,
+    # references, audio, and video at different boundaries, and the signature
+    # alone does not describe reference/keyframe prefix structure. Key on the
+    # full segment table so a mask compiled for one segmentation is never
+    # reused for another.
+    layout_key = (
+        tuple(layout.signature),
+        tuple(tuple(segment) for segment in layout.segments),
+        video_offset,
+        audio_offset,
+    )
+    key = (str(device), layout_key, p.temporal_window, p.spatial_radius, p.bridge_stride)
     cached = state.mask_cache.get(key)
     if cached is not None:
         state.mask_cache.move_to_end(key)
@@ -150,38 +161,44 @@ def _make_block_mask(state, q, *, device):
     return block_mask
 
 def _run_flex(state, q, k, v):
-    global _COMPILED_FLEX
     from torch.nn.attention.flex_attention import flex_attention
 
-    # H3 arrives BHSD; flex_attention consumes BHSD directly. Compile once so
-    # CUDA uses the fused block-sparse kernel instead of materializing S².
-    if _COMPILED_FLEX is None:
-        # Context windows are equalized to one video/audio shape within a run.
-        # Fixed-shape compilation avoids PyTorch Inductor's symbolic BlockMask
-        # lowering path, while tensor-captured offsets can still vary at runtime
-        # without causing value-specialized recompiles.
-        _COMPILED_FLEX = torch.compile(flex_attention, dynamic=False)
+    # H3 arrives BHSD; flex_attention consumes BHSD directly. Fixed-shape
+    # compilation avoids PyTorch Inductor's symbolic BlockMask lowering path,
+    # while tensor-captured offsets can still vary at runtime without causing
+    # value-specialized recompiles. One runner is kept per concrete shape so a
+    # duration/resolution/window change triggers an observable compile instead
+    # of relying on hidden Dynamo guard-cache semantics.
+    key = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
+    runner = _COMPILED_FLEX_CACHE.get(key)
+    if runner is None:
+        print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={key}", flush=True)
+        runner = torch.compile(flex_attention, dynamic=False)
+        _COMPILED_FLEX_CACHE[key] = runner
     mask = _make_block_mask(state, q, device=q.device)
-    return _COMPILED_FLEX(q, k, v, block_mask=mask)
+    return runner(q, k, v, block_mask=mask)
 
 
 @torch.no_grad()
-def feta_gain(state, q, k) -> float:
-    """H3-native FETA-style scalar from temporal off-diagonal video attention.
+def feta_gain(state, q, k) -> torch.Tensor | None:
+    """H3-native FETA-style gain from temporal off-diagonal video attention.
 
     Only target-video rows participate. The diagnostic samples spatial sites and
     heads, preserving same-site temporal correspondence and avoiding an S² map.
+    Returns a zero-dim device tensor (never converted to a Python float on the
+    hot path — that would force a GPU→CPU synchronization per FETA-enabled
+    block), or None when FETA does not apply to this call.
     """
     p = state.policy
     if not p.feta_enabled or state.layout is None or state.block_index is None:
-        return 1.0
+        return None
     if not (p.feta_first_layer <= state.block_index <= p.feta_last_layer):
-        return 1.0
+        return None
 
     seg = target_segments(state.layout)
     latent_t, frame_rows = video_shape_from_layout(state.layout)
     if latent_t < 2:
-        return 1.0
+        return None
 
     qv = q[:, :, seg.video_start:seg.video_stop, :].reshape(q.shape[0], q.shape[1], latent_t, frame_rows, q.shape[-1])
     kv = k[:, :, seg.video_start:seg.video_stop, :].reshape(k.shape[0], k.shape[1], latent_t, frame_rows, k.shape[-1])
@@ -200,16 +217,16 @@ def feta_gain(state, q, k) -> float:
     # multiplied by (T + weight), clamped to at least one. We sample heads and
     # spatial sites, but do not alter the estimator itself.
     diag_sum = probs.diagonal(dim1=-2, dim2=-1).sum(dim=-1)
-    offdiag_sum = float((latent_t - diag_sum).mean())
-    mean_offdiag = offdiag_sum / max(latent_t * (latent_t - 1), 1)
+    mean_offdiag = (latent_t - diag_sum).mean() / max(latent_t * (latent_t - 1), 1)
     gain = mean_offdiag * (latent_t + p.feta_strength)
-    return float(min(max(gain, 1.0), p.feta_max_gain))
+    return gain.clamp(min=1.0, max=float(p.feta_max_gain))
 
 
-def _scale_video_output(state, out, gain, *, heads, skip_output_reshape):
-    if gain <= 1.0 or state.layout is None:
+def _scale_video_output(state, out, gain, *, skip_output_reshape):
+    if state.layout is None:
         return out
     seg = target_segments(state.layout)
+    gain = gain.to(out.dtype)
     if skip_output_reshape:
         # BHSD output
         out = out.clone()
@@ -251,11 +268,19 @@ def make_attention_override(state):
             state.dense_calls += 1
             out = _dense(func, q, k, v, heads, args, kwargs)
 
+        if state.nag is not None:
+            try:
+                out = apply_nag(state, q, k, v, out, skip_output_reshape=skip_output_reshape)
+            except Exception as exc:
+                if state.nag.strict or state.policy.strict:
+                    raise RuntimeError(f"{LOG} NAG failed: {type(exc).__name__}: {exc}") from exc
+                state.note_decline(f"nag-error:{type(exc).__name__}")
+
         if state.policy.feta_enabled:
             try:
                 gain = feta_gain(state, q, k)
-                out = _scale_video_output(state, out, gain, heads=heads,
-                                          skip_output_reshape=skip_output_reshape)
+                if gain is not None:
+                    out = _scale_video_output(state, out, gain, skip_output_reshape=skip_output_reshape)
             except Exception as exc:
                 if state.policy.strict:
                     raise RuntimeError(f"{LOG} FETA failed: {type(exc).__name__}: {exc}") from exc

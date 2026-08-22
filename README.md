@@ -6,6 +6,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
 3. **Synchronized audio/video context windows** with overlap-add blending and absolute H3 RoPE preservation.
 4. **Pipe-delimited timeline prompting** with independently encoded, equal-time prompt segments.
+5. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
@@ -61,11 +62,35 @@ That absolute-position transplant is important: a context window beginning at la
 
 This node splits a prompt on `|`, encodes every segment independently with MiniMax's Qwen3-VL text encoder, and maps the segments in order across equal portions of the target timeline. It is not a decorative delimiter passed to one global text encoding.
 
-All segment embeddings are padded to one token length before sampling, preserving one compiled H3 context shape. Each synchronized A/V context window receives the weighted mixture of the prompt segments that physically overlap it, so a window crossing a prompt boundary blends the two contexts instead of imposing a hard latent seam.
+All segment embeddings are padded to one token length before sampling, preserving one compiled H3 context shape. Each synchronized A/V context window uses the **complete encoding of the one segment covering its midpoint** — contextualized token slots from independently encoded prompts do not correspond to one another, so hidden states are never interpolated. Around a prompt boundary, adjacent windows generated under different prompts crossfade in **output space** through the context-window overlap-add blend, which is where blending is semantically sound.
+
+Segments must share the same conditioning structure: differing multimodal inserts or presentation tags across segments are rejected at encode time rather than silently stamped with segment 1's metadata.
+
+Segments must not outnumber the context windows that can select them: if a segment's equal-time span contains no window midpoint, H3Forge warns at the first step (or aborts in strict mode) instead of letting that prompt silently vanish. Use fewer segments or a smaller `window_frames`.
 
 Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 AV Latent`. A single segment is valid and behaves like ordinary global conditioning. Escape a literal pipe as `\|`.
 
-Every segment is encoded independently. Repeat concrete identity, wardrobe, location, lighting, and style anchors inside every segment. Do not use cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; those words refer to context the segment encoder cannot see.
+Every segment is encoded independently. Write each segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`), and repeat concrete identity, wardrobe, location, lighting, voice, and style anchors inside every segment. Do not use cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; those words refer to context the segment encoder cannot see. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.
+
+### H3 Forge — Normalized Attention Guidance (experimental)
+
+H3's released checkpoints are guidance-distilled: a normal `BasicGuider` workflow already runs one forward per step and pays no CFG cost, but negative prompts do nothing at CFG 1. This node restores meaningful negative-prompt control **without a second complete H3 transformer pass**.
+
+H3 is structurally on the expensive side of the NAG divide: unlike Wan's external text cross-attention (where NAG costs roughly 12%), H3's text, references, audio, and video share one packed self-attention per block, like Flux (where faithful NAG costs closer to 87%). So this node implements **H3 NAG-Lite**, not faithful NAG:
+
+1. the negative prompt is encoded once and passed through H3's text preprocessing;
+2. at selected DiT blocks, the current positive target audio/video queries attend to the positive text K/V and to the negative sidecar text K/V;
+3. the exact NAG formula (`guided = pos·scale − neg·(scale−1)`, L1-renormalized with cap `tau`, alpha-blended) is applied to those two text-conditioned contributions;
+4. only the **delta** is injected into target audio/video attention rows before the output projection;
+5. A/V↔A/V self-attention, the MLP, and the rest of the positive packed stream are untouched.
+
+The added attention cost is roughly `target rows × text length` per selected block instead of `packed length²`.
+
+**Documented approximations** (why this is named NAG-Lite): the sidecar text state is frozen at the refined embedding rather than re-evolved through earlier blocks; it skips per-step modulated norms and RoPE on sidecar keys; and in `lite` mode the standalone text attention does not share the packed softmax denominator with A/V keys. `mode=faithful_selective` removes the last approximation by rerunning full-key attention for the target rows with the text partition swapped — materially more expensive, useful as a quality ceiling for the selected blocks.
+
+Knobs: start at `nag_scale 3.0` (not Wan's 11 — H3 is distilled, single-stream, and jointly generates speech and imagery, so aggressive attention extrapolation has more opportunities to damage identity, voice, or sync). Find stable `nag_tau`/`nag_alpha`, then leave them fixed and tune only the scale. `nag_sigma_end` stops NAG once sigma falls below it, saving compute in the late schedule. `first_block`/`last_block` select the DiT blocks; `video_strength`/`audio_strength` scale the injected delta per modality.
+
+The node composes with `H3 Forge — Sliding Attention + FETA` in either wiring order (both configure one shared H3Forge runtime) and works standalone. Do not stack generic ComfyUI-NAG on top.
 
 ## Requirements
 
@@ -87,13 +112,14 @@ git clone https://github.com/RationallyPrime/ComfyUI-H3Forge.git
 
 or place the extracted `ComfyUI-H3Forge/` directory there, then restart ComfyUI.
 
-Three nodes should appear:
+Four nodes should appear:
 
 - `H3 Forge — Sliding Attention + FETA`
 - `H3 Forge — Chained A/V Context Windows`
 - `H3 Forge — Pipe Timeline Prompt`
+- `H3 Forge — Normalized Attention Guidance` (experimental)
 
-The attention and context nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in either order. The pipe-timeline node accepts MiniMax's `CLIP` and returns the positive `CONDITIONING` used by the guider.
+The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The pipe-timeline node accepts MiniMax's `CLIP` and returns the positive `CONDITIONING` used by the guider; the NAG node additionally takes the negative `CONDITIONING`.
 
 ## First Blackwell bring-up
 
@@ -228,18 +254,51 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 `stagger`
 : Moves interior window boundaries by at most the overlap amount across sampling steps while preserving complete coverage.
 
+### NAG
+
+`nag_scale`
+: Attention-space extrapolation strength between positive and negative text contributions. Start at `3.0`; H3 is distilled and single-stream, so do not import Wan-scale defaults.
+
+`nag_tau`
+: L1-norm cap on the guided feature relative to the positive feature. Find a stable value, then leave it fixed and tune `nag_scale`.
+
+`nag_alpha`
+: Blend of the guided feature back toward the positive feature.
+
+`nag_sigma_end`
+: NAG applies while the current sigma is at or above this value; below it, blocks run untouched.
+
+`first_block` / `last_block`
+: Inclusive DiT block range that receives the sidecar delta.
+
+`video_strength` / `audio_strength`
+: Per-modality multipliers on the injected delta for target video and audio rows.
+
 ## Important compatibility notes
 
-- **Do not stack `SolAttnH3` and `H3ForgeAttention` on the same model.** Both own `optimized_attention_override`; H3Forge prints a warning if it replaces an existing override.
+- **Do not stack `SolAttnH3` and H3Forge attention/NAG nodes on the same model.** Both own `optimized_attention_override`; H3Forge prints a warning if it replaces an existing override. Choose SolAttn or H3Forge for a given run.
 - H3Forge Context Windows *can* be used without H3Forge Attention.
 - FETA can be tested with `mode=dense`.
 - `strict=true` is recommended for development / first GPU tests. Use `strict=false` only when you explicitly prefer dense fallback over an aborted generation.
 - This is inference experimentation, not a claim that MiniMax trained H3 with this exact sparse topology.
 - MiniMax describes native sparse-attention training, while the released ComfyUI inference path is dense. Start from the one-second default and treat shorter windows as an explicit quality/speed sweep.
 
+### Composing with ComfyUI-KJNodes
+
+Kijai's KJNodes ships focused native-H3 nodes that compose well with H3Forge and belong in the canonical workflow:
+
+- **MiniMax H3 Chunk FeedForward** — chunks SwiGLU along packed-token rows; rows are independent, so this is intended to be mathematically exact while reducing peak activation memory. Recommended by default alongside H3Forge.
+- **MiniMax H3 Token Counter** — reports the true packed token count (text, keyframes/references, audio, video). Put it in every diagnostic workflow; packed sequence length is the quantity that actually predicts attention cost.
+- **MiniMax H3 Low VRAM Attention** — composes through `optimized_attention`, so it can run under H3Forge sparse mode, but its head grouping invokes the override once per head group. Ordinary sparse attention is mathematically separable across head groups; H3Forge's *sampled* FETA gain is not, and could differ per group. For a clean equivalence test run `KJ Low VRAM Attention + H3Forge sparse + FETA disabled`, and treat that combination as the supported mode until FETA computes one global gain across groups.
+
+### Approximate accelerators
+
+- **ComfyUI-MiniMaxH3-FirstBlockCache** replaces/skips the remaining block stack and warns against combining it with another `double_block` replacement — that is a direct conflict with H3Forge's block stamping and context surgery. Do not combine; benchmark it in isolation with fixed seeds.
+- **ComfyUI-Spectrum-MiniMax-H3** forecasts post-transformer features and skips selected transformer evaluations; its own documentation notes it changes the denoising trajectory. Keep it out of any workflow whose purpose is proving H3Forge or NAG behavior.
+
 ## Test locally
 
-The included CPU tests cover scheduler coverage, blending positivity, and sampler-step resolution:
+The included CPU tests cover scheduler coverage, blend-edge correction, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
 
 ```bash
 PYTHONPATH=. python -m pytest -q tests

@@ -2,7 +2,7 @@
 
 Use the same seed, prompt, input conditioning, resolution, frame count, sampler, steps, CFG/guidance, and model files for every row.
 
-For pipe-timeline tests, keep the exact segment count and delimiter placement fixed. Each segment is an independent encoding and occupies an equal portion of the target video timeline.
+For pipe-timeline tests, keep the exact segment count and delimiter placement fixed. Each segment is an independent encoding and occupies an equal portion of the target video timeline; each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add.
 
 | ID | Sparse | FETA | Context | Purpose |
 |---|---|---|---|---|
@@ -68,3 +68,38 @@ Keep overlap around 20–30% initially:
 | 41 | 10 |
 
 The best point will depend heavily on target resolution because each video latent frame contains all spatial patch rows.
+
+## NAG acceptance matrix
+
+Use the same fixed-seed workflow as the runs above. All NAG runs use `BasicGuider` at CFG 1 unless stated otherwise.
+
+| ID | Guidance | Sparse | Purpose |
+|---|---|---|---|
+| N-A | BasicGuider CFG 1 | off | Native reference |
+| N-B | NAG-Lite | off | Isolate guidance |
+| N-C | NAG-Lite | on | Composition with H3Forge sparse |
+| N-D | Selective faithful NAG (`mode=faithful_selective`) | off | Quality ceiling for the selected blocks |
+| N-E | Ordinary CFG | off | Cost/quality reference |
+
+Starting values: `nag_scale 3.0`, `nag_tau 2.5`, `nag_alpha 0.15`, `nag_sigma_end 0.70`, blocks `8–28`, `video_strength 1.0`, `audio_strength 0.5`, `strict true`. Find stable tau/alpha first, then tune only the scale.
+
+Negative prompts should separately test:
+
+- visual object suppression;
+- style suppression;
+- quality defects (blur, malformed hands);
+- camera/static-motion suppression;
+- music suppression;
+- speech or voice-property suppression;
+- environmental audio suppression.
+
+For each run record wall time, peak VRAM, attention-call counts (`nag=` in the run summary), voice identity, lip sync, event synchronization, and fixed-seed visual differences against N-A.
+
+Performance target (a target, not a prediction): NAG-Lite under 20% overhead versus N-A. Selective faithful NAG will land materially higher — H3 is a packed single-stream transformer, structurally closer to Flux's expensive NAG case than to Wan's cheap one.
+
+## KJNodes composition checks
+
+- Add `MiniMax H3 Token Counter` to every diagnostic workflow and record the packed token count per run.
+- `MiniMax H3 Chunk FeedForward` is expected to be output-identical; verify once against B0 with fixed seeds, then leave it on.
+- `MiniMax H3 Low VRAM Attention` equivalence gate: run `KJ Low VRAM Attention + H3Forge sparse + FETA disabled` against A1 before allowing the combination into larger stacks. KJ head grouping invokes the attention override per head group, which is only guaranteed consistent with FETA off.
+- Do not include FirstBlockCache or Spectrum in any H3Forge/NAG proving run; benchmark them in isolation later.

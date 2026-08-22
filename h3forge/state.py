@@ -22,14 +22,27 @@ class AttentionPolicy:
     feta_max_spatial_samples: int = 128
     feta_max_heads: int = 8
 
+    def __post_init__(self):
+        if self.feta_first_layer > self.feta_last_layer:
+            raise ValueError(
+                f"feta_first_layer ({self.feta_first_layer}) must not exceed "
+                f"feta_last_layer ({self.feta_last_layer})"
+            )
+
 
 @dataclass
 class RuntimeState:
     policy: AttentionPolicy
+    default_policy: AttentionPolicy | None = None
     layout: Any = None
     block_index: int | None = None
     step_index: int | None = None
     total_steps: int | None = None
+    current_sigma: float | None = None
+    nag: Any = None
+    nag_runtime: Any = None
+    diffusion: Any = None
+    blocks: Any = None
     mask_cache: OrderedDict = field(default_factory=OrderedDict)
     mask_cache_limit: int = 32
     mask_hits: int = 0
@@ -38,6 +51,7 @@ class RuntimeState:
     dense_calls: int = 0
     sparse_calls: int = 0
     feta_calls: int = 0
+    nag_calls: int = 0
     declines: dict[str, int] = field(default_factory=dict)
 
     def note_decline(self, reason: str) -> None:
@@ -48,9 +62,18 @@ class RuntimeState:
         self.block_index = None
         self.step_index = None
         self.total_steps = None
+        self.current_sigma = None
+        # Config is re-resolved from the sampled clone's transformer_options on
+        # every forward; resetting here keeps a stale config from surviving a
+        # run whose forwards never resolve (e.g. an aborted sample).
+        self.nag = None
+        self.nag_runtime = None
+        if self.default_policy is not None:
+            self.policy = self.default_policy
         self.dense_calls = 0
         self.sparse_calls = 0
         self.feta_calls = 0
+        self.nag_calls = 0
         self.mask_hits = 0
         self.mask_misses = 0
         self.mask_evictions = 0
@@ -58,6 +81,8 @@ class RuntimeState:
 
     def stats(self) -> str:
         bits = [f"sparse={self.sparse_calls}", f"dense={self.dense_calls}", f"feta={self.feta_calls}"]
+        if self.nag_calls:
+            bits.append(f"nag={self.nag_calls}")
         if self.mask_hits or self.mask_misses:
             bits.append(f"masks=hit:{self.mask_hits},miss:{self.mask_misses},evict:{self.mask_evictions}")
         if self.declines:
@@ -81,3 +106,14 @@ def resolve_step(transformer_options: dict) -> tuple[int | None, int | None]:
         return min(idx, total), total
     except Exception:
         return None, total
+
+
+def resolve_sigma(transformer_options: dict) -> float | None:
+    """Best-effort current-sigma resolution, independent of the full schedule."""
+    current = transformer_options.get("sigmas")
+    if current is None or getattr(current, "numel", lambda: 0)() == 0:
+        return None
+    try:
+        return float(current.flatten()[0])
+    except Exception:
+        return None

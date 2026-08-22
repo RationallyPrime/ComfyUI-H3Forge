@@ -5,12 +5,16 @@ from comfy.patcher_extension import WrappersMP
 from .attention import LOG, make_attention_override
 from .context import ContextPolicy, make_context_wrapper
 from .layout import padded_spatial_shape
+from .nag import NAG_MODES, NAGConfig
 from .prompt import encode_pipe_prompt, make_segmented_extra_conds
-from .state import AttentionPolicy, RuntimeState, resolve_step
+from .state import AttentionPolicy, RuntimeState, resolve_sigma, resolve_step
 
 ATTN_KEY = "h3forge_attention"
 CTX_KEY = "h3forge_context"
 STAMP = "h3forge_block"
+STATE_GETTER = "h3forge_state_getter"
+POLICY_KEY = "h3forge_attention_policy"
+NAG_KEY = "h3forge_nag"
 
 
 def _require_h3(model):
@@ -18,6 +22,40 @@ def _require_h3(model):
     if diffusion is None or type(diffusion).__name__ != "MiniMaxH3Model":
         raise ValueError(f"{LOG} MiniMax-H3 required; got {type(diffusion).__name__}")
     return diffusion
+
+
+def _acquire_runtime(model, diffusion):
+    """Clone the model and return (clone, transformer_options of the clone).
+
+    The override, wrappers, and block stamps are installed once, whichever
+    H3Forge node runs first; the shared RuntimeState behind them carries only
+    caches and per-forward transients. Node configuration (attention policy,
+    NAG config) is stored in the clone's transformer_options — deep-copied per
+    ModelPatcher.clone(), so sibling branches and cached upstream outputs keep
+    their own configuration — and resolved into the state at each forward.
+    """
+    patched = model.clone()
+    opts = patched.model_options.setdefault("transformer_options", {})
+    if opts.get(STATE_GETTER) is not None:
+        return patched, opts
+
+    state = RuntimeState(AttentionPolicy(mode="dense", feta_enabled=False))
+    state.default_policy = state.policy
+    state.diffusion = diffusion
+    state.blocks = diffusion.blocks
+    if "optimized_attention_override" in opts:
+        print(
+            f"{LOG} replacing an existing optimized_attention_override; "
+            "do not stack SolAttnH3 with H3Forge attention nodes",
+            flush=True,
+        )
+    opts["optimized_attention_override"] = make_attention_override(state)
+    opts[STATE_GETTER] = lambda: state
+    patched.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, ATTN_KEY, _run_wrapper(state))
+    patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, ATTN_KEY, _forward_wrapper(state))
+    for i in range(len(diffusion.blocks)):
+        patched.set_model_patch_replace(_stamp_block(state, i), "dit", "double_block", i)
+    return patched, opts
 
 
 class H3ForgeAttention:
@@ -48,28 +86,67 @@ class H3ForgeAttention:
               first_dense_layers, first_dense_fraction, feta_enabled, feta_strength,
               feta_max_gain, feta_first_layer, feta_last_layer, strict):
         diffusion = _require_h3(model)
-        policy = AttentionPolicy(
-            mode=mode, temporal_window=temporal_window, spatial_radius=spatial_radius,
-            bridge_stride=bridge_stride, first_dense_layers=first_dense_layers,
-            first_dense_fraction=first_dense_fraction, strict=strict,
-            feta_enabled=feta_enabled, feta_strength=feta_strength,
-            feta_max_gain=feta_max_gain, feta_first_layer=feta_first_layer,
-            feta_last_layer=feta_last_layer,
-        )
-        state = RuntimeState(policy)
-        patched = model.clone()
-        opts = patched.model_options.setdefault("transformer_options", {})
-        if "optimized_attention_override" in opts:
-            print(
-                f"{LOG} replacing an existing optimized_attention_override; "
-                "do not stack SolAttnH3 with H3ForgeAttention",
-                flush=True,
+        try:
+            policy = AttentionPolicy(
+                mode=mode, temporal_window=temporal_window, spatial_radius=spatial_radius,
+                bridge_stride=bridge_stride, first_dense_layers=first_dense_layers,
+                first_dense_fraction=first_dense_fraction, strict=strict,
+                feta_enabled=feta_enabled, feta_strength=feta_strength,
+                feta_max_gain=feta_max_gain, feta_first_layer=feta_first_layer,
+                feta_last_layer=feta_last_layer,
             )
-        opts["optimized_attention_override"] = make_attention_override(state)
-        patched.add_wrapper_with_key(WrappersMP.OUTER_SAMPLE, ATTN_KEY, _run_wrapper(state))
-        patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, ATTN_KEY, _forward_wrapper(state))
-        for i in range(len(diffusion.blocks)):
-            patched.set_model_patch_replace(_stamp_block(state, i), "dit", "double_block", i)
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+        patched, opts = _acquire_runtime(model, diffusion)
+        opts[POLICY_KEY] = policy
+        return (patched,)
+
+
+class H3ForgeNAG:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "negative": ("CONDITIONING",),
+            "mode": (list(NAG_MODES), {"default": "lite"}),
+            "nag_scale": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 20.0, "step": 0.1}),
+            "nag_tau": ("FLOAT", {"default": 2.5, "min": 1.0, "max": 10.0, "step": 0.1}),
+            "nag_alpha": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "nag_sigma_end": ("FLOAT", {"default": 0.70, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "first_block": ("INT", {"default": 8, "min": 0, "max": 49}),
+            "last_block": ("INT", {"default": 28, "min": 0, "max": 49}),
+            "video_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "audio_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "strict": ("BOOLEAN", {"default": False}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/guidance"
+    EXPERIMENTAL = True
+    DESCRIPTION = (
+        "Experimental H3 NAG-Lite: restores negative-prompt control on the guidance-distilled H3 "
+        "checkpoints at CFG 1 by guiding only the negative-text sidecar contribution to target "
+        "audio/video attention rows. Not a faithful dual-branch NAG; see the README for the "
+        "documented approximations."
+    )
+
+    def patch(self, model, negative, mode, nag_scale, nag_tau, nag_alpha, nag_sigma_end,
+              first_block, last_block, video_strength, audio_strength, strict):
+        diffusion = _require_h3(model)
+        if len(negative) != 1:
+            raise ValueError(f"{LOG} NAG expects exactly one negative conditioning entry, got {len(negative)}")
+        try:
+            config = NAGConfig(
+                negative_context=negative[0][0], mode=mode, scale=nag_scale, tau=nag_tau,
+                alpha=nag_alpha, sigma_end=nag_sigma_end, first_block=first_block,
+                last_block=last_block, video_strength=video_strength,
+                audio_strength=audio_strength, strict=strict,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+        patched, opts = _acquire_runtime(model, diffusion)
+        opts[NAG_KEY] = config
         return (patched,)
 
 
@@ -94,6 +171,12 @@ def _run_wrapper(state):
 
 def _forward_wrapper(state):
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
+        # Configuration lives in this model clone's transformer_options and is
+        # resolved here on every forward: a sibling branch or a cached upstream
+        # output without the attention/NAG key must run with the dense default /
+        # without NAG, not with whatever a later node wrote into shared state.
+        state.policy = transformer_options.get(POLICY_KEY, state.default_policy or state.policy)
+        state.nag = transformer_options.get(NAG_KEY)
         # The token refiner can call optimized_attention before the first stamped
         # DiT block. Never let the previous forward's final block index make that
         # call look like block 49 (which can incorrectly activate FETA).
@@ -113,6 +196,7 @@ def _forward_wrapper(state):
                 state.note_decline(f"layout-error:{type(exc).__name__}")
         state.layout = layout
         state.step_index, state.total_steps = resolve_step(transformer_options)
+        state.current_sigma = resolve_sigma(transformer_options)
         sentinel = object()
         previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
         if layout is not None:
@@ -174,8 +258,9 @@ class H3ForgePipePrompt:
     FUNCTION = "encode"
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
-        "Encode | separated MiniMax-H3 prompts independently and map them in equal time spans "
-        "through H3Forge context windows. Escape a literal pipe as \\|."
+        "Encode | separated MiniMax-H3 prompts independently; each H3Forge context window uses the "
+        "segment covering its midpoint, and windows generated under different prompts crossfade in "
+        "output space through the overlap-add blend. Escape a literal pipe as \\|."
     )
 
     def encode(self, clip, prompt):
@@ -189,9 +274,11 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
     "H3ForgePipePrompt": H3ForgePipePrompt,
+    "H3ForgeNAG": H3ForgeNAG,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
+    "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
 }
