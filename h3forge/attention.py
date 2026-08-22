@@ -7,6 +7,7 @@ from .nag import apply_nag
 
 LOG = "[H3Forge]"
 _COMPILED_FLEX_CACHE: dict = {}
+_COMPILED_FLEX_CACHE_LIMIT = 8
 
 
 def _unwrap(x):
@@ -170,11 +171,15 @@ def _run_flex(state, q, k, v):
     # duration/resolution/window change triggers an observable compile instead
     # of relying on hidden Dynamo guard-cache semantics.
     key = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
-    runner = _COMPILED_FLEX_CACHE.get(key)
+    runner = _COMPILED_FLEX_CACHE.pop(key, None)
     if runner is None:
         print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={key}", flush=True)
         runner = torch.compile(flex_attention, dynamic=False)
-        _COMPILED_FLEX_CACHE[key] = runner
+    # Re-insert as most recent and bound the cache like mask_cache: a session
+    # sweeping durations/resolutions must not accumulate runners forever.
+    _COMPILED_FLEX_CACHE[key] = runner
+    while len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
+        del _COMPILED_FLEX_CACHE[next(iter(_COMPILED_FLEX_CACHE))]
     mask = _make_block_mask(state, q, device=q.device)
     return runner(q, k, v, block_mask=mask)
 
@@ -222,18 +227,18 @@ def feta_gain(state, q, k) -> torch.Tensor | None:
     return gain.clamp(min=1.0, max=float(p.feta_max_gain))
 
 
-def _scale_video_output(state, out, gain, *, skip_output_reshape):
+def _scale_video_output(state, out, gain, *, skip_output_reshape, owned=False):
     if state.layout is None:
         return out
     seg = target_segments(state.layout)
     gain = gain.to(out.dtype)
+    if not owned:
+        out = out.clone()
     if skip_output_reshape:
         # BHSD output
-        out = out.clone()
         out[:, :, seg.video_start:seg.video_stop, :].mul_(gain)
     else:
         # B,S,H*D output expected by H3's Attention module.
-        out = out.clone()
         out[:, seg.video_start:seg.video_stop, :].mul_(gain)
     state.feta_calls += 1
     return out
@@ -268,9 +273,11 @@ def make_attention_override(state):
             state.dense_calls += 1
             out = _dense(func, q, k, v, heads, args, kwargs)
 
+        nag_input = out
         if state.nag is not None:
             try:
-                out = apply_nag(state, q, k, v, out, skip_output_reshape=skip_output_reshape)
+                out = apply_nag(state, q, k, v, out, skip_output_reshape=skip_output_reshape,
+                                transformer_options=options, attn_mask=kwargs.get("mask"))
             except Exception as exc:
                 if state.nag.strict or state.policy.strict:
                     raise RuntimeError(f"{LOG} NAG failed: {type(exc).__name__}: {exc}") from exc
@@ -280,7 +287,10 @@ def make_attention_override(state):
             try:
                 gain = feta_gain(state, q, k)
                 if gain is not None:
-                    out = _scale_video_output(state, out, gain, skip_output_reshape=skip_output_reshape)
+                    # A NAG-cloned output is exclusively ours: scale it in place
+                    # instead of cloning the packed tensor a second time.
+                    out = _scale_video_output(state, out, gain, skip_output_reshape=skip_output_reshape,
+                                              owned=out is not nag_input)
             except Exception as exc:
                 if state.policy.strict:
                     raise RuntimeError(f"{LOG} FETA failed: {type(exc).__name__}: {exc}") from exc

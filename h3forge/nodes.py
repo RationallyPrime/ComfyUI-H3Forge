@@ -164,6 +164,9 @@ def _run_wrapper(state):
         try:
             return executor(*args, **kwargs)
         finally:
+            # Free the NAG sidecar K/V cache when sampling ends; holding it
+            # until the next H3Forge run would pin its VRAM through decoding.
+            state.nag_runtime = None
             if state.sparse_calls or state.dense_calls:
                 print(f"{LOG} {state.stats()}", flush=True)
     return wrapper
@@ -195,8 +198,8 @@ def _forward_wrapper(state):
                     raise
                 state.note_decline(f"layout-error:{type(exc).__name__}")
         state.layout = layout
-        state.step_index, state.total_steps = resolve_step(transformer_options)
         state.current_sigma = resolve_sigma(transformer_options)
+        state.step_index, state.total_steps = resolve_step(transformer_options, sigma=state.current_sigma)
         sentinel = object()
         previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
         if layout is not None:

@@ -160,7 +160,8 @@ def negative_text_kv(state, cfg: NAGConfig, block_index: int, *, heads: int, hea
 
 
 def apply_nag(state, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, *,
-              skip_output_reshape: bool) -> torch.Tensor:
+              skip_output_reshape: bool, transformer_options: dict | None = None,
+              attn_mask: torch.Tensor | None = None) -> torch.Tensor:
     """Inject the NAG text-guidance delta into target audio/video attention rows."""
     cfg = state.nag
     if cfg is None or state.layout is None or state.block_index is None:
@@ -169,9 +170,24 @@ def apply_nag(state, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: tor
         return out
     if cfg.alpha <= 0.0 or cfg.scale <= 1.0:
         return out
+    if cfg.video_strength == 0.0 and cfg.audio_strength == 0.0:
+        return out
     if state.current_sigma is not None and state.current_sigma < cfg.sigma_end:
         return out
+    cond_or_uncond = (transformer_options or {}).get("cond_or_uncond")
+    if cond_or_uncond is not None and any(flag != 0 for flag in cond_or_uncond):
+        # NAG guides the positive branch only. Under a CFG guider the uncond
+        # forward (batched with cond, or separate under low VRAM) must pass
+        # through untouched, or the delta would distort the CFG difference.
+        state.note_decline("nag-uncond-forward")
+        return out
+    if attn_mask is not None:
+        # The real attention excluded masked keys; a maskless sidecar delta
+        # would be computed over keys the model's output never saw.
+        state.note_decline("nag-preexisting-mask")
+        return out
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[2] != state.layout.seq_len:
+        state.note_decline("nag-unexpected-q-shape")
         return out
 
     seg = target_segments(state.layout)
