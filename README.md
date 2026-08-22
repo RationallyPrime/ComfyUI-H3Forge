@@ -10,6 +10,12 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
+## Status
+
+The GPU integration gate has been passed: three GPU sessions on Blackwell hardware have run H3Forge against a live H3 checkpoint. Headline result so far: a **full one-minute synchronized audio/video clip produced in a single generation** on the chained A/V context-window path, peaking **under 50 GB of VRAM**.
+
+Systematic numbers against `BLACKWELL_TEST_MATRIX.md` (sparse sweeps, seam/identity scoring, NAG acceptance) are still being collected. Treat the knob defaults in this README as working starting points, not tuned optima.
+
 ## What is implemented
 
 ### H3 Forge — Sliding Attention + FETA
@@ -121,9 +127,9 @@ Four nodes should appear:
 
 The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The pipe-timeline node accepts MiniMax's `CLIP` and returns the positive `CONDITIONING` used by the guider; the NAG node additionally takes the negative `CONDITIONING`.
 
-## First Blackwell bring-up
+## GPU bring-up protocol
 
-Do **not** turn every knob on for the first run. Use a known-good H3 workflow and keep seed/prompt/resolution/steps fixed.
+This protocol was used for the initial Blackwell bring-up and remains the recommended path when validating a new GPU, driver, or ComfyUI build. Do **not** turn every knob on for the first run. Use a known-good H3 workflow and keep seed/prompt/resolution/steps fixed.
 
 ### Run 0 — baseline
 
@@ -310,7 +316,7 @@ Static syntax check:
 python -m compileall -q .
 ```
 
-GPU/model correctness cannot be validated without a loaded H3 checkpoint and CUDA device. The first Blackwell session is therefore the integration gate.
+The CPU tests cannot validate GPU/model correctness on their own — that requires a loaded H3 checkpoint and a CUDA device, and has now been exercised in live GPU sessions (see [Status](#status)). They remain the fast pre-GPU gate for the scheduler, mask, and blend math.
 
 ## Design lineage
 
