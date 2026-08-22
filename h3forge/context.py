@@ -100,12 +100,11 @@ def make_context_wrapper(policy: ContextPolicy):
             model = executor.class_obj
             padded_h, padded_w = padded_spatial_shape(video_x.shape[3], video_x.shape[4], model.patch_size)
 
-            if prompt_segments and not transformer_options.get("h3forge_pipe_prompt_announced", False):
+            if prompt_segments and step == 0:
                 print(
                     f"{LOG} pipe prompt segments={len(prompt_segments)} mapped across {total_t} video latents",
                     flush=True,
                 )
-                transformer_options["h3forge_pipe_prompt_announced"] = True
 
             video_acc = torch.zeros_like(video_x)
             video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
