@@ -13,7 +13,9 @@ The project is deliberately a custom-node patch layer. It does **not** fork or m
 
 ## Status
 
-The GPU integration gate has been passed: three GPU sessions on Blackwell hardware have run H3Forge against a live H3 checkpoint. Headline result so far: a **full one-minute synchronized audio/video clip produced in a single generation** on the chained A/V context-window path, peaking **under 50 GB of VRAM**.
+The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip** from a 1,450-frame AV latent in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
+
+Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. Peak denoising memory is governed mainly by the active window, while wall time and total work continue to grow with the number of windows. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
 
 Systematic numbers against `BLACKWELL_TEST_MATRIX.md` (sparse sweeps, seam/identity scoring, NAG acceptance) are still being collected. Treat the knob defaults in this README as working starting points, not tuned optima.
 
@@ -112,7 +114,7 @@ The node composes with `H3 Forge — Sliding Attention + FETA` in either wiring 
 - CUDA strongly recommended; sparse FlexAttention is not intended as a CPU execution path.
 - No extra Python package is required by H3Forge itself.
 
-The code was authored against the ComfyUI MiniMax-H3 implementation current on 2026-08-21.
+The code was authored against the native ComfyUI MiniMax-H3 implementation and most recently rechecked live with ComfyUI `0.34.0`, Python `3.12.3`, and PyTorch `2.13.0+cu130` on 2026-09-03.
 
 ## Install
 
@@ -134,6 +136,15 @@ Five nodes should appear:
 - `H3 Forge — Normalized Attention Guidance` (experimental)
 
 The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the video/audio VAEs and one-to-four images, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
+
+For the recommended feed-forward memory reduction, also install [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes):
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/kijai/ComfyUI-KJNodes.git
+```
+
+Restart ComfyUI after installing either custom-node package.
 
 ## GPU bring-up protocol
 
@@ -299,11 +310,19 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 
 ### Composing with ComfyUI-KJNodes
 
-Kijai's KJNodes ships focused native-H3 nodes that compose well with H3Forge and belong in the canonical workflow:
+Kijai's KJNodes ships several native-H3 utilities. Only the feed-forward chunker belongs in the default H3Forge model chain:
 
-- **MiniMax H3 Chunk FeedForward** — chunks SwiGLU along packed-token rows; rows are independent, so this is intended to be mathematically exact while reducing peak activation memory. Recommended by default alongside H3Forge.
-- **MiniMax H3 Token Counter** — reports the true packed token count (text, keyframes/references, audio, video). Put it in every diagnostic workflow; packed sequence length is the quantity that actually predicts attention cost.
-- **MiniMax H3 Low VRAM Attention** — composes through `optimized_attention`, so it can run under H3Forge sparse mode, but its head grouping invokes the override once per head group. Ordinary sparse attention is mathematically separable across head groups; H3Forge's *sampled* FETA gain is not, and could differ per group. For a clean equivalence test run `KJ Low VRAM Attention + H3Forge sparse + FETA disabled`, and treat that combination as the supported mode until FETA computes one global gain across groups.
+```text
+selected H3 model
+  → MiniMax H3 Chunk FeedForward
+  → H3 Forge — Chained A/V Context Windows
+  → H3 Forge — Sliding Attention + FETA
+  → scheduler and guider
+```
+
+- **MiniMax H3 Chunk FeedForward** — chunks the packed-token rows of each SwiGLU feed-forward block. Those rows are independent, and INT8 activation quantization is per-token, so the operation is intended to match the unchunked model while reducing peak activation memory. Start with KJNodes' defaults, `chunks=2` and `seq_threshold=4096`. H3Forge patches context/attention behavior at different seams, so the chunker can stay enabled for baseline, sparse, and context-window runs.
+- **MiniMax H3 Token Counter** — optional diagnostics only. It passes the latent and conditioning through while reporting the true packed count for text, references/keyframes, audio, and video. Add it when investigating attention cost or kernel limits; it does not need to occupy the canonical model chain.
+- **MiniMax H3 Low VRAM Attention** — experimental and intentionally excluded from the canonical H3Forge workflow. It replaces H3 block/attention forwards and may split the attention override into head groups. Before combining it with H3Forge, require a fixed-seed equivalence run with FETA disabled; sampled FETA gain is not guaranteed to remain global across separate head-group calls.
 
 ### Approximate accelerators
 
