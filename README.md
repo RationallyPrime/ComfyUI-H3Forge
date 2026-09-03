@@ -13,7 +13,7 @@ The project is deliberately a custom-node patch layer. It does **not** fork or m
 
 ## Status
 
-The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip** from a 1,450-frame AV latent in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
+The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
 
 Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. Peak denoising memory is governed mainly by the active window, while wall time and total work continue to grow with the number of windows. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
 
@@ -152,7 +152,7 @@ This protocol was used for the initial Blackwell bring-up and remains the recomm
 
 ### Run 0 — baseline
 
-No H3Forge nodes. Record:
+No H3Forge nodes and no KJNodes chunker: this is the native reference (`B0`) that every later equivalence check compares against. Record:
 
 - wall time;
 - peak VRAM;
@@ -320,7 +320,7 @@ selected H3 model
   → scheduler and guider
 ```
 
-- **MiniMax H3 Chunk FeedForward** — chunks the packed-token rows of each SwiGLU feed-forward block. Those rows are independent, and INT8 activation quantization is per-token, so the operation is intended to match the unchunked model while reducing peak activation memory. Start with KJNodes' defaults, `chunks=2` and `seq_threshold=4096`. H3Forge patches context/attention behavior at different seams, so the chunker can stay enabled for baseline, sparse, and context-window runs.
+- **MiniMax H3 Chunk FeedForward** — chunks the packed-token rows of each SwiGLU feed-forward block. Those rows are independent, and INT8 activation quantization is per-token, so the operation is intended to match the unchunked model while reducing peak activation memory. Start with KJNodes' defaults, `chunks=2` and `seq_threshold=4096`. H3Forge patches context/attention behavior at different seams, so the chunker composes with sparse and context-window runs, but it is gated rather than assumed: keep it **out** of the native baseline (Run 0 / `B0`), then verify it once against that unchunked baseline with fixed seeds (`BLACKWELL_TEST_MATRIX.md`, KJNodes composition checks). Leave it enabled only after that equivalence check passes; otherwise a chunker discrepancy would be misattributed to H3Forge in every later comparison.
 - **MiniMax H3 Token Counter** — optional diagnostics only. It passes the latent and conditioning through while reporting the true packed count for text, references/keyframes, audio, and video. Add it when investigating attention cost or kernel limits; it does not need to occupy the canonical model chain.
 - **MiniMax H3 Low VRAM Attention** — experimental and intentionally excluded from the canonical H3Forge workflow. It replaces H3 block/attention forwards and may split the attention override into head groups. Before combining it with H3Forge, require a fixed-seed equivalence run with FETA disabled; sampled FETA gain is not guaranteed to remain global across separate head-group calls.
 
