@@ -5,7 +5,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 1. **H3-native sliding/radial sparse attention** using PyTorch FlexAttention.
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
 3. **Synchronized audio/video context windows** with overlap-add blending and absolute H3 RoPE preservation.
-4. **Pipe-delimited timeline prompting** with independently encoded, equal-time prompt segments.
+4. **Pipe-delimited timeline prompting** with independently encoded, optionally unequal prompt spans and a reusable global anchor.
 5. **Reference-aware pipe prompting** that reuses ComfyUI's native Ref2VA encoder for every segment.
 6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
 
@@ -13,7 +13,7 @@ The project is deliberately a custom-node patch layer. It does **not** fork or m
 
 ## Status
 
-The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip** from a 1,450-frame AV latent in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
+The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
 
 Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. Peak denoising memory is governed mainly by the active window, while wall time and total work continue to grow with the number of windows. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
 
@@ -69,21 +69,28 @@ That absolute-position transplant is important: a context window beginning at la
 
 ### H3 Forge — Pipe Timeline Prompt
 
-This node splits a prompt on `|`, encodes every segment independently with MiniMax's Qwen3-VL text encoder, and maps the segments in order across equal portions of the target timeline. It is not a decorative delimiter passed to one global text encoding.
+This node splits a prompt on `|`, encodes every segment independently with MiniMax's Qwen3-VL text encoder, and maps the segments in order across the target timeline. It is not a decorative delimiter passed to one global text encoding.
+
+Two optional inputs make the timeline less toy-like:
+
+- `global_prompt` is repeated inside every independent segment encoding. Put the identity/style/location anchors that truly apply throughout the video here instead of maintaining identical copies by hand.
+- `segment_durations` accepts exactly one positive number per segment, separated by commas or newlines. The numbers are relative durations, so `2,18,40` means the same thing whether you think of them as seconds, frames, or beats. They do not have to add up to the output length. Leave the field empty for equal spans.
 
 All segment embeddings are padded to one token length before sampling, preserving one compiled H3 context shape. Each synchronized A/V context window uses the **complete encoding of the one segment covering its midpoint** — contextualized token slots from independently encoded prompts do not correspond to one another, so hidden states are never interpolated. Around a prompt boundary, adjacent windows generated under different prompts crossfade in **output space** through the context-window overlap-add blend, which is where blending is semantically sound.
 
 Segments must share the same conditioning structure: differing multimodal inserts or presentation tags across segments are rejected at encode time rather than silently stamped with segment 1's metadata.
 
-Segments must not outnumber the context windows that can select them: if a segment's equal-time span contains no window midpoint, H3Forge warns at the first step (or aborts in strict mode) instead of letting that prompt silently vanish. Use fewer segments or a smaller `window_frames`.
+Segments must not outnumber the context windows that can select them: if a segment's requested span contains no window midpoint, H3Forge warns at the first step (or aborts in strict mode) instead of letting that prompt silently vanish. This can also happen when an unequal segment is shorter than the context window's reachable midpoint range. Use fewer segments, lengthen the affected duration, or use a smaller `window_frames`.
 
 Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 AV Latent`. A single segment is valid and behaves like ordinary global conditioning. Escape a literal pipe as `\|`.
 
-Every segment is encoded independently. Write each segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`), and repeat concrete identity, wardrobe, location, lighting, voice, and style anchors inside every segment. Do not use cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; those words refer to context the segment encoder cannot see. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.
+Every segment is encoded independently. Write each local segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`). Put concrete identity, wardrobe, location, lighting, voice, and style anchors in `global_prompt`, or repeat them manually when they change between segments. Do not rely on cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; the local segment encoder cannot see a previous segment. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.
+
+At sampler step zero, the context node prints one compact plan containing the actual latent length, window count, effective stagger phase, window/overlap settings, total video-latent visits, and a run-length-compressed prompt-to-window assignment. `video_latent_visits` is an overlap accounting ratio, not a wall-time or VRAM prediction.
 
 ### H3 Forge — Reference Pipe Timeline Prompt
 
-This is the image-reference counterpart to the text-only pipe node. It splits on `|`, invokes ComfyUI's native `MiniMaxH3ReferenceToVideo` encoder independently for every self-contained segment with the same one-to-four reference images, validates that their multimodal token-tag structure matches, and returns both the combined positive conditioning and native AV latent. The first segment's identical native reference payload supplies the global reference prefix; every local context window receives the complete reference-aware Qwen encoding selected for its midpoint.
+This is the image-reference counterpart to the text-only pipe node. It splits on `|`, invokes ComfyUI's native `MiniMaxH3ReferenceToVideo` encoder independently for every self-contained segment with the same one-to-four reference images, validates that their multimodal token-tag structure matches, and returns both the combined positive conditioning and native AV latent. It supports the same optional `global_prompt` and `segment_durations` inputs. The first segment's identical native reference payload supplies the global reference prefix; every local context window receives the complete reference-aware Qwen encoding selected for its midpoint.
 
 Use full Ref2VA prompt grammar inside **every** segment (`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`) and keep reference labels and subject definitions identical. This node intentionally does not expose reference video or reference audio inputs yet; use the native node directly when those modalities matter.
 
@@ -152,7 +159,7 @@ This protocol was used for the initial Blackwell bring-up and remains the recomm
 
 ### Run 0 — baseline
 
-No H3Forge nodes. Record:
+No H3Forge nodes and no KJNodes chunker: this is the native reference (`B0`) that every later equivalence check compares against. Record:
 
 - wall time;
 - peak VRAM;
@@ -279,6 +286,14 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 `stagger`
 : Moves interior window boundaries by at most the overlap amount across sampling steps while preserving complete coverage.
 
+### Timeline prompt
+
+`global_prompt`
+: An optional shared anchor included in every segment before that segment is independently encoded. It saves repetition; it is not a separate globally attended token bank.
+
+`segment_durations`
+: Comma- or newline-delimited positive relative durations, with exactly one value per `|` segment. Empty means equal spans. Selection remains hard and midpoint-based per context window; the overlap-add blend performs the boundary crossfade in output space.
+
 ### NAG
 
 `nag_scale`
@@ -320,7 +335,7 @@ selected H3 model
   → scheduler and guider
 ```
 
-- **MiniMax H3 Chunk FeedForward** — chunks the packed-token rows of each SwiGLU feed-forward block. Those rows are independent, and INT8 activation quantization is per-token, so the operation is intended to match the unchunked model while reducing peak activation memory. Start with KJNodes' defaults, `chunks=2` and `seq_threshold=4096`. H3Forge patches context/attention behavior at different seams, so the chunker can stay enabled for baseline, sparse, and context-window runs.
+- **MiniMax H3 Chunk FeedForward** — chunks the packed-token rows of each SwiGLU feed-forward block. Those rows are independent, and INT8 activation quantization is per-token, so the operation is intended to match the unchunked model while reducing peak activation memory. Start with KJNodes' defaults, `chunks=2` and `seq_threshold=4096`. H3Forge patches context/attention behavior at different seams, so the chunker composes with sparse and context-window runs, but it is gated rather than assumed: keep it **out** of the native baseline (Run 0 / `B0`), then verify it once against that unchunked baseline with fixed seeds (`BLACKWELL_TEST_MATRIX.md`, KJNodes composition checks). Leave it enabled only after that equivalence check passes; otherwise a chunker discrepancy would be misattributed to H3Forge in every later comparison.
 - **MiniMax H3 Token Counter** — optional diagnostics only. It passes the latent and conditioning through while reporting the true packed count for text, references/keyframes, audio, and video. Add it when investigating attention cost or kernel limits; it does not need to occupy the canonical model chain.
 - **MiniMax H3 Low VRAM Attention** — experimental and intentionally excluded from the canonical H3Forge workflow. It replaces H3 block/attention forwards and may split the attention override into head groups. Before combining it with H3Forge, require a fixed-seed equivalence run with FETA disabled; sampled FETA gain is not guaranteed to remain global across separate head-group calls.
 
@@ -331,7 +346,7 @@ selected H3 model
 
 ## Test locally
 
-The included CPU tests cover scheduler coverage, blend-edge correction, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
+The included CPU tests cover scheduler coverage, unequal prompt-span routing, global-anchor propagation, context-plan reporting, blend-edge correction, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
 
 ```bash
 PYTHONPATH=. python -m pytest -q tests
@@ -345,14 +360,17 @@ python -m compileall -q .
 
 The CPU tests cannot validate GPU/model correctness on their own — that requires a loaded H3 checkpoint and a CUDA device, and has now been exercised in live GPU sessions (see [Status](#status)). They remain the fast pre-GPU gate for the scheduler, mask, and blend math.
 
-## Design lineage
+## Design lineage and nearby work
 
-H3Forge is an original implementation informed by:
+H3Forge is an original implementation informed by native ComfyUI's MiniMax-H3 packed layout and wrapper seams, WanVideoWrapper's context scheduling, and Enhance-A-Video/FETA's off-diagonal temporal-attention gain. The H3 ecosystem now has several useful neighboring projects:
 
-- native ComfyUI MiniMax-H3 packed layout and wrapper seams;
-- the sparse-attention integration pattern demonstrated by ComfyUI-SolAttn-H3;
-- WanVideoWrapper's context-window scheduling ideas;
-- Enhance-A-Video/FETA's off-diagonal temporal-attention gain.
+- [ComfyUI-SolAttn-H3](https://github.com/quzopl/ComfyUI-SolAttn-H3) demonstrates disciplined sparse-attention integration, named fallback reasons, self-tests, and per-run telemetry. H3Forge keeps its own H3-aware sparse topology and now applies the same principle of reporting the actual context plan it ran.
+- [ComfyUI-YCNodes-MiniMax-H3](https://github.com/yichengup/ComfyUI-YCNodes-MiniMax-H3) introduced a practical global/local Prompt Relay UI with explicit segment lengths. [T8's MiniMax H3 nodes](https://github.com/T8mars/comfyui-minimax-h3-audio-T8) go further with validated frame/second/percent ranges and absolute-timeline projection across sequential long-video segments. H3Forge independently adopts the small composable part that fits its different mechanism: a repeated global anchor and exact unequal relative spans for independently encoded context-window prompts.
+- [ComfyUI-MMH3Tools](https://github.com/ckinpdx/ComfyUI-MMH3Tools) and [ComfyUI-H3-Toolkit](https://github.com/wordbrew/ComfyUI-H3-Toolkit) are stronger at H3 frame/audio-grid utilities, workflow validation, and staged long-video mechanics. H3Forge continues to use its own synchronized per-denoise A/V windows with transplanted absolute positions rather than importing a sequential continuation engine.
+- [ComfyUI-MiniMax-H3-LongMedia](https://github.com/vizart-vj/ComfyUI-MiniMax-H3-LongMedia) is a fuller end-user long-media system with sequential execution, continuation overlap, streaming/offload, and a memory governor. H3Forge remains the smaller inference-surgery layer and composes with KJNodes' feed-forward chunker instead of duplicating that application shell.
+- [H3-Optimizations](https://github.com/Zironic/H3-Optimizations) provides unusually thorough GPU diagnostics and benchmark harnesses. H3Forge's retained artifact and Blackwell matrix serve the same evidence goal, but its benchmark coverage is still less mature.
+
+These are design comparisons, not copied source. In particular, T8 is GPL-3.0-or-later while H3Forge is Apache-2.0; H3Forge's duration routing and reporting here were implemented independently against its existing data path.
 
 No upstream model weights are included.
 

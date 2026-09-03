@@ -1,13 +1,22 @@
 import pytest
 import torch
 
-from h3forge.context import assert_full_coverage, audio_overlap_frames, blend_weights, window_starts
+from h3forge.context import (
+    ContextPolicy,
+    assert_full_coverage,
+    audio_overlap_frames,
+    blend_weights,
+    context_plan_summary,
+    make_context_wrapper,
+    window_starts,
+)
 from h3forge.layout import expand_audio_range, padded_spatial_shape
 from h3forge.prompt import (
     combine_conditioning_segments,
     encode_pipe_prompt,
     make_segmented_extra_conds,
     pad_segment_contexts,
+    parse_segment_durations,
     select_segment_index,
     split_pipe_prompt,
     unreachable_segments,
@@ -93,6 +102,17 @@ def test_pipe_prompt_rejects_empty_segments():
         split_pipe_prompt("first || third")
 
 
+def test_segment_durations_are_exact_and_fail_closed():
+    assert parse_segment_durations("2, 18\n40", 3) == (2.0, 18.0, 40.0)
+    assert parse_segment_durations("", 3) == (1.0, 1.0, 1.0)
+    with pytest.raises(ValueError, match="exactly one"):
+        parse_segment_durations("2,18", 3)
+    with pytest.raises(ValueError, match="greater than zero"):
+        parse_segment_durations("2,0,40", 3)
+    with pytest.raises(ValueError, match="greater than zero"):
+        parse_segment_durations("2,nan,40", 3)
+
+
 def test_segment_contexts_pad_to_one_compiled_shape():
     contexts = [torch.ones(1, 2, 3), torch.full((1, 4, 3), 2.0)]
     padded = pad_segment_contexts(contexts)
@@ -117,6 +137,52 @@ def test_segment_selection_is_hard_and_midpoint_based():
         select_segment_index(0, 5, 10, 0)
 
 
+def test_segment_selection_respects_unequal_durations():
+    durations = (2.0, 18.0, 40.0)
+    # On a 60-latent timeline, the requested boundaries are exactly 2 and 20.
+    assert select_segment_index(0, 2, 60, 3, durations) == 0
+    assert select_segment_index(1, 3, 60, 3, durations) == 1
+    assert select_segment_index(10, 20, 60, 3, durations) == 1
+    assert select_segment_index(20, 40, 60, 3, durations) == 2
+    with pytest.raises(ValueError, match="expected 3"):
+        select_segment_index(0, 2, 60, 3, (1.0, 2.0))
+
+
+def test_segment_selection_is_scale_safe_for_huge_durations():
+    durations = (1e307, 1e307)
+    assert select_segment_index(0, 50, 100, 2, durations) == 0
+    assert select_segment_index(50, 100, 100, 2, durations) == 1
+
+
+def test_segment_selection_is_scale_invariant():
+    # Durations are unitless ratios, so a huge or tiny finite scale must route
+    # exactly like its reduced form, including when sum(weights) itself would
+    # overflow in float.
+    windows = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]
+    for scaled in ((1e307, 1e307), (1e308, 1e308), (1e-307, 1e-307)):
+        assert [select_segment_index(v0, v1, 60, 2, scaled) for v0, v1 in windows] == [
+            select_segment_index(v0, v1, 60, 2, (1.0, 1.0)) for v0, v1 in windows
+        ]
+
+    # Preserve unequal user-entered ratios too, especially at exact cuts.
+    baseline = parse_segment_durations("1,3", 2)
+    scaled = parse_segment_durations("1e307,3e307", 2)
+    assert select_segment_index(0, 2, 4, 2, baseline) == 1
+    assert select_segment_index(0, 2, 4, 2, scaled) == 1
+
+
+def test_segment_selection_ties_are_exact():
+    # A midpoint sitting exactly on a duration boundary belongs to the later
+    # segment (strict less-than), independent of float rounding: with (1,1,10)
+    # on 60 latents the boundaries are exactly 5 and 10.
+    durations = (1.0, 1.0, 10.0)
+    assert select_segment_index(0, 10, 60, 3, durations) == 1
+    assert select_segment_index(1, 9, 60, 3, durations) == 1
+    assert select_segment_index(0, 20, 60, 3, durations) == 2
+    assert select_segment_index(4, 6, 60, 3, durations) == 1
+    assert select_segment_index(3, 6, 60, 3, durations) == 0
+
+
 def test_unreachable_segments_detected_when_segments_outnumber_windows():
     # 30 latents with the default 25/5 policy give windows [0,25) and [5,30);
     # both midpoints land in segment 2 of 3, so segments 1 and 3 would vanish.
@@ -126,6 +192,47 @@ def test_unreachable_segments_detected_when_segments_outnumber_windows():
     # With enough windows every segment is selected somewhere.
     assert unreachable_segments(window_starts(60, 25, 5, 0), 25, 60, 3) == []
     assert unreachable_segments(window_starts(30, 25, 5, 0), 25, 30, 1) == []
+
+
+def test_context_plan_reports_work_and_prompt_assignment():
+    summary = context_plan_summary(
+        total=60,
+        starts=[0, 20, 35],
+        window=25,
+        overlap=5,
+        phase=0,
+        prompt_count=3,
+        prompt_durations=(2.0, 18.0, 40.0),
+    )
+    assert "windows=3" in summary
+    assert "video_latent_visits=1.25x" in summary
+    assert "prompt_windows=2x1,3x2" in summary
+
+
+def test_single_window_path_emits_step_zero_context_plan(capsys):
+    class Executor:
+        def __call__(self, x, timestep, context, transformer_options, **kwargs):
+            return x
+
+    wrapper = make_context_wrapper(ContextPolicy(window_frames=25, overlap_frames=5))
+    video = torch.zeros(1, 1, 10, 1, 1)
+    audio = torch.zeros(1, 1, 1, 20)
+    transformer_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.0]),
+        "sigmas": torch.tensor([1.0]),
+    }
+    result = wrapper(
+        Executor(),
+        [video, audio],
+        timestep=None,
+        context=torch.zeros(1, 1, 1),
+        transformer_options=transformer_options,
+    )
+    assert result[0] is video
+    assert result[1] is audio
+    receipt = capsys.readouterr().out
+    assert "context plan video_latents=10 windows=1 window/overlap=10/0" in receipt
+    assert "phase=0 video_latent_visits=1.00x" in receipt
 
 
 class _Clip:
@@ -152,6 +259,28 @@ def test_pipe_segments_are_encoded_independently_and_annotated():
     assert metadata["h3forge_prompt_segment_count"] == 2
     assert [tuple(x.shape) for x in metadata["h3forge_prompt_segments"]] == [(1, 4, 2), (1, 4, 2)]
     assert torch.equal(metadata["minimax_token_tags"], torch.ones(4, dtype=torch.long))
+
+
+def test_pipe_prompt_repeats_global_anchor_and_carries_durations():
+    seen = []
+
+    class RecordingClip(_Clip):
+        @staticmethod
+        def tokenize(text):
+            seen.append(text)
+            return text
+
+    conditioning = encode_pipe_prompt(
+        RecordingClip(),
+        "first action | second action",
+        global_prompt="same red coat, 35mm film",
+        segment_durations="2, 8",
+    )
+    assert seen == [
+        "same red coat, 35mm film\n\nfirst action",
+        "same red coat, 35mm film\n\nsecond action",
+    ]
+    assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2.0, 8.0)
 
 
 def test_reference_conditioning_segments_retain_shared_native_payload():
@@ -206,8 +335,14 @@ def test_segment_contexts_are_carried_through_minimax_payload():
 
     wrapper = make_segmented_extra_conds(base_extra_conds, BaseModel(), Diffusion())
     raw = (torch.zeros(1, 3, 2), torch.ones(1, 3, 2))
-    result = wrapper(device="cpu", seed=7, h3forge_prompt_segments=raw)
+    result = wrapper(
+        device="cpu",
+        seed=7,
+        h3forge_prompt_segments=raw,
+        h3forge_prompt_segment_durations=(2.0, 8.0),
+    )
     payload = result["minimax_payload"].cond
     assert payload["seed"] == 7
     assert torch.equal(payload["h3forge_prompt_segments"][0], torch.ones_like(raw[0]))
     assert torch.equal(payload["h3forge_prompt_segments"][1], torch.full_like(raw[1], 2))
+    assert payload["h3forge_prompt_segment_durations"] == (2.0, 8.0)

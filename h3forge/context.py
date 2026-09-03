@@ -81,6 +81,44 @@ def assert_full_coverage(video_den: torch.Tensor, audio_den: torch.Tensor) -> No
         raise RuntimeError("context windows left audio latents with zero accumulated blend weight")
 
 
+def context_plan_summary(
+    total: int,
+    starts: list[int],
+    window: int,
+    overlap: int,
+    *,
+    phase: int,
+    prompt_count: int = 0,
+    prompt_durations=None,
+) -> str:
+    """Return one compact, truthful account of a context-window pass."""
+    ranges = [(start, min(start + window, total)) for start in starts]
+    latent_visits = sum(end - start for start, end in ranges) / max(total, 1)
+    bits = [
+        f"video_latents={total}",
+        f"windows={len(ranges)}",
+        f"window/overlap={window}/{overlap}",
+        f"phase={phase}",
+        f"video_latent_visits={latent_visits:.2f}x",
+    ]
+    if prompt_count:
+        assigned = [
+            select_segment_index(start, end, total, prompt_count, prompt_durations) + 1
+            for start, end in ranges
+        ]
+        runs = []
+        for index in assigned:
+            if runs and runs[-1][0] == index:
+                runs[-1][1] += 1
+            else:
+                runs.append([index, 1])
+        bits.append(
+            "prompt_windows="
+            + ",".join(f"{index}x{count}" for index, count in runs)
+        )
+    return " ".join(bits)
+
+
 def _slice_optional_video(mask, v0, v1):
     if mask is None:
         return None
@@ -100,6 +138,7 @@ def make_context_wrapper(policy: ContextPolicy):
         total_t = int(video_x.shape[2])
         payload = dict(kwargs.get("minimax_payload") or {})
         prompt_segments = payload.get("h3forge_prompt_segments")
+        prompt_durations = payload.get("h3forge_prompt_segment_durations")
         step, _ = resolve_step(transformer_options)
 
         if total_t <= policy.window_frames:
@@ -113,6 +152,19 @@ def make_context_wrapper(policy: ContextPolicy):
                     raise RuntimeError(message)
                 if step in (None, 0):
                     print(message, flush=True)
+            if step == 0:
+                summary = context_plan_summary(
+                    total_t,
+                    [0],
+                    total_t,
+                    0,
+                    phase=0,
+                )
+                if prompt_segments:
+                    # The fast path runs the primary conditioning context
+                    # directly; it does not use midpoint selection.
+                    summary += " prompt_windows=1x1"
+                print(f"{LOG} context plan " + summary, flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         full_layout = payload.get("layout")
@@ -127,7 +179,10 @@ def make_context_wrapper(policy: ContextPolicy):
             stride = policy.window_frames - policy.overlap_frames
             phase = 0
             if policy.stagger and stride > 2 and step is not None:
-                phase = (step * max(stride // 3, 1)) % stride
+                phase = min(
+                    (step * max(stride // 3, 1)) % stride,
+                    policy.overlap_frames,
+                )
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
             if prompt_segments:
                 # Validate reachability over every stagger phase the run can
@@ -142,7 +197,7 @@ def make_context_wrapper(policy: ContextPolicy):
                 for p in sorted(phases):
                     missing_union.update(unreachable_segments(
                         window_starts(total_t, policy.window_frames, policy.overlap_frames, p),
-                        policy.window_frames, total_t, len(prompt_segments)))
+                        policy.window_frames, total_t, len(prompt_segments), prompt_durations))
                 missing = sorted(missing_union)
                 if missing:
                     message = (
@@ -165,9 +220,17 @@ def make_context_wrapper(policy: ContextPolicy):
             model = executor.class_obj
             padded_h, padded_w = padded_spatial_shape(video_x.shape[3], video_x.shape[4], model.patch_size)
 
-            if prompt_segments and step == 0:
+            if step == 0:
                 print(
-                    f"{LOG} pipe prompt segments={len(prompt_segments)} mapped across {total_t} video latents",
+                    f"{LOG} context plan " + context_plan_summary(
+                        total_t,
+                        starts,
+                        policy.window_frames,
+                        policy.overlap_frames,
+                        phase=phase,
+                        prompt_count=len(prompt_segments) if prompt_segments else 0,
+                        prompt_durations=prompt_durations,
+                    ),
                     flush=True,
                 )
 
@@ -184,7 +247,8 @@ def make_context_wrapper(policy: ContextPolicy):
                     # different prompts do not correspond, so windows never mix
                     # hidden states — boundary crossfade happens in output space
                     # through the overlap-add below.
-                    segment_index = select_segment_index(v0, v1, total_t, len(prompt_segments))
+                    segment_index = select_segment_index(
+                        v0, v1, total_t, len(prompt_segments), prompt_durations)
                     local_context = prompt_segments[segment_index]
                 local_layout = clone_window_layout(
                     full_layout=full_layout,

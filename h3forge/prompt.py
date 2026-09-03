@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +37,69 @@ def split_pipe_prompt(prompt: str) -> list[str]:
     return segments
 
 
+Duration = int | float | str | Fraction
+
+
+def _duration_fraction(value: Duration) -> Fraction:
+    """Resolve one duration without inheriting avoidable binary-float drift."""
+    if isinstance(value, Fraction):
+        resolved = value
+    elif isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("segment durations must be finite and greater than zero")
+        # ``str(float)`` retains the user's decimal-scale intent. Feeding the
+        # float directly to Fraction would instead preserve its binary storage
+        # error, so equivalent ratios such as (1,3) and (1e307,3e307) could
+        # disagree exactly at a cut boundary.
+        resolved = Fraction(str(value))
+    else:
+        try:
+            resolved = Fraction(str(value).strip())
+        except (ValueError, ZeroDivisionError) as exc:
+            raise ValueError("segment durations must contain only numbers") from exc
+    if resolved <= 0:
+        raise ValueError("segment durations must be finite and greater than zero")
+    return resolved
+
+
+def parse_segment_durations(raw: str | None, count: int) -> tuple[Fraction, ...]:
+    """Parse positive comma/newline-delimited prompt durations.
+
+    Values are deliberately unitless: ``2,18,40`` can mean seconds, frames,
+    beats, or any other durations because only their relative proportions are
+    needed to map them onto the target latent timeline. An empty input retains
+    the original equal-duration behaviour.
+    """
+    if count < 1:
+        raise ValueError("segment count must be positive")
+    if raw is None or not str(raw).strip():
+        return (Fraction(1),) * count
+
+    parts = [part.strip() for line in str(raw).splitlines() for part in line.split(",")]
+    if any(not part for part in parts):
+        raise ValueError("segment_durations contains an empty value")
+    if len(parts) != count:
+        raise ValueError(
+            f"segment_durations needs exactly one value per prompt segment "
+            f"({count} segments, {len(parts)} values)"
+        )
+    try:
+        decimals = tuple(Decimal(part) for part in parts)
+    except InvalidOperation as exc:
+        raise ValueError("segment_durations must contain only numbers") from exc
+    if any(not value.is_finite() or value <= 0 for value in decimals):
+        raise ValueError("segment_durations values must be finite and greater than zero")
+    return tuple(Fraction(part) for part in parts)
+
+
+def compose_segment_prompts(segments: Sequence[str], global_prompt: str = "") -> list[str]:
+    """Repeat an optional global anchor inside every independent encoding."""
+    anchor = str(global_prompt).strip()
+    if not anchor:
+        return list(segments)
+    return [f"{anchor}\n\n{segment}" for segment in segments]
+
+
 def pad_segment_contexts(contexts: Sequence[torch.Tensor]) -> list[torch.Tensor]:
     """Right-pad independently encoded [1, tokens, channels] contexts."""
     if not contexts:
@@ -60,8 +126,14 @@ def pad_text_tags(tags: torch.Tensor | None, tokens: int) -> torch.Tensor:
     return F.pad(tags, (0, tokens - tags.shape[0]), value=1)
 
 
-def select_segment_index(v0: int, v1: int, total: int, count: int) -> int:
-    """Pick the prompt segment whose equal-time span contains the window midpoint.
+def select_segment_index(
+    v0: int,
+    v1: int,
+    total: int,
+    count: int,
+    durations: Sequence[Duration] | None = None,
+) -> int:
+    """Pick the prompt segment whose duration span contains the window midpoint.
 
     Contextualized hidden states from independently encoded prompts do not
     share a common token basis, so a boundary window uses the one segment that
@@ -72,11 +144,34 @@ def select_segment_index(v0: int, v1: int, total: int, count: int) -> int:
         raise ValueError("segment count must be positive")
     if not (0 <= v0 < v1 <= total):
         raise ValueError(f"invalid window [{v0}, {v1}) for total {total}")
-    midpoint = (v0 + v1) / 2.0
-    return min(int(midpoint * count / total), count - 1)
+    weights = tuple(_duration_fraction(value) for value in (durations or (Fraction(1),) * count))
+    if len(weights) != count:
+        raise ValueError(f"expected {count} segment durations, got {len(weights)}")
+
+    # Only the durations' ratios carry meaning, so the boundary predicate is
+    # evaluated in exact rational arithmetic from their decimal representation.
+    # The float form
+    # ``midpoint * sum(weights) / total`` overflows to ``inf`` for large finite
+    # durations such as ``1e307,1e307`` and routes every window to the final
+    # segment; float normalization avoids the overflow but makes a midpoint
+    # sitting exactly on a boundary land on whichever side the rounding fell.
+    total_weight = sum(weights)
+    target = Fraction(v0 + v1, 2 * total) * total_weight
+    boundary = Fraction(0)
+    for index, weight in enumerate(weights[:-1]):
+        boundary += weight
+        if target < boundary:
+            return index
+    return count - 1
 
 
-def unreachable_segments(starts: Sequence[int], window: int, total: int, count: int) -> list[int]:
+def unreachable_segments(
+    starts: Sequence[int],
+    window: int,
+    total: int,
+    count: int,
+    durations: Sequence[Duration] | None = None,
+) -> list[int]:
     """Return zero-based segment indices no context window would ever select.
 
     Window midpoints are quantized to the scheduler's stride and confined to
@@ -84,7 +179,10 @@ def unreachable_segments(starts: Sequence[int], window: int, total: int, count: 
     prompts are silently unreachable; callers surface that instead of letting
     a prompt vanish without a trace.
     """
-    selected = {select_segment_index(v0, min(v0 + window, total), total, count) for v0 in starts}
+    selected = {
+        select_segment_index(v0, min(v0 + window, total), total, count, durations)
+        for v0 in starts
+    }
     return sorted(set(range(count)) - selected)
 
 
@@ -113,13 +211,21 @@ def make_segmented_extra_conds(
 
         payload = dict(payload_cond.cond)
         payload["h3forge_prompt_segments"] = tuple(processed)
+        durations = kwargs.get("h3forge_prompt_segment_durations")
+        if durations is not None:
+            payload["h3forge_prompt_segment_durations"] = tuple(
+                _duration_fraction(value) for value in durations
+            )
         out["minimax_payload"] = payload_cond._copy_with(payload)
         return out
 
     return extra_conds
 
 
-def combine_conditioning_segments(conditionings: Sequence):
+def combine_conditioning_segments(
+    conditionings: Sequence,
+    durations: Sequence[Duration] | None = None,
+):
     """Combine independently encoded MiniMax conditionings into one timeline.
 
     Each input may already contain native reference-aware Qwen context and DiT
@@ -135,6 +241,14 @@ def combine_conditioning_segments(conditionings: Sequence):
         metadata.append(conditioning[0][1])
 
     padded = pad_segment_contexts(encoded)
+    resolved_durations = tuple(
+        _duration_fraction(value) for value in (durations or (Fraction(1),) * len(padded))
+    )
+    if len(resolved_durations) != len(padded):
+        raise ValueError(
+            f"expected one duration per prompt segment ({len(padded)} segments, "
+            f"{len(resolved_durations)} durations)"
+        )
     tokens = padded[0].shape[1]
     padded_tags = [pad_text_tags(meta.get("minimax_token_tags"), tokens) for meta in metadata]
     # The run carries one set of conditioning metadata, so it is only correct
@@ -157,14 +271,22 @@ def combine_conditioning_segments(conditionings: Sequence):
     primary_meta["minimax_token_tags"] = padded_tags[0]
     primary_meta["h3forge_prompt_segments"] = tuple(padded)
     primary_meta["h3forge_prompt_segment_count"] = len(padded)
+    primary_meta["h3forge_prompt_segment_durations"] = resolved_durations
     return [[padded[0], primary_meta]]
 
 
-def encode_pipe_prompt(clip, prompt: str):
+def encode_pipe_prompt(
+    clip,
+    prompt: str,
+    global_prompt: str = "",
+    segment_durations: str = "",
+):
     """Encode each text-only pipe segment and return one annotated conditioning."""
     texts = split_pipe_prompt(prompt)
+    durations = parse_segment_durations(segment_durations, len(texts))
+    texts = compose_segment_prompts(texts, global_prompt)
     conditionings = [
         clip.encode_from_tokens_scheduled(clip.tokenize(text))
         for text in texts
     ]
-    return combine_conditioning_segments(conditionings)
+    return combine_conditioning_segments(conditionings, durations)
