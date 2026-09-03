@@ -1,11 +1,15 @@
+from fractions import Fraction
+
 import pytest
 import torch
 
 from h3forge.context import (
+    ContextPolicy,
     assert_full_coverage,
     audio_overlap_frames,
     blend_weights,
     context_plan_summary,
+    make_context_wrapper,
     window_starts,
 )
 from h3forge.layout import expand_audio_range, padded_spatial_shape
@@ -101,14 +105,23 @@ def test_pipe_prompt_rejects_empty_segments():
 
 
 def test_segment_durations_are_exact_and_fail_closed():
-    assert parse_segment_durations("2, 18\n40", 3) == (2.0, 18.0, 40.0)
-    assert parse_segment_durations("", 3) == (1.0, 1.0, 1.0)
+    assert parse_segment_durations("2, 18\n40", 3) == (Fraction(2), Fraction(18), Fraction(40))
+    assert parse_segment_durations("", 3) == (Fraction(1), Fraction(1), Fraction(1))
+    # Decimal text becomes the decimal ratio, never the nearest binary float:
+    # Fraction(0.1) != Fraction(1, 10), and only the latter keeps 1:3 exact.
+    assert parse_segment_durations("0.1,0.3", 2) == (Fraction(1, 10), Fraction(3, 10))
+    assert parse_segment_durations("1e307,3e307", 2) == (Fraction(10**307), Fraction(3 * 10**307))
+    assert all(isinstance(value, Fraction) for value in parse_segment_durations("2,8", 2))
     with pytest.raises(ValueError, match="exactly one"):
         parse_segment_durations("2,18", 3)
     with pytest.raises(ValueError, match="greater than zero"):
         parse_segment_durations("2,0,40", 3)
-    with pytest.raises(ValueError, match="greater than zero"):
+    with pytest.raises(ValueError, match="finite"):
         parse_segment_durations("2,nan,40", 3)
+    with pytest.raises(ValueError, match="finite"):
+        parse_segment_durations("2,inf,40", 3)
+    with pytest.raises(ValueError, match="finite"):
+        parse_segment_durations("2,abc,40", 3)
 
 
 def test_segment_contexts_pad_to_one_compiled_shape():
@@ -161,6 +174,13 @@ def test_segment_selection_is_scale_invariant():
         assert [select_segment_index(v0, v1, 60, 2, scaled) for v0, v1 in windows] == [
             select_segment_index(v0, v1, 60, 2, (1.0, 1.0)) for v0, v1 in windows
         ]
+    # Unequal ratios too: 1e307 and 3e307 are not exactly 1:3 as binary floats,
+    # so an exact-cut midpoint would flip sides if the float rounding leaked in.
+    for scaled in ((1.0, 3.0), (1e307, 3e307), (1e-307, 3e-307), ("0.1", "0.3"), (1, 3)):
+        assert select_segment_index(0, 2, 4, 2, scaled) == 1
+        assert [select_segment_index(v0, v1, 60, 2, scaled) for v0, v1 in windows] == [
+            select_segment_index(v0, v1, 60, 2, (Fraction(1), Fraction(3))) for v0, v1 in windows
+        ]
 
 
 def test_segment_selection_ties_are_exact():
@@ -199,6 +219,63 @@ def test_context_plan_reports_work_and_prompt_assignment():
     assert "windows=3" in summary
     assert "video_latent_visits=1.25x" in summary
     assert "prompt_windows=2x1,3x2" in summary
+
+
+def _one_window_run(policy, total_t, step, prompt_segments=None, prompt_durations=None):
+    """Drive the wrapper's single-window path and return (printed, context used)."""
+    seen = {}
+
+    def executor(x, timestep, context, transformer_options, **kwargs):
+        seen["context"] = context
+        return x
+
+    payload = {}
+    if prompt_segments is not None:
+        payload["h3forge_prompt_segments"] = prompt_segments
+        payload["h3forge_prompt_segment_durations"] = prompt_durations
+    options = {}
+    if step is not None:
+        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        options = {"sample_sigmas": sigmas, "sigmas": sigmas[step:step + 1]}
+    x = [torch.zeros(1, 4, total_t, 2, 2), torch.zeros(1, 4, 6)]
+    make_context_wrapper(policy)(executor, x, None, "base-context", options, minimax_payload=payload)
+    return seen["context"]
+
+
+def test_single_window_video_reports_its_context_plan_at_step_zero(capsys):
+    policy = ContextPolicy(window_frames=25, overlap_frames=5)
+    assert _one_window_run(policy, 10, step=0) == "base-context"
+    lines = [line for line in capsys.readouterr().out.splitlines() if "context plan" in line]
+    assert len(lines) == 1
+    assert "video_latents=10" in lines[0]
+    assert "windows=1" in lines[0]
+    assert "video_latent_visits=1.00x" in lines[0]
+    assert "prompt_windows" not in lines[0]
+
+    _one_window_run(policy, 10, step=1)
+    assert "context plan" not in capsys.readouterr().out
+
+
+def test_single_window_video_uses_the_midpoint_segment_and_reports_it(capsys):
+    policy = ContextPolicy(window_frames=25, overlap_frames=5)
+    segments = ("segment-1", "segment-2")
+    # A front-loaded 1:9 timeline puts the whole-video midpoint in segment 2;
+    # the receipt and the executed context must name the same segment.
+    used = _one_window_run(policy, 10, step=0, prompt_segments=segments,
+                           prompt_durations=(Fraction(1), Fraction(9)))
+    assert used == "segment-2"
+    out = capsys.readouterr().out
+    assert "only segment 2 is used" in out
+    assert "prompt_windows=2x1" in out
+
+    used = _one_window_run(policy, 10, step=0, prompt_segments=segments,
+                           prompt_durations=(Fraction(9), Fraction(1)))
+    assert used == "segment-1"
+    assert "prompt_windows=1x1" in capsys.readouterr().out
+
+    with pytest.raises(RuntimeError, match="only segment 2 is used"):
+        _one_window_run(ContextPolicy(window_frames=25, overlap_frames=5, strict=True), 10,
+                        step=0, prompt_segments=segments, prompt_durations=(Fraction(1), Fraction(9)))
 
 
 class _Clip:

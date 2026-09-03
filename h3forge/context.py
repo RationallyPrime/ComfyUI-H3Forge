@@ -142,17 +142,39 @@ def make_context_wrapper(policy: ContextPolicy):
         step, _ = resolve_step(transformer_options)
 
         if total_t <= policy.window_frames:
-            if prompt_segments and len(prompt_segments) > 1:
-                message = (
-                    f"{LOG} pipe prompt has {len(prompt_segments)} segments but the whole video fits "
-                    f"one context window ({total_t} <= {policy.window_frames} latents); only segment 1 "
-                    "is used — lengthen the video or shrink window_frames"
+            # One window covers the whole video, so this is the single-window
+            # instance of the general rule: the window uses the one segment
+            # whose duration span contains its midpoint, and the step-zero plan
+            # reports that same selection.
+            segment_count = len(prompt_segments) if prompt_segments else 0
+            local_context = context
+            if segment_count:
+                selected = select_segment_index(0, total_t, total_t, segment_count, prompt_durations)
+                local_context = prompt_segments[selected]
+                if segment_count > 1:
+                    message = (
+                        f"{LOG} pipe prompt has {segment_count} segments but the whole video fits "
+                        f"one context window ({total_t} <= {policy.window_frames} latents); only "
+                        f"segment {selected + 1} is used — lengthen the video or shrink window_frames"
+                    )
+                    if policy.strict:
+                        raise RuntimeError(message)
+                    if step in (None, 0):
+                        print(message, flush=True)
+            if step == 0:
+                print(
+                    f"{LOG} context plan " + context_plan_summary(
+                        total_t,
+                        [0],
+                        policy.window_frames,
+                        policy.overlap_frames,
+                        phase=0,
+                        prompt_count=segment_count,
+                        prompt_durations=prompt_durations,
+                    ),
+                    flush=True,
                 )
-                if policy.strict:
-                    raise RuntimeError(message)
-                if step in (None, 0):
-                    print(message, flush=True)
-            return executor(x, timestep, context, transformer_options, **kwargs)
+            return executor(x, timestep, local_context, transformer_options, **kwargs)
 
         full_layout = payload.get("layout")
         try:

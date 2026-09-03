@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 from fractions import Fraction
 
@@ -36,18 +35,52 @@ def split_pipe_prompt(prompt: str) -> list[str]:
     return segments
 
 
-def parse_segment_durations(raw: str | None, count: int) -> tuple[float, ...]:
+Duration = Fraction | int | float | str
+
+
+def _ratio(value: Duration) -> Fraction:
+    """Exact rational from one user-facing duration value.
+
+    A float is read through its shortest round-trip repr, so a value that
+    arrived as ``3e307`` or ``0.1`` keeps the decimal ratio the user typed;
+    ``Fraction(float)`` would freeze that float's binary rounding into the
+    timeline and let a pure rescaling of the durations move a boundary.
+    """
+    if isinstance(value, float):
+        value = repr(value)
+    try:
+        return Fraction(value)
+    except (ValueError, TypeError, ZeroDivisionError) as exc:
+        raise ValueError("segment durations must be finite numbers") from exc
+
+
+def coerce_segment_durations(values: Sequence[Duration], count: int) -> tuple[Fraction, ...]:
+    """Validate ``count`` positive durations as exact rationals.
+
+    Every duration consumer goes through here, so the ratio that reaches the
+    window selector is the one the user entered, never a float rounding of it.
+    """
+    weights = tuple(_ratio(value) for value in values)
+    if len(weights) != count:
+        raise ValueError(f"expected {count} segment durations, got {len(weights)}")
+    if any(weight <= 0 for weight in weights):
+        raise ValueError("segment durations must be greater than zero")
+    return weights
+
+
+def parse_segment_durations(raw: str | None, count: int) -> tuple[Fraction, ...]:
     """Parse positive comma/newline-delimited prompt durations.
 
     Values are deliberately unitless: ``2,18,40`` can mean seconds, frames,
     beats, or any other durations because only their relative proportions are
     needed to map them onto the target latent timeline. An empty input retains
-    the original equal-duration behaviour.
+    the original equal-duration behaviour. The text is parsed straight into
+    exact rationals so no float rounding ever enters the ratio.
     """
     if count < 1:
         raise ValueError("segment count must be positive")
     if raw is None or not str(raw).strip():
-        return (1.0,) * count
+        return (Fraction(1),) * count
 
     parts = [part.strip() for line in str(raw).splitlines() for part in line.split(",")]
     if any(not part for part in parts):
@@ -57,13 +90,7 @@ def parse_segment_durations(raw: str | None, count: int) -> tuple[float, ...]:
             f"segment_durations needs exactly one value per prompt segment "
             f"({count} segments, {len(parts)} values)"
         )
-    try:
-        durations = tuple(float(part) for part in parts)
-    except ValueError as exc:
-        raise ValueError("segment_durations must contain only numbers") from exc
-    if any(not math.isfinite(value) or value <= 0 for value in durations):
-        raise ValueError("segment_durations values must be finite and greater than zero")
-    return durations
+    return coerce_segment_durations(parts, count)
 
 
 def compose_segment_prompts(segments: Sequence[str], global_prompt: str = "") -> list[str]:
@@ -105,7 +132,7 @@ def select_segment_index(
     v1: int,
     total: int,
     count: int,
-    durations: Sequence[float] | None = None,
+    durations: Sequence[Duration] | None = None,
 ) -> int:
     """Pick the prompt segment whose duration span contains the window midpoint.
 
@@ -118,11 +145,7 @@ def select_segment_index(
         raise ValueError("segment count must be positive")
     if not (0 <= v0 < v1 <= total):
         raise ValueError(f"invalid window [{v0}, {v1}) for total {total}")
-    weights = tuple(float(value) for value in (durations or (1.0,) * count))
-    if len(weights) != count:
-        raise ValueError(f"expected {count} segment durations, got {len(weights)}")
-    if any(not math.isfinite(value) or value <= 0 for value in weights):
-        raise ValueError("segment durations must be finite and greater than zero")
+    weights = coerce_segment_durations(durations or (1,) * count, count)
 
     # Only the durations' ratios carry meaning, so the boundary predicate is
     # evaluated in exact rational arithmetic. The float form
@@ -130,11 +153,10 @@ def select_segment_index(
     # durations such as ``1e307,1e307`` and routes every window to the final
     # segment; float normalization avoids the overflow but makes a midpoint
     # sitting exactly on a boundary land on whichever side the rounding fell.
-    total_weight = sum(Fraction(weight) for weight in weights)
-    target = Fraction(v0 + v1, 2 * total) * total_weight
+    target = Fraction(v0 + v1, 2 * total) * sum(weights)
     boundary = Fraction(0)
     for index, weight in enumerate(weights[:-1]):
-        boundary += Fraction(weight)
+        boundary += weight
         if target < boundary:
             return index
     return count - 1
@@ -145,7 +167,7 @@ def unreachable_segments(
     window: int,
     total: int,
     count: int,
-    durations: Sequence[float] | None = None,
+    durations: Sequence[Duration] | None = None,
 ) -> list[int]:
     """Return zero-based segment indices no context window would ever select.
 
@@ -188,7 +210,8 @@ def make_segmented_extra_conds(
         payload["h3forge_prompt_segments"] = tuple(processed)
         durations = kwargs.get("h3forge_prompt_segment_durations")
         if durations is not None:
-            payload["h3forge_prompt_segment_durations"] = tuple(float(value) for value in durations)
+            payload["h3forge_prompt_segment_durations"] = coerce_segment_durations(
+                durations, len(segments))
         out["minimax_payload"] = payload_cond._copy_with(payload)
         return out
 
@@ -197,7 +220,7 @@ def make_segmented_extra_conds(
 
 def combine_conditioning_segments(
     conditionings: Sequence,
-    durations: Sequence[float] | None = None,
+    durations: Sequence[Duration] | None = None,
 ):
     """Combine independently encoded MiniMax conditionings into one timeline.
 
@@ -214,14 +237,7 @@ def combine_conditioning_segments(
         metadata.append(conditioning[0][1])
 
     padded = pad_segment_contexts(encoded)
-    resolved_durations = tuple(float(value) for value in (durations or (1.0,) * len(padded)))
-    if len(resolved_durations) != len(padded):
-        raise ValueError(
-            f"expected one duration per prompt segment ({len(padded)} segments, "
-            f"{len(resolved_durations)} durations)"
-        )
-    if any(not math.isfinite(value) or value <= 0 for value in resolved_durations):
-        raise ValueError("segment durations must be finite and greater than zero")
+    resolved_durations = coerce_segment_durations(durations or (1,) * len(padded), len(padded))
     tokens = padded[0].shape[1]
     padded_tags = [pad_text_tags(meta.get("minimax_token_tags"), tokens) for meta in metadata]
     # The run carries one set of conditioning metadata, so it is only correct
