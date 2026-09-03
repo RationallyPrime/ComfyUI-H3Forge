@@ -146,6 +146,12 @@ def test_segment_selection_respects_unequal_durations():
         select_segment_index(0, 2, 60, 3, (1.0, 2.0))
 
 
+def test_segment_selection_is_scale_safe_for_huge_durations():
+    durations = (1e307, 1e307)
+    assert select_segment_index(0, 50, 100, 2, durations) == 0
+    assert select_segment_index(50, 100, 100, 2, durations) == 1
+
+
 def test_unreachable_segments_detected_when_segments_outnumber_windows():
     # 30 latents with the default 25/5 policy give windows [0,25) and [5,30);
     # both midpoints land in segment 2 of 3, so segments 1 and 3 would vanish.

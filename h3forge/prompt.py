@@ -123,9 +123,14 @@ def select_segment_index(
     if any(not math.isfinite(value) or value <= 0 for value in weights):
         raise ValueError("segment durations must be finite and greater than zero")
 
-    target = ((v0 + v1) / 2.0) * sum(weights) / total
+    # Durations are relative, so scale by the largest before summing. This
+    # keeps individually finite values such as (1e307, 1e307) from overflowing
+    # to infinity and changing an equal split into "always choose the last".
+    scale = max(weights)
+    normalized = tuple(value / scale for value in weights)
+    target = ((v0 + v1) / (2.0 * total)) * sum(normalized)
     boundary = 0.0
-    for index, weight in enumerate(weights[:-1]):
+    for index, weight in enumerate(normalized[:-1]):
         boundary += weight
         if target < boundary:
             return index
