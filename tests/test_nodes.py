@@ -209,9 +209,14 @@ def test_reference_pipe_node_reuses_native_ref2va_for_each_segment(monkeypatch):
         clip=object(), vae=object(), audio_vae=object(), ref_image_1=image,
         prompt="short segment | a deliberately longer segment",
         width=864, height=480, length=124, ref_image_size="match",
+        global_prompt="same woman and red coat",
+        segment_durations="2,8",
     )
 
     assert len(calls) == 2
     assert all(call["ref_images"] == {"ref_image_0": image} for call in calls)
+    assert calls[0]["prompt"] == "same woman and red coat\n\nshort segment"
+    assert calls[1]["prompt"] == "same woman and red coat\n\na deliberately longer segment"
     assert conditioning[0][1]["h3forge_prompt_segment_count"] == 2
+    assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2.0, 8.0)
     assert latent == {"samples": "native-latent"}

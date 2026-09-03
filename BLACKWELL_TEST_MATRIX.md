@@ -2,7 +2,7 @@
 
 Use the same seed, prompt, input conditioning, resolution, frame count, sampler, steps, CFG/guidance, and model files for every row.
 
-For pipe-timeline tests, keep the exact segment count and delimiter placement fixed. Each segment is an independent encoding and occupies an equal portion of the target video timeline; each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add.
+For pipe-timeline tests, keep the exact segment count, delimiter placement, `global_prompt`, and `segment_durations` fixed. Each segment is an independent encoding and occupies its requested relative portion of the target video timeline (equal portions when durations are empty); each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add. Retain the step-zero context-plan line so the actual window count, stagger phase, latent-visit ratio, and prompt assignment are part of the receipt.
 
 | ID | Sparse | FETA | Context | Purpose |
 |---|---|---|---|---|

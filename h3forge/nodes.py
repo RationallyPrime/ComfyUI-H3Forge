@@ -8,8 +8,10 @@ from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
 from .prompt import (
     combine_conditioning_segments,
+    compose_segment_prompts,
     encode_pipe_prompt,
     make_segmented_extra_conds,
+    parse_segment_durations,
     split_pipe_prompt,
 )
 from .state import AttentionPolicy, RuntimeState, resolve_sigma, resolve_step
@@ -279,23 +281,38 @@ class H3ForgeContextWindows:
 class H3ForgePipePrompt:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
-            "clip": ("CLIP",),
-            "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
-        }}
+        return {
+            "required": {
+                "clip": ("CLIP",),
+                "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
+            },
+            "optional": {
+                "global_prompt": ("STRING", {
+                    "multiline": True,
+                    "dynamicPrompts": True,
+                    "default": "",
+                    "tooltip": "Optional anchor repeated inside every independently encoded segment.",
+                }),
+                "segment_durations": ("STRING", {
+                    "default": "",
+                    "tooltip": "One positive number per segment, comma-separated. Empty means equal time.",
+                }),
+            },
+        }
 
     RETURN_TYPES = ("CONDITIONING",)
     FUNCTION = "encode"
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
         "Encode | separated MiniMax-H3 prompts independently; each H3Forge context window uses the "
-        "segment covering its midpoint, and windows generated under different prompts crossfade in "
-        "output space through the overlap-add blend. Escape a literal pipe as \\|."
+        "segment covering its midpoint. Optional segment_durations assigns unequal spans (for example "
+        "2,18,40); global_prompt repeats a shared anchor in every independent encoding. Windows under "
+        "different prompts crossfade in output space. Escape a literal pipe as \\|."
     )
 
-    def encode(self, clip, prompt):
+    def encode(self, clip, prompt, global_prompt="", segment_durations=""):
         try:
-            return (encode_pipe_prompt(clip, prompt),)
+            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations),)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
 
@@ -319,6 +336,16 @@ class H3ForgeReferencePipePrompt:
                 "ref_image_2": ("IMAGE",),
                 "ref_image_3": ("IMAGE",),
                 "ref_image_4": ("IMAGE",),
+                "global_prompt": ("STRING", {
+                    "multiline": True,
+                    "dynamicPrompts": True,
+                    "default": "",
+                    "tooltip": "Optional anchor repeated inside every independently encoded segment.",
+                }),
+                "segment_durations": ("STRING", {
+                    "default": "",
+                    "tooltip": "One positive number per segment, comma-separated. Empty means equal time.",
+                }),
             },
         }
 
@@ -328,17 +355,21 @@ class H3ForgeReferencePipePrompt:
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
         "Encode | separated MiniMax-H3 Ref2VA prompts independently with the same one-to-four "
-        "reference images. Returns native reference conditioning plus the H3 AV latent for use "
+        "reference images. Optional global_prompt anchors every segment and segment_durations assigns "
+        "unequal timeline spans. Returns native reference conditioning plus the H3 AV latent for use "
         "with H3Forge context windows. Reference video/audio inputs are not supported by this node."
     )
 
     def encode(self, clip, vae, audio_vae, ref_image_1, prompt, width, height, length,
-               ref_image_size, ref_image_2=None, ref_image_3=None, ref_image_4=None):
+               ref_image_size, ref_image_2=None, ref_image_3=None, ref_image_4=None,
+               global_prompt="", segment_durations=""):
         texts = split_pipe_prompt(prompt)
         if len(texts) < 2:
             raise ValueError(f"{LOG} reference pipe prompt requires at least two | separated segments")
         if len(texts) > 8:
             raise ValueError(f"{LOG} reference pipe prompt supports at most eight segments")
+        durations = parse_segment_durations(segment_durations, len(texts))
+        texts = compose_segment_prompts(texts, global_prompt)
 
         try:
             from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
@@ -369,7 +400,7 @@ class H3ForgeReferencePipePrompt:
                 latent = result[1]
 
         try:
-            return combine_conditioning_segments(conditionings), latent
+            return combine_conditioning_segments(conditionings, durations), latent
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
 
