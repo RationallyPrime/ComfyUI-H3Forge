@@ -152,6 +152,19 @@ def make_context_wrapper(policy: ContextPolicy):
                     raise RuntimeError(message)
                 if step in (None, 0):
                     print(message, flush=True)
+            if step == 0:
+                summary = context_plan_summary(
+                    total_t,
+                    [0],
+                    total_t,
+                    0,
+                    phase=0,
+                )
+                if prompt_segments:
+                    # The fast path runs the primary conditioning context
+                    # directly; it does not use midpoint selection.
+                    summary += " prompt_windows=1x1"
+                print(f"{LOG} context plan " + summary, flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         full_layout = payload.get("layout")

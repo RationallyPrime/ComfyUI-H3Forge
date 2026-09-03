@@ -2,10 +2,12 @@ import pytest
 import torch
 
 from h3forge.context import (
+    ContextPolicy,
     assert_full_coverage,
     audio_overlap_frames,
     blend_weights,
     context_plan_summary,
+    make_context_wrapper,
     window_starts,
 )
 from h3forge.layout import expand_audio_range, padded_spatial_shape
@@ -162,6 +164,12 @@ def test_segment_selection_is_scale_invariant():
             select_segment_index(v0, v1, 60, 2, (1.0, 1.0)) for v0, v1 in windows
         ]
 
+    # Preserve unequal user-entered ratios too, especially at exact cuts.
+    baseline = parse_segment_durations("1,3", 2)
+    scaled = parse_segment_durations("1e307,3e307", 2)
+    assert select_segment_index(0, 2, 4, 2, baseline) == 1
+    assert select_segment_index(0, 2, 4, 2, scaled) == 1
+
 
 def test_segment_selection_ties_are_exact():
     # A midpoint sitting exactly on a duration boundary belongs to the later
@@ -199,6 +207,32 @@ def test_context_plan_reports_work_and_prompt_assignment():
     assert "windows=3" in summary
     assert "video_latent_visits=1.25x" in summary
     assert "prompt_windows=2x1,3x2" in summary
+
+
+def test_single_window_path_emits_step_zero_context_plan(capsys):
+    class Executor:
+        def __call__(self, x, timestep, context, transformer_options, **kwargs):
+            return x
+
+    wrapper = make_context_wrapper(ContextPolicy(window_frames=25, overlap_frames=5))
+    video = torch.zeros(1, 1, 10, 1, 1)
+    audio = torch.zeros(1, 1, 1, 20)
+    transformer_options = {
+        "sample_sigmas": torch.tensor([1.0, 0.0]),
+        "sigmas": torch.tensor([1.0]),
+    }
+    result = wrapper(
+        Executor(),
+        [video, audio],
+        timestep=None,
+        context=torch.zeros(1, 1, 1),
+        transformer_options=transformer_options,
+    )
+    assert result[0] is video
+    assert result[1] is audio
+    receipt = capsys.readouterr().out
+    assert "context plan video_latents=10 windows=1 window/overlap=10/0" in receipt
+    assert "phase=0 video_latent_visits=1.00x" in receipt
 
 
 class _Clip:
