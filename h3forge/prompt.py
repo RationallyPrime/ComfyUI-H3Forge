@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from fractions import Fraction
 
 import torch
 import torch.nn.functional as F
@@ -123,15 +124,17 @@ def select_segment_index(
     if any(not math.isfinite(value) or value <= 0 for value in weights):
         raise ValueError("segment durations must be finite and greater than zero")
 
-    # Durations are relative, so scale by the largest before summing. This
-    # keeps individually finite values such as (1e307, 1e307) from overflowing
-    # to infinity and changing an equal split into "always choose the last".
-    scale = max(weights)
-    normalized = tuple(value / scale for value in weights)
-    target = ((v0 + v1) / (2.0 * total)) * sum(normalized)
-    boundary = 0.0
-    for index, weight in enumerate(normalized[:-1]):
-        boundary += weight
+    # Only the durations' ratios carry meaning, so the boundary predicate is
+    # evaluated in exact rational arithmetic. The float form
+    # ``midpoint * sum(weights) / total`` overflows to ``inf`` for large finite
+    # durations such as ``1e307,1e307`` and routes every window to the final
+    # segment; float normalization avoids the overflow but makes a midpoint
+    # sitting exactly on a boundary land on whichever side the rounding fell.
+    total_weight = sum(Fraction(weight) for weight in weights)
+    target = Fraction(v0 + v1, 2 * total) * total_weight
+    boundary = Fraction(0)
+    for index, weight in enumerate(weights[:-1]):
+        boundary += Fraction(weight)
         if target < boundary:
             return index
     return count - 1

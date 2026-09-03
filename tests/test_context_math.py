@@ -152,6 +152,29 @@ def test_segment_selection_is_scale_safe_for_huge_durations():
     assert select_segment_index(50, 100, 100, 2, durations) == 1
 
 
+def test_segment_selection_is_scale_invariant():
+    # Durations are unitless ratios, so a huge or tiny finite scale must route
+    # exactly like its reduced form, including when sum(weights) itself would
+    # overflow in float.
+    windows = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]
+    for scaled in ((1e307, 1e307), (1e308, 1e308), (1e-307, 1e-307)):
+        assert [select_segment_index(v0, v1, 60, 2, scaled) for v0, v1 in windows] == [
+            select_segment_index(v0, v1, 60, 2, (1.0, 1.0)) for v0, v1 in windows
+        ]
+
+
+def test_segment_selection_ties_are_exact():
+    # A midpoint sitting exactly on a duration boundary belongs to the later
+    # segment (strict less-than), independent of float rounding: with (1,1,10)
+    # on 60 latents the boundaries are exactly 5 and 10.
+    durations = (1.0, 1.0, 10.0)
+    assert select_segment_index(0, 10, 60, 3, durations) == 1
+    assert select_segment_index(1, 9, 60, 3, durations) == 1
+    assert select_segment_index(0, 20, 60, 3, durations) == 2
+    assert select_segment_index(4, 6, 60, 3, durations) == 1
+    assert select_segment_index(3, 6, 60, 3, durations) == 0
+
+
 def test_unreachable_segments_detected_when_segments_outnumber_windows():
     # 30 latents with the default 25/5 policy give windows [0,25) and [5,30);
     # both midpoints land in segment 2 of 3, so segments 1 and 3 would vanish.
