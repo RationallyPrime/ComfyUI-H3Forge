@@ -202,13 +202,18 @@ def _make_block_mask(state, q, *, device):
     def mask_mod(b, h, q_idx, kv_idx):
         gq = q_idx < audio_start
         gk = kv_idx < audio_start
+        aq = (q_idx >= audio_start) & (q_idx < audio_stop)
+        ak = (kv_idx >= audio_start) & (kv_idx < audio_stop)
         vq = (q_idx >= video_start) & (q_idx < video_stop)
         vk = (kv_idx >= video_start) & (kv_idx < video_stop)
 
         tq = token_time(q_idx)
         tk = token_time(kv_idx)
         dt = torch.abs(tq - tk)
-        allow = gq | gk | (dt <= temporal_window)
+        # Preserve the complete utterance history across both stereo channels.
+        # Audio is small compared with video; limiting its self-attention makes
+        # later tokens repeat dialogue that has fallen outside the local band.
+        allow = gq | gk | (aq & ak) | (dt <= temporal_window)
 
         # Video↔video links between different temporal positions use a local
         # spatial radius in patch-grid coordinates; same-frame attention is dense.
