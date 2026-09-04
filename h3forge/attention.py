@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import types
+
 import torch
 
 from .layout import target_segments, video_shape_from_layout
@@ -8,42 +10,36 @@ from .nag import apply_nag
 LOG = "[H3Forge]"
 _COMPILED_FLEX_CACHE: dict = {}
 _COMPILED_FLEX_CACHE_LIMIT = 8
-_DYNAMO_HEADROOM_APPLIED = False
 
 
-def _ensure_dynamo_headroom() -> None:
-    """Let Dynamo keep every flex runner this module is willing to cache.
+def _with_private_code(fn):
+    """Return a copy of ``fn`` whose code object belongs to one runner alone.
 
-    ``torch.compile`` budgets recompiles per wrapped *code object*, not per
-    compiled wrapper, so N distinct shapes of ``flex_attention`` spend N slots
-    of one shared budget whose default is 8 -- exactly
-    ``_COMPILED_FLEX_CACHE_LIMIT``. On the next shape Dynamo stops compiling
-    and falls back to eager, and eager ``flex_attention`` materializes the full
-    S x S score matrix: tens of GiB at H3 sequence lengths, so the symptom is a
-    sudden out-of-memory error rather than a visibly slower path. Evicting our
-    own runner does not refund a Dynamo slot, so the budget must simply be
-    larger than the cache. Text tokens are part of the shape, so merely editing
-    a prompt between runs consumes a slot and a normal session reaches the
-    limit within a handful of generations.
+    Dynamo keys its recompile budget (``torch._dynamo.config.recompile_limit``,
+    default 8) on the *code object* of the function it wraps, not on the
+    ``torch.compile`` wrapper around it. Every ``torch.compile(flex_attention)``
+    therefore spends a slot of one process-wide budget hanging off
+    ``flex_attention.__code__``, and evicting our own runner never refunds one.
+    Once a session has met more distinct attention shapes than that budget --
+    text tokens are part of the shape, so a prompt edit is a new shape -- every
+    further shape falls back to eager ``flex_attention``, which materializes
+    the full S x S score matrix and out-of-memories at H3 sequence lengths.
+    Raising the budget only moves the session length at which that happens.
+
+    ``code.replace()`` mints a distinct code object with identical bytecode, so
+    a runner compiled from this copy owns a full budget of its own that no other
+    runner can spend. The number of shapes a process may meet is then bounded
+    by nothing but the runner LRU below.
     """
-    global _DYNAMO_HEADROOM_APPLIED
-    if _DYNAMO_HEADROOM_APPLIED:
-        return
-    _DYNAMO_HEADROOM_APPLIED = True
-    needed = _COMPILED_FLEX_CACHE_LIMIT + 8
-    try:
-        import torch._dynamo as dynamo
-    except Exception:
-        return
-    # Named "cache_size_limit" before torch 2.9 and "recompile_limit" after;
-    # raise whichever this build exposes, and never lower a larger setting.
-    for name in ("recompile_limit", "cache_size_limit"):
-        current = getattr(dynamo.config, name, None)
-        if isinstance(current, int) and current < needed:
-            setattr(dynamo.config, name, needed)
-            print(f"{LOG} raised torch._dynamo.config.{name} {current} -> {needed} so "
-                  f"{_COMPILED_FLEX_CACHE_LIMIT} flex_attention shapes stay compiled "
-                  "(eager flex_attention is O(S^2) and would OOM)", flush=True)
+    copy = types.FunctionType(fn.__code__.replace(), fn.__globals__, fn.__name__,
+                              fn.__defaults__, fn.__closure__)
+    copy.__kwdefaults__ = fn.__kwdefaults__
+    copy.__annotations__ = fn.__annotations__
+    copy.__qualname__ = fn.__qualname__
+    copy.__module__ = fn.__module__
+    copy.__doc__ = fn.__doc__
+    copy.__dict__.update(fn.__dict__)
+    return copy
 
 
 def _unwrap(x):
@@ -200,19 +196,19 @@ def _make_block_mask(state, q, *, device):
 def _run_flex(state, q, k, v):
     from torch.nn.attention.flex_attention import flex_attention
 
-    _ensure_dynamo_headroom()
-
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Fixed-shape
     # compilation avoids PyTorch Inductor's symbolic BlockMask lowering path,
     # while tensor-captured offsets can still vary at runtime without causing
     # value-specialized recompiles. One runner is kept per concrete shape so a
     # duration/resolution/window change triggers an observable compile instead
-    # of relying on hidden Dynamo guard-cache semantics.
+    # of relying on hidden Dynamo guard-cache semantics, and each runner wraps
+    # a private copy of flex_attention so Dynamo's per-code-object recompile
+    # budget is per runner too (see _with_private_code).
     key = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
     runner = _COMPILED_FLEX_CACHE.pop(key, None)
     if runner is None:
         print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={key}", flush=True)
-        runner = torch.compile(flex_attention, dynamic=False)
+        runner = torch.compile(_with_private_code(flex_attention), dynamic=False)
     # Re-insert as most recent and bound the cache like mask_cache: a session
     # sweeping durations/resolutions must not accumulate runners forever.
     _COMPILED_FLEX_CACHE[key] = runner

@@ -1,5 +1,4 @@
-import sys
-import types
+import inspect
 
 import pytest
 import torch
@@ -11,6 +10,7 @@ from h3forge.attention import (
     _runtime_int,
     _scale_video_output,
     _video_cumulative_time,
+    _with_private_code,
     feta_gain,
 )
 from h3forge.state import AttentionPolicy, RuntimeState
@@ -191,6 +191,11 @@ def test_flex_attention_compiles_one_runner_per_shape(monkeypatch):
     q2 = torch.ones(1, 2, 5, 4)
     _run_flex(state, q2, q2, q2)
     assert len(compile_calls) == 2
+    # Each runner wraps its own copy of flex_attention: a private code object
+    # per runner is what keeps Dynamo's recompile budget per runner.
+    first, second = (call[0] for call in compile_calls)
+    assert first.__code__ is not fake_flex.__code__
+    assert first.__code__ is not second.__code__
 
 
 def _feta_state():
@@ -246,36 +251,45 @@ def test_reversed_feta_layer_range_is_rejected():
         AttentionPolicy(feta_first_layer=10, feta_last_layer=3)
 
 
-def test_dynamo_headroom_exceeds_the_flex_runner_cache(monkeypatch):
-    """Dynamo must be able to hold every shape the flex cache keeps.
+def test_private_code_copy_is_a_faithful_distinct_function():
+    from torch.nn.attention.flex_attention import flex_attention
 
-    The budget is shared across all torch.compile wrappers of one function, so
-    a limit equal to the cache size makes the next shape silently fall back to
-    eager flex_attention, which is O(S^2) and out-of-memories at H3 lengths.
+    first = _with_private_code(flex_attention)
+    second = _with_private_code(flex_attention)
+    assert first.__code__ is not flex_attention.__code__
+    assert first.__code__ is not second.__code__
+    assert first.__code__.co_code == flex_attention.__code__.co_code
+    assert inspect.signature(first) == inspect.signature(flex_attention)
+    assert first.__name__ == flex_attention.__name__
+    assert first.__module__ == flex_attention.__module__
+    assert first.__globals__ is flex_attention.__globals__
+
+
+def test_each_runner_owns_its_dynamo_recompile_budget():
+    """Shapes beyond Dynamo's per-code-object budget must not fall back to eager.
+
+    Dynamo counts recompiles on the wrapped function's code object, so N
+    runners of one function share one budget and a session that meets more
+    shapes than the limit silently degrades to eager flex_attention (O(S^2),
+    OOM at H3 lengths). A private code object per runner has no such ceiling.
     """
-    from h3forge import attention as attention_module
+    import torch._dynamo as dynamo
 
-    class FakeConfig:
-        def __init__(self, limit):
-            self.recompile_limit = limit
+    def kernel(x):
+        return x * 2 + 1
 
-    config = FakeConfig(8)
-    fake = types.SimpleNamespace(config=config)
-    monkeypatch.setattr(attention_module, "_DYNAMO_HEADROOM_APPLIED", False)
-    # "import torch._dynamo as x" reads the attribute off the torch module when
-    # it is already imported, so patching sys.modules alone would not be seen.
-    monkeypatch.setattr(torch, "_dynamo", fake, raising=False)
-    monkeypatch.setitem(sys.modules, "torch._dynamo", fake)
-    attention_module._ensure_dynamo_headroom()
-    assert config.recompile_limit > attention_module._COMPILED_FLEX_CACHE_LIMIT
-
-    # A limit already larger is never reduced.
-    config.recompile_limit = 4096
-    monkeypatch.setattr(attention_module, "_DYNAMO_HEADROOM_APPLIED", False)
-    attention_module._ensure_dynamo_headroom()
-    assert config.recompile_limit == 4096
-
-    # And the whole thing is done once per process, not per attention call.
-    config.recompile_limit = 8
-    attention_module._ensure_dynamo_headroom()
-    assert config.recompile_limit == 8
+    inputs = [torch.ones(n) for n in range(3, 8)]
+    dynamo.reset()
+    try:
+        with dynamo.config.patch(recompile_limit=1, fail_on_recompile_limit_hit=True):
+            # One shared code object: the second distinct shape exhausts the budget.
+            with pytest.raises(Exception, match="recompile_limit"):
+                for x in inputs:
+                    torch.compile(kernel, dynamic=False, backend="eager")(x)
+            # A private code object per runner: every shape compiles.
+            runners = [torch.compile(_with_private_code(kernel), dynamic=False, backend="eager")
+                       for _ in inputs]
+            for runner, x in zip(runners, inputs):
+                assert torch.equal(runner(x), x * 3)
+    finally:
+        dynamo.reset()

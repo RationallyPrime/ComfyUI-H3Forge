@@ -39,6 +39,8 @@ The H3 temporal mapping is **not** guessed from token indices. Video time uses M
 
 Both FlexAttention and block-mask construction are compiled. The block mask is built once with `H=None` because the policy is head-independent, then broadcast across H3's 56 heads. This avoids the eager `B × H × S × S` boolean grid that otherwise OOMs before the sparse kernel can run. If FlexAttention declines and `strict=false`, H3Forge falls back to ComfyUI's configured dense attention backend and records the reason.
 
+One compiled `flex_attention` runner is kept per concrete attention shape, in a small LRU. Each runner wraps its own private copy of `flex_attention`'s code object, because Dynamo counts recompiles per code object rather than per `torch.compile` wrapper: with one shared code object, a session that met more distinct shapes than Dynamo's budget (and a prompt edit is a new shape, since text tokens are part of it) would silently fall back to eager `flex_attention` and its full `S × S` score matrix. With a code object per runner, the number of shapes a session may meet is bounded by nothing but the LRU.
+
 ### H3 FETA
 
 The optional enrichment path follows Enhance-A-Video's scalar FETA estimator but only samples MiniMax-H3's **target-video rows**:
@@ -350,8 +352,6 @@ selected H3 model
 - **ComfyUI-Spectrum-MiniMax-H3** forecasts post-transformer features and skips selected transformer evaluations; its own documentation notes it changes the denoising trajectory. Keep it out of any workflow whose purpose is proving H3Forge or NAG behavior.
 
 ## Test locally
-
-H3Forge keeps one compiled `flex_attention` runner per concrete shape. `torch.compile` budgets recompiles per wrapped code object rather than per wrapper, so those shapes share one Dynamo budget whose default equals the runner cache size; the next shape would stop compiling and fall back to eager `flex_attention`, which materializes the full S x S score matrix and out-of-memories at H3 sequence lengths. H3Forge therefore raises `torch._dynamo.config.recompile_limit` above its own cache size on first use and never lowers a larger setting. Text tokens are part of the attention shape, so editing a prompt between runs is enough to consume a slot.
 
 The included CPU tests cover evenly spaced and staggered scheduler coverage, full-window pyramid and retained overlap-linear fusion, unequal prompt-span routing, global-anchor propagation, context-plan reporting, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
 
