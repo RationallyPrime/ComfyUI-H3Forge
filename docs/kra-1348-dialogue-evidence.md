@@ -48,3 +48,21 @@ The candidate is not proof of general dialogue, identity, lip-sync, or
 long-duration quality equivalence. The short generation isolates the reported
 failure; the separate large-shape attention benchmark measures the cost of the
 changed mask without conflating model loading, decoding, or compilation.
+
+## Large-shape GPU cost
+
+Torch 2.13.0+cu130, BF16, 56 heads × 128 dimensions; 80/10 windows over
+427 video latents at 1344×768, 455 audio latents per window, 136 text tokens,
+81,686 packed rows. All six masks were compiled and warmed before measuring
+three six-window passes in separate baseline/candidate processes.
+
+| Metric | Merged #11/#12 baseline | Full audio self-attention |
+| --- | --- | --- |
+| Median six-window attention-layer pass | 1868.458 ms | 1921.920 ms |
+| Peak allocated CUDA bytes | 4760076288 | 4760076288 |
+| Peak reserved CUDA bytes | 10334765056 | 10334765056 |
+
+The candidate costs 2.86% more time with identical allocator peaks.
+This measures one sparse attention layer across the actual six-window geometry,
+not a complete denoiser step or full 60-second output. Model weights, decoding,
+cold compilation and unrelated ComfyUI allocations are outside the measurement.

@@ -28,14 +28,14 @@ Patches MiniMax-H3's `optimized_attention_override` and stamps the 50 DiT block 
 The sparse policy is modality aware:
 
 - text / conditioning / reference prefix remains globally reachable;
-- target audio ↔ audio uses a local temporal band;
+- target audio ↔ audio stays fully visible across both stereo channels, preserving earlier utterances;
 - target video ↔ audio uses the same H3 physical time coordinate;
 - same-time video ↔ video stays spatially dense;
 - cross-time video ↔ video is limited by both temporal distance and a spatial patch radius;
 - optional dilated bridge times provide long-range K/V routes outside the local band;
 - early layers and an early fraction of denoising can remain dense.
 
-The H3 temporal mapping is **not** guessed from token indices. Video time uses MiniMax-H3's `1,4,4,4,4` latent-token cadence and audio uses its native one-step grid.
+The H3 temporal mapping is **not** guessed from token indices. Video time uses MiniMax-H3's `1,4,4,4,4` latent-token cadence and audio uses its native one-step grid. Both use 40 Hz ticks; `temporal_window` limits video and cross-modal links, while audio self-attention is uncapped.
 
 Both FlexAttention and block-mask construction are compiled. The block mask is built once with `H=None` because the policy is head-independent, then broadcast across H3's 56 heads. This avoids the eager `B × H × S × S` boolean grid that otherwise OOMs before the sparse kernel can run. If FlexAttention declines and `strict=false`, H3Forge falls back to ComfyUI's configured dense attention backend and records the reason.
 
