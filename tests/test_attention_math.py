@@ -1,3 +1,6 @@
+import sys
+import types
+
 import pytest
 import torch
 
@@ -241,3 +244,38 @@ def test_feta_scales_only_target_video_rows():
 def test_reversed_feta_layer_range_is_rejected():
     with pytest.raises(ValueError, match="feta_first_layer"):
         AttentionPolicy(feta_first_layer=10, feta_last_layer=3)
+
+
+def test_dynamo_headroom_exceeds_the_flex_runner_cache(monkeypatch):
+    """Dynamo must be able to hold every shape the flex cache keeps.
+
+    The budget is shared across all torch.compile wrappers of one function, so
+    a limit equal to the cache size makes the next shape silently fall back to
+    eager flex_attention, which is O(S^2) and out-of-memories at H3 lengths.
+    """
+    from h3forge import attention as attention_module
+
+    class FakeConfig:
+        def __init__(self, limit):
+            self.recompile_limit = limit
+
+    config = FakeConfig(8)
+    fake = types.SimpleNamespace(config=config)
+    monkeypatch.setattr(attention_module, "_DYNAMO_HEADROOM_APPLIED", False)
+    # "import torch._dynamo as x" reads the attribute off the torch module when
+    # it is already imported, so patching sys.modules alone would not be seen.
+    monkeypatch.setattr(torch, "_dynamo", fake, raising=False)
+    monkeypatch.setitem(sys.modules, "torch._dynamo", fake)
+    attention_module._ensure_dynamo_headroom()
+    assert config.recompile_limit > attention_module._COMPILED_FLEX_CACHE_LIMIT
+
+    # A limit already larger is never reduced.
+    config.recompile_limit = 4096
+    monkeypatch.setattr(attention_module, "_DYNAMO_HEADROOM_APPLIED", False)
+    attention_module._ensure_dynamo_headroom()
+    assert config.recompile_limit == 4096
+
+    # And the whole thing is done once per process, not per attention call.
+    config.recompile_limit = 8
+    attention_module._ensure_dynamo_headroom()
+    assert config.recompile_limit == 8

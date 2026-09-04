@@ -351,6 +351,8 @@ selected H3 model
 
 ## Test locally
 
+H3Forge keeps one compiled `flex_attention` runner per concrete shape. `torch.compile` budgets recompiles per wrapped code object rather than per wrapper, so those shapes share one Dynamo budget whose default equals the runner cache size; the next shape would stop compiling and fall back to eager `flex_attention`, which materializes the full S x S score matrix and out-of-memories at H3 sequence lengths. H3Forge therefore raises `torch._dynamo.config.recompile_limit` above its own cache size on first use and never lowers a larger setting. Text tokens are part of the attention shape, so editing a prompt between runs is enough to consume a slot.
+
 The included CPU tests cover evenly spaced and staggered scheduler coverage, full-window pyramid and retained overlap-linear fusion, unequal prompt-span routing, global-anchor propagation, context-plan reporting, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
 
 ```bash

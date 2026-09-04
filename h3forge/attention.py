@@ -8,6 +8,42 @@ from .nag import apply_nag
 LOG = "[H3Forge]"
 _COMPILED_FLEX_CACHE: dict = {}
 _COMPILED_FLEX_CACHE_LIMIT = 8
+_DYNAMO_HEADROOM_APPLIED = False
+
+
+def _ensure_dynamo_headroom() -> None:
+    """Let Dynamo keep every flex runner this module is willing to cache.
+
+    ``torch.compile`` budgets recompiles per wrapped *code object*, not per
+    compiled wrapper, so N distinct shapes of ``flex_attention`` spend N slots
+    of one shared budget whose default is 8 -- exactly
+    ``_COMPILED_FLEX_CACHE_LIMIT``. On the next shape Dynamo stops compiling
+    and falls back to eager, and eager ``flex_attention`` materializes the full
+    S x S score matrix: tens of GiB at H3 sequence lengths, so the symptom is a
+    sudden out-of-memory error rather than a visibly slower path. Evicting our
+    own runner does not refund a Dynamo slot, so the budget must simply be
+    larger than the cache. Text tokens are part of the shape, so merely editing
+    a prompt between runs consumes a slot and a normal session reaches the
+    limit within a handful of generations.
+    """
+    global _DYNAMO_HEADROOM_APPLIED
+    if _DYNAMO_HEADROOM_APPLIED:
+        return
+    _DYNAMO_HEADROOM_APPLIED = True
+    needed = _COMPILED_FLEX_CACHE_LIMIT + 8
+    try:
+        import torch._dynamo as dynamo
+    except Exception:
+        return
+    # Named "cache_size_limit" before torch 2.9 and "recompile_limit" after;
+    # raise whichever this build exposes, and never lower a larger setting.
+    for name in ("recompile_limit", "cache_size_limit"):
+        current = getattr(dynamo.config, name, None)
+        if isinstance(current, int) and current < needed:
+            setattr(dynamo.config, name, needed)
+            print(f"{LOG} raised torch._dynamo.config.{name} {current} -> {needed} so "
+                  f"{_COMPILED_FLEX_CACHE_LIMIT} flex_attention shapes stay compiled "
+                  "(eager flex_attention is O(S^2) and would OOM)", flush=True)
 
 
 def _unwrap(x):
@@ -163,6 +199,8 @@ def _make_block_mask(state, q, *, device):
 
 def _run_flex(state, q, k, v):
     from torch.nn.attention.flex_attention import flex_attention
+
+    _ensure_dynamo_headroom()
 
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Fixed-shape
     # compilation avoids PyTorch Inductor's symbolic BlockMask lowering path,
