@@ -262,6 +262,13 @@ def test_minimax_special_tokens_are_never_split():
     # An unterminated "<|" is not a token, so its pipe stays an ordinary delimiter. That
     # fails visibly on a malformed prompt instead of swallowing the rest into one segment.
     assert split_pipe_prompt("broken <| open | tail") == ["broken <", "open", "tail"]
+    # A malformed opener may not borrow a later token's closer: the delimiters between
+    # them are still delimiters, and the later token still survives intact.
+    assert split_pipe_prompt("first <| broken | second <|cutoff|> | third") == [
+        "first <", "broken", "second <|cutoff|>", "third",
+    ]
+    # Only a bare identifier is a token body; anything else is ordinary text.
+    assert split_pipe_prompt("a <|not a token|> b") == ["a <", "not a token", "> b"]
 
 
 def test_custom_delimiters_split_and_escape():

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Sequence
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -12,6 +13,10 @@ import torch.nn.functional as F
 DEFAULT_SEGMENT_DELIMITER = "|"
 _TOKEN_OPEN = "<|"
 _TOKEN_CLOSE = "|>"
+# A MiniMax special token is ``<|name|>`` with a bare identifier inside. Anchoring the
+# match here means an unterminated ``<|`` cannot borrow a later token's closer and
+# swallow every delimiter in between; it stays ordinary text and splits normally.
+_TOKEN_PATTERN = re.compile(re.escape(_TOKEN_OPEN) + r"\w+" + re.escape(_TOKEN_CLOSE))
 
 
 def validate_segment_delimiter(delimiter: str) -> str:
@@ -55,13 +60,11 @@ def split_pipe_prompt(prompt: str, delimiter: str = DEFAULT_SEGMENT_DELIMITER) -
             current.append("\\")
             index += 1
             continue
-        if prompt.startswith(_TOKEN_OPEN, index):
-            close = prompt.find(_TOKEN_CLOSE, index + len(_TOKEN_OPEN))
-            if close != -1:
-                stop = close + len(_TOKEN_CLOSE)
-                current.append(prompt[index:stop])
-                index = stop
-                continue
+        token = _TOKEN_PATTERN.match(prompt, index)
+        if token is not None:
+            current.append(token.group(0))
+            index = token.end()
+            continue
         if prompt.startswith(delimiter, index):
             segments.append("".join(current).strip())
             current = []
