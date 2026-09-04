@@ -51,7 +51,9 @@ def test_phase_moves_only_interior_starts_and_keeps_fixed_anchors():
     shifted = window_starts(427, 112, 6, 53)
     assert shifted[0] == base[0] == 0
     assert shifted[-1] == base[-1] == 315
-    assert all(after > before for before, after in zip(base[1:-1], shifted[1:-1]))
+    # A phase can collapse onto the same cadence point when overlap leaves
+    # less than five latents of room; it must never force an invalid overlap.
+    assert all(after >= before for before, after in zip(base[1:-1], shifted[1:-1]))
     assert window_starts(427, 107, 6, 20) == [0, 100, 180, 260, 320]
 
 
@@ -64,6 +66,34 @@ def test_phase_must_be_an_integer_inside_the_stride(phase):
 def test_window_at_least_total_uses_one_start():
     assert window_starts(25, 25, 8, 0) == [0]
     assert window_starts(24, 25, 8, 0) == [0]
+
+
+@pytest.mark.parametrize("window,overlap", [(80, 10), (80, 11), (107, 6)])
+def test_shipped_context_policies_snap_interiors_but_preserve_the_tail(window, overlap):
+    for phase in range(max_stagger_phase(window, overlap) + 1):
+        starts = window_starts(427, window, overlap, phase)
+        assert all(start % 5 == 0 for start in starts[:-1])
+        # The tail is exempt: moving it would lose coverage or change length.
+        assert starts[-1] == 427 - window
+        receipt = context_plan_summary(427, starts, window, overlap, phase=phase)
+        assert "cadence=5" in receipt
+        assert f"off_cadence_starts={int((427 - window) % 5 != 0)}" in receipt
+
+
+def test_tight_stride_keeps_unsnappable_starts_and_reports_them():
+    starts = window_starts(13, 4, 1)
+    assert starts == [0, 3, 6, 9]
+    assert "off_cadence_starts=3" in context_plan_summary(13, starts, 4, 1, phase=0)
+
+    # For 25/8, 24 gaps must cover 402 latents. All interior starts on the
+    # cadence would allow gaps of at most 15, which cannot reach the tail.
+    # Adding windows would change the prompt-segment contract, so some
+    # interior starts must remain off cadence as well as the exact tail.
+    starts = window_starts(427, 25, 8)
+    assert len(starts) == 25
+    assert any(start % 5 for start in starts[1:-1])
+    count = sum(start % 5 != 0 for start in starts)
+    assert f"off_cadence_starts={count}" in context_plan_summary(427, starts, 25, 8, phase=0)
 
 
 def test_pyramid_blend_uses_the_whole_window_for_odd_and_even_lengths():

@@ -10,6 +10,7 @@ from .prompt import select_segment_index, unreachable_segments
 from .state import resolve_step
 
 LOG = "[H3Forge]"
+_LATENT_CADENCE = 5
 
 
 @dataclass(frozen=True)
@@ -59,8 +60,8 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
     final_start = total - window
     count = 1 + (final_start + stride - 1) // stride
     base = [round(i * final_start / (count - 1)) for i in range(count)]
-    if phase == 0 or count <= 2:
-        return sorted(set(base))
+    if count <= 2:
+        return base
 
     starts = [0]
     for i in range(1, count - 1):
@@ -71,9 +72,16 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
         # final anchor within a stride each.
         lower = max(starts[-1] + 1, final_start - remaining * stride)
         upper = min(starts[-1] + stride, final_start - remaining)
-        starts.append(min(max(base[i] + phase, lower), upper))
+        candidate = min(max(base[i] + phase, lower), upper)
+        # Apply the phase first, then snap within the feasible interval. Exact
+        # anchors, overlap and count take precedence if no cadence point fits.
+        first = ((lower + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
+        last = (upper // _LATENT_CADENCE) * _LATENT_CADENCE
+        if first <= last:
+            candidate = min(max(round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE, first), last)
+        starts.append(candidate)
     starts.append(final_start)
-    return sorted(set(starts))
+    return starts
 
 
 def blend_weights(length: int, overlap: int, *, device, dtype, mode="pyramid",
@@ -152,6 +160,8 @@ def context_plan_summary(
         f"min_overlap={min((window - (right - left) for left, right in pairwise(starts)), default=0)}",
         f"blend={blend}",
         f"stagger={'on' if stagger else 'off'}",
+        f"cadence={_LATENT_CADENCE}",
+        f"off_cadence_starts={sum(start % _LATENT_CADENCE != 0 for start in starts)}",
     ]
     if max_phase is not None:
         bits.append(f"max_phase={max_phase}")
