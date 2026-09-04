@@ -27,26 +27,6 @@ def ordered_halving(value: int) -> float:
     return int(binary[::-1], 2) / (1 << 64)
 
 
-def stagger_phase(step: int, stride: int) -> int:
-    """Interior-boundary shift for one sampler step: ordered halving scaled to the stride."""
-    return int(ordered_halving(step) * stride)
-
-
-def reachable_phases(stride: int, total_steps: int | None) -> set[int]:
-    """Every phase ``stagger_phase`` can yield over the resolved sampler schedule.
-
-    ``resolve_step`` answers with a step in ``[0, total_steps]`` when the schedule
-    is known and ``None`` otherwise; an unresolved step staggers nothing, so it
-    contributes phase 0 only. Validating exactly this image means a short run is
-    never rejected for a phase it cannot reach, and a long run never reaches a
-    phase that was not checked.
-    """
-    phases = {0}
-    if total_steps is not None:
-        phases.update(stagger_phase(step, stride) for step in range(total_steps + 1))
-    return phases
-
-
 def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list[int]:
     if window >= total:
         return [0]
@@ -189,7 +169,7 @@ def make_context_wrapper(policy: ContextPolicy):
         payload = dict(kwargs.get("minimax_payload") or {})
         prompt_segments = payload.get("h3forge_prompt_segments")
         prompt_durations = payload.get("h3forge_prompt_segment_durations")
-        step, total_steps = resolve_step(transformer_options)
+        step, _ = resolve_step(transformer_options)
 
         if total_t <= policy.window_frames:
             if prompt_segments and len(prompt_segments) > 1:
@@ -231,14 +211,16 @@ def make_context_wrapper(policy: ContextPolicy):
             stride = policy.window_frames - policy.overlap_frames
             phase = 0
             if policy.stagger and step is not None:
-                phase = stagger_phase(step, stride)
+                phase = int(ordered_halving(step) * stride)
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
             if prompt_segments:
-                # Validate reachability over every stagger phase the resolved
-                # schedule can visit, not just this step's starts: a config that
-                # survives step 0 must not strict-abort or silently drop a
-                # segment once the window boundaries shift on later steps.
-                phases = reachable_phases(stride, total_steps) if policy.stagger else {0}
+                # Validate reachability over every stagger phase the run can
+                # visit, not just this step's starts: a config that survives
+                # step 0 must not strict-abort or silently drop a segment once
+                # the window boundaries shift on later steps.
+                phases = {0}
+                if policy.stagger:
+                    phases.update(int(ordered_halving(s) * stride) for s in range(64))
                 missing_union: set[int] = set()
                 for p in sorted(phases):
                     missing_union.update(unreachable_segments(
