@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import pairwise
 
 import torch
 
@@ -14,10 +15,16 @@ LOG = "[H3Forge]"
 @dataclass(frozen=True)
 class ContextPolicy:
     window_frames: int = 25
-    overlap_frames: int = 5
+    overlap_frames: int = 8
     stagger: bool = True
     blend: str = "pyramid"
     strict: bool = False
+
+
+def ordered_halving(value: int) -> float:
+    """Return the bit-reversed base-2 fraction used for context staggering."""
+    binary = f"{value:064b}"
+    return int(binary[::-1], 2) / (1 << 64)
 
 
 def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list[int]:
@@ -29,30 +36,47 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
     if stride <= 0:
         raise ValueError("overlap must be smaller than window")
 
+    if not isinstance(phase, int) or not 0 <= phase < stride:
+        raise ValueError(f"phase must be an integer in [0, {stride})")
+
+    final_start = total - window
+    count = 1 + (final_start + stride - 1) // stride
+    base = [round(i * final_start / (count - 1)) for i in range(count)]
+    if phase == 0 or count <= 2:
+        return sorted(set(base))
+
     starts = [0]
-    phase = max(0, min(int(phase), overlap))
-    s = stride + phase
-    while s < total - window:
-        starts.append(max(1, s))
-        s += stride
-    starts.append(total - window)
+    for i in range(1, count - 1):
+        remaining = count - 1 - i
+        lower = max(starts[-1] + 1, final_start - remaining * window)
+        upper = min(starts[-1] + window, final_start - remaining)
+        starts.append(min(max(base[i] + phase, lower), upper))
+    starts.append(final_start)
     return sorted(set(starts))
 
 
 def blend_weights(length: int, overlap: int, *, device, dtype, mode="pyramid",
                   ramp_start: bool = True, ramp_end: bool = True):
-    """Overlap-add blend weights with explicit first/last edge correction.
-
-    The outermost edges of the full timeline have no neighbouring window to
-    blend with, so the first window keeps full weight on its left edge and the
-    last window on its right edge (ramp_start/ramp_end False). Interior edges
-    ramp as usual.
-    """
+    """Return full-window pyramid, overlap-linear, or flat fusion weights."""
+    if mode not in {"pyramid", "overlap-linear", "flat"}:
+        raise ValueError(f"unknown blend mode: {mode}")
     if length <= 0:
         return torch.empty(0, device=device, dtype=dtype)
-    if mode == "flat" or overlap <= 0 or not (ramp_start or ramp_end):
+    if mode == "flat":
         return torch.ones(length, device=device, dtype=dtype)
-    ramp = min(overlap, max(length // 2, 1))
+
+    if mode == "pyramid":
+        peak = (length + 1) // 2
+        ascending = torch.arange(1, peak + 1, device=device, dtype=torch.float32)
+        descending_start = peak if length % 2 == 0 else peak - 1
+        descending = torch.arange(descending_start, 0, -1, device=device, dtype=torch.float32)
+        return torch.cat((ascending, descending)).to(dtype)
+
+    if overlap <= 0 or not (ramp_start or ramp_end):
+        return torch.ones(length, device=device, dtype=dtype)
+    ramp = min(overlap, length // 2)
+    if ramp == 0:
+        return torch.ones(length, device=device, dtype=dtype)
     w = torch.ones(length, device=device, dtype=torch.float32)
     edge = torch.linspace(1.0 / (ramp + 1), 1.0, ramp, device=device)
     if ramp_start:
@@ -88,6 +112,8 @@ def context_plan_summary(
     overlap: int,
     *,
     phase: int,
+    blend: str = "pyramid",
+    stagger: bool = False,
     prompt_count: int = 0,
     prompt_durations=None,
 ) -> str:
@@ -100,6 +126,10 @@ def context_plan_summary(
         f"window/overlap={window}/{overlap}",
         f"phase={phase}",
         f"video_latent_visits={latent_visits:.2f}x",
+        f"stride={window - overlap}",
+        f"min_overlap={min((window - (right - left) for left, right in pairwise(starts)), default=0)}",
+        f"blend={blend}",
+        f"stagger={'on' if stagger else 'off'}",
     ]
     if prompt_count:
         assigned = [
@@ -159,6 +189,8 @@ def make_context_wrapper(policy: ContextPolicy):
                     total_t,
                     0,
                     phase=0,
+                    blend=policy.blend,
+                    stagger=False,
                 )
                 if prompt_segments:
                     # The fast path runs the primary conditioning context
@@ -178,11 +210,8 @@ def make_context_wrapper(policy: ContextPolicy):
 
             stride = policy.window_frames - policy.overlap_frames
             phase = 0
-            if policy.stagger and stride > 2 and step is not None:
-                phase = min(
-                    (step * max(stride // 3, 1)) % stride,
-                    policy.overlap_frames,
-                )
+            if policy.stagger and step is not None:
+                phase = int(ordered_halving(step) * stride)
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
             if prompt_segments:
                 # Validate reachability over every stagger phase the run can
@@ -190,9 +219,8 @@ def make_context_wrapper(policy: ContextPolicy):
                 # step 0 must not strict-abort or silently drop a segment once
                 # the window boundaries shift on later steps.
                 phases = {0}
-                if policy.stagger and stride > 2:
-                    increment = max(stride // 3, 1)
-                    phases = {min((s * increment) % stride, policy.overlap_frames) for s in range(stride)}
+                if policy.stagger:
+                    phases.update(int(ordered_halving(s) * stride) for s in range(64))
                 missing_union: set[int] = set()
                 for p in sorted(phases):
                     missing_union.update(unreachable_segments(
@@ -228,6 +256,8 @@ def make_context_wrapper(policy: ContextPolicy):
                         policy.window_frames,
                         policy.overlap_frames,
                         phase=phase,
+                        blend=policy.blend,
+                        stagger=policy.stagger,
                         prompt_count=len(prompt_segments) if prompt_segments else 0,
                         prompt_durations=prompt_durations,
                     ),

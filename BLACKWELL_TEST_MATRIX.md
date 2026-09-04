@@ -2,7 +2,7 @@
 
 Use the same seed, prompt, input conditioning, resolution, frame count, sampler, steps, CFG/guidance, and model files for every row.
 
-For pipe-timeline tests, keep the exact segment count, delimiter placement, `global_prompt`, and `segment_durations` fixed. Each segment is an independent encoding and occupies its requested relative portion of the target video timeline (equal portions when durations are empty); each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add. Retain the step-zero context-plan line so the actual window count, stagger phase, latent-visit ratio, and prompt assignment are part of the receipt.
+For pipe-timeline tests, keep the exact segment count, delimiter placement, `global_prompt`, and `segment_durations` fixed. Each segment is an independent encoding and occupies its requested relative portion of the target video timeline (equal portions when durations are empty); each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add. Retain the step-zero context-plan line so the actual window count, stagger phase/state, stride, minimum adjacent overlap, blend mode, latent-visit ratio, and prompt assignment are part of the receipt.
 
 | ID | Sparse | FETA | Context | Purpose |
 |---|---|---|---|---|
@@ -58,14 +58,15 @@ H3 timeline units are 40 Hz. Do not read `temporal_window` or `bridge_stride` as
 
 ## Context sweep
 
-Keep overlap around 20–30% initially:
+Sweep overlap around 20–32% initially; `25 / 8` is the current node default:
 
-| window | overlap |
-|---:|---:|
-| 17 | 4 |
-| 25 | 5 |
-| 33 | 8 |
-| 41 | 10 |
+| window | overlap | note |
+|---:|---:|---|
+| 17 | 4 | lower-window comparison |
+| 25 | 5 | retained pre-parity comparison |
+| 25 | 8 | current default |
+| 33 | 8 | larger-window comparison |
+| 41 | 10 | larger-window comparison |
 
 The best point will depend heavily on target resolution because each video latent frame contains all spatial patch rows.
 

@@ -4,6 +4,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -69,6 +70,59 @@ def test_h3forge_nodes_share_one_runtime_regardless_of_order(monkeypatch):
             is first.model_options["transformer_options"]["optimized_attention_override"])
     # The upstream model remains unpatched.
     assert base.model_options == {}
+
+
+def test_context_node_exposes_core_parity_defaults(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+    required = nodes.H3ForgeContextWindows.INPUT_TYPES()["required"]
+    assert required["overlap_frames"][1]["default"] == 8
+    assert required["blend"][0] == ["pyramid", "overlap-linear", "flat"]
+    assert required["blend"][1]["default"] == "pyramid"
+
+
+@pytest.mark.parametrize("stride", [1, 2])
+def test_context_node_rejects_too_small_a_stride_for_stagger(monkeypatch, stride):
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    with pytest.raises(ValueError, match="stride of at least 3"):
+        nodes.H3ForgeContextWindows().patch(
+            object(), 25, 25 - stride, True, "pyramid", False,
+        )
+
+
+def test_context_node_allows_small_stride_when_stagger_is_off(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+
+    class MinimalPatcher:
+        model = object()
+
+        def clone(self):
+            return self
+
+        @staticmethod
+        def get_model_object(name):
+            assert name == "extra_conds"
+            return lambda **kwargs: kwargs
+
+        @staticmethod
+        def add_object_patch(name, value):
+            assert name == "extra_conds"
+            assert callable(value)
+
+        @staticmethod
+        def add_wrapper_with_key(kind, key, wrapper):
+            assert kind == "diffusion"
+            assert key == nodes.CTX_KEY
+            assert callable(wrapper)
+
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    model = MinimalPatcher()
+    assert nodes.H3ForgeContextWindows().patch(
+        model, 25, 23, False, "pyramid", False,
+    ) == (model,)
+    assert nodes.H3ForgeContextWindows().patch(
+        model, 25, 22, True, "pyramid", False,
+    ) == (model,)
 
 
 def test_nag_and_attention_configs_stay_per_branch(monkeypatch):
