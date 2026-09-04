@@ -38,8 +38,8 @@ def _with_private_code(fn):
 
     ``code.replace()`` mints a distinct code object with identical bytecode, so
     a runner compiled from this copy owns a full budget of its own that no other
-    runner can spend. The number of shapes a process may meet is then bounded
-    by nothing but the runner LRU below.
+    runner can spend. The runner LRU below bounds H3Forge's retained Dynamo
+    state; PyTorch's process-wide backend caches have a separate lifetime.
     """
     copy = types.FunctionType(fn.__code__.replace(), fn.__globals__, fn.__name__,
                               fn.__defaults__, fn.__closure__)
@@ -61,13 +61,13 @@ def _acquire_kernel(flex_attention):
 def _release_runner(runner):
     """Evict a runner: drop its Dynamo state and pool its kernel for reuse.
 
-    Deleting the cache entry alone frees nothing. Dynamo hangs a runner's cache
-    entries -- guard managers, traced graphs, the compiled graph and its
-    kernels -- off the private code object, and keeps that code object alive
-    in an lru_cache of cleaned bytecode, so an evicted runner would retain
-    every artifact it ever compiled. ``reset_code`` drops the entries (their
-    installed ``__compiled_fn_*`` globals go with them) and refunds the budget,
-    so the kernel can back the next runner with a clean slate.
+    Deleting our cache entry alone leaves Dynamo's per-code entries alive.
+    ``reset_code`` drops those entries and their installed ``__compiled_fn_*``
+    globals, refunding the budget before this code object is reused.
+
+    This does not evict Inductor's process-wide PyCodeCache modules or unload
+    CUDA kernels. Those backend caches also serve other ComfyUI nodes and are
+    not owned by this runner LRU; total compilation memory is not bounded here.
     """
     from torch._dynamo import reset_code
 
