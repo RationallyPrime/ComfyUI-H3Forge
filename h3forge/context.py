@@ -73,11 +73,12 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
         lower = max(starts[-1] + 1, final_start - remaining * stride)
         upper = min(starts[-1] + stride, final_start - remaining)
         candidate = min(max(base[i] + phase, lower), upper)
-        # Apply the phase first, then snap within the feasible interval. Exact
-        # anchors, overlap and count take precedence if no cadence point fits.
+        # Align static plans. Active stagger phases retain their original
+        # geometry: snapping those too can collapse every phase onto the only
+        # feasible cadence plan, silently disabling seam movement.
         first = ((lower + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
         last = (upper // _LATENT_CADENCE) * _LATENT_CADENCE
-        if first <= last:
+        if phase == 0 and first <= last:
             candidate = min(max(round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE, first), last)
         starts.append(candidate)
     starts.append(final_start)

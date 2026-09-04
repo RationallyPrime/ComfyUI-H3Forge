@@ -51,9 +51,7 @@ def test_phase_moves_only_interior_starts_and_keeps_fixed_anchors():
     shifted = window_starts(427, 112, 6, 53)
     assert shifted[0] == base[0] == 0
     assert shifted[-1] == base[-1] == 315
-    # A phase can collapse onto the same cadence point when overlap leaves
-    # less than five latents of room; it must never force an invalid overlap.
-    assert all(after >= before for before, after in zip(base[1:-1], shifted[1:-1]))
+    assert all(after > before for before, after in zip(base[1:-1], shifted[1:-1]))
     assert window_starts(427, 107, 6, 20) == [0, 100, 180, 260, 320]
 
 
@@ -70,14 +68,24 @@ def test_window_at_least_total_uses_one_start():
 
 @pytest.mark.parametrize("window,overlap", [(80, 10), (80, 11), (107, 6)])
 def test_shipped_context_policies_snap_interiors_but_preserve_the_tail(window, overlap):
-    for phase in range(max_stagger_phase(window, overlap) + 1):
-        starts = window_starts(427, window, overlap, phase)
-        assert all(start % 5 == 0 for start in starts[:-1])
-        # The tail is exempt: moving it would lose coverage or change length.
-        assert starts[-1] == 427 - window
-        receipt = context_plan_summary(427, starts, window, overlap, phase=phase)
-        assert "cadence=5" in receipt
-        assert f"off_cadence_starts={int((427 - window) % 5 != 0)}" in receipt
+    starts = window_starts(427, window, overlap, 0)
+    assert all(start % 5 == 0 for start in starts[:-1])
+    # The tail is exempt: moving it would lose coverage or change length.
+    assert starts[-1] == 427 - window
+    receipt = context_plan_summary(427, starts, window, overlap, phase=0)
+    assert "cadence=5" in receipt
+    assert f"off_cadence_starts={int((427 - window) % 5 != 0)}" in receipt
+
+
+@pytest.mark.parametrize("window,overlap", [(80, 10), (25, 8)])
+def test_cadence_alignment_does_not_disable_staggering(window, overlap):
+    plans = {tuple(window_starts(427, window, overlap, stagger_phase(step, window, overlap)))
+             for step in range(32)}
+    assert len(plans) > 1
+    for starts in plans:
+        count = sum(start % 5 != 0 for start in starts)
+        receipt = context_plan_summary(427, list(starts), window, overlap, phase=1)
+        assert f"off_cadence_starts={count}" in receipt
 
 
 def test_tight_stride_keeps_unsnappable_starts_and_reports_them():
