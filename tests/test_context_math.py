@@ -11,6 +11,8 @@ from h3forge.context import (
     context_plan_summary,
     make_context_wrapper,
     ordered_halving,
+    reachable_phases,
+    stagger_phase,
     window_starts,
 )
 from h3forge.layout import expand_audio_range, padded_spatial_shape
@@ -111,7 +113,57 @@ def test_ordered_halving_first_eight_values():
     ]
 
 
-def test_context_wrapper_uses_ordered_halving_and_validates_the_first_64_phases(monkeypatch):
+def test_reachable_phases_are_the_phase_map_image_of_the_resolved_schedule():
+    # resolve_step answers in [0, total_steps]; the validated set is exactly that image.
+    assert reachable_phases(17, 20) == {stagger_phase(step, 17) for step in range(21)}
+    assert stagger_phase(31, 17) == 16
+    assert 16 not in reachable_phases(17, 20)
+    # A stride wider than 64 keeps producing new phases past step 64.
+    assert reachable_phases(101, 200) - reachable_phases(101, 63)
+    # No schedule means no resolved step, so the run never staggers.
+    assert reachable_phases(17, None) == {0}
+
+
+def _strict_reachability_probe(monkeypatch, *, total_steps: int, latents: int, segments: int):
+    """Run a strict wrapper up to the reachability gate and stop right after it."""
+    from h3forge import context as context_module
+
+    def stop_after_reachability(*args, **kwargs):
+        raise RuntimeError("reachability recorded")
+
+    monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_reachability)
+
+    def executor(x, timestep, context, transformer_options, **kwargs):
+        return x
+
+    wrapper = make_context_wrapper(ContextPolicy(window_frames=25, overlap_frames=8, stagger=True, strict=True))
+    video = torch.zeros(1, 1, latents, 1, 1)
+    audio = torch.zeros(1, 1, 1, 2 * latents)
+    prompt_segments = tuple(torch.full((1, 1, 1), float(index)) for index in range(segments))
+    sigmas = torch.linspace(1.0, 0.0, total_steps + 1)
+    wrapper(
+        executor,
+        [video, audio],
+        timestep=None,
+        context=prompt_segments[0],
+        transformer_options={"sample_sigmas": sigmas, "sigmas": sigmas[:1]},
+        minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
+    )
+
+
+def test_short_run_is_not_rejected_for_a_phase_it_never_reaches(monkeypatch):
+    # 25/8 over 94 latents with five equal segments: segment 3 goes unselected
+    # only at phases first reached by step 31, so a 20-step run must pass.
+    with pytest.raises(RuntimeError, match="reachability recorded"):
+        _strict_reachability_probe(monkeypatch, total_steps=20, latents=94, segments=5)
+
+
+def test_run_reaching_a_segment_dropping_phase_is_rejected(monkeypatch):
+    with pytest.raises(RuntimeError, match=r"segments \[3\] are never selected"):
+        _strict_reachability_probe(monkeypatch, total_steps=31, latents=94, segments=5)
+
+
+def test_context_wrapper_uses_ordered_halving_and_validates_every_phase_of_the_schedule(monkeypatch):
     from h3forge import context as context_module
 
     seen_phases = []
@@ -148,9 +200,9 @@ def test_context_wrapper_uses_ordered_halving_and_validates_the_first_64_phases(
         minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
     )
 
-    expected_reachability_phases = {
-        int(ordered_halving(step) * stride) for step in range(64)
-    } | {0}
+    # Four sigmas resolve to total_steps == 3, so steps 0..3 are the schedule.
+    expected_reachability_phases = {stagger_phase(step, stride) for step in range(4)} | {0}
+    assert expected_reachability_phases == {0, 25, 50, 75}
     assert result == [video, audio]
     assert seen_phases[0] == int(ordered_halving(1) * stride) == 50
     assert set(seen_phases[1:]) == expected_reachability_phases
