@@ -1,3 +1,5 @@
+from itertools import pairwise
+
 import pytest
 import torch
 
@@ -8,6 +10,7 @@ from h3forge.context import (
     blend_weights,
     context_plan_summary,
     make_context_wrapper,
+    ordered_halving,
     window_starts,
 )
 from h3forge.layout import expand_audio_range, padded_spatial_shape
@@ -23,40 +26,146 @@ from h3forge.prompt import (
 )
 
 
-def test_windows_cover_full_range():
-    starts = window_starts(61, 25, 5, 0)
-    covered = set()
-    for s in starts:
-        covered.update(range(s, min(s + 25, 61)))
-    assert covered == set(range(61))
+def test_window_starts_use_even_spacing_without_a_near_duplicate_tail():
+    starts = window_starts(427, 112, 6)
+    overlaps = [112 - (right - left) for left, right in pairwise(starts)]
+    assert starts == [0, 105, 210, 315]
+    assert len(starts) == 4
     assert starts[0] == 0
-    assert starts[-1] == 36
+    assert starts[-1] == 315
+    assert all(value >= 6 for value in overlaps)
+
+    starts = window_starts(427, 107, 6)
+    overlaps = [107 - (right - left) for left, right in pairwise(starts)]
+    assert starts == [0, 80, 160, 240, 320]
+    assert len(starts) == 5
+    assert max(overlaps) - min(overlaps) <= 1
+    assert all(value < 50 for value in overlaps)
 
 
-def test_phase_still_covers_full_range():
-    starts = window_starts(61, 25, 5, 7)
-    covered = set()
-    for s in starts:
-        covered.update(range(s, min(s + 25, 61)))
-    assert covered == set(range(61))
+def test_phase_moves_only_interior_starts_and_keeps_fixed_anchors():
+    base = window_starts(427, 112, 6, 0)
+    shifted = window_starts(427, 112, 6, 53)
+    assert shifted[0] == base[0] == 0
+    assert shifted[-1] == base[-1] == 315
+    assert all(after > before for before, after in zip(base[1:-1], shifted[1:-1]))
+    assert window_starts(427, 107, 6, 20) == [0, 100, 180, 260, 320]
 
 
-def test_blend_positive():
-    w = blend_weights(25, 5, device="cpu", dtype=torch.float32)
-    assert torch.all(w > 0)
-    assert w[0] < w[5]
-    assert w[-1] < w[-6]
+@pytest.mark.parametrize("phase", [-1, 101, 1.5])
+def test_phase_must_be_an_integer_inside_the_stride(phase):
+    with pytest.raises(ValueError, match="phase must be an integer"):
+        window_starts(427, 107, 6, phase)
 
 
-def test_blend_edges_keep_full_weight_at_timeline_boundaries():
-    first = blend_weights(25, 5, device="cpu", dtype=torch.float32, ramp_start=False)
+def test_window_at_least_total_uses_one_start():
+    assert window_starts(25, 25, 8, 0) == [0]
+    assert window_starts(24, 25, 8, 0) == [0]
+
+
+def test_pyramid_blend_uses_the_whole_window_for_odd_and_even_lengths():
+    odd = blend_weights(7, 2, device="cpu", dtype=torch.float32, mode="pyramid")
+    even = blend_weights(6, 2, device="cpu", dtype=torch.float32, mode="pyramid")
+    assert odd.tolist() == [1, 2, 3, 4, 3, 2, 1]
+    assert even.tolist() == [1, 2, 3, 3, 2, 1]
+    assert torch.equal(
+        blend_weights(7, 0, device="cpu", dtype=torch.float32, mode="pyramid",
+                      ramp_start=False, ramp_end=False),
+        odd,
+    )
+
+
+def test_overlap_linear_preserves_the_old_edge_ramp_and_boundary_handling():
+    expected_edge = torch.linspace(1 / 6, 1, 5)
+    interior = blend_weights(25, 5, device="cpu", dtype=torch.float32, mode="overlap-linear")
+    assert torch.allclose(interior[:5], expected_edge)
+    assert torch.allclose(interior[-5:], expected_edge.flip(0))
+
+    first = blend_weights(25, 5, device="cpu", dtype=torch.float32,
+                          mode="overlap-linear", ramp_start=False)
     assert torch.all(first[:5] == 1.0)
     assert first[-1] < first[-6]
-    last = blend_weights(25, 5, device="cpu", dtype=torch.float32, ramp_end=False)
+    last = blend_weights(25, 5, device="cpu", dtype=torch.float32,
+                         mode="overlap-linear", ramp_end=False)
     assert torch.all(last[-5:] == 1.0)
     assert last[0] < last[5]
-    only = blend_weights(25, 5, device="cpu", dtype=torch.float32, ramp_start=False, ramp_end=False)
+    only = blend_weights(25, 5, device="cpu", dtype=torch.float32,
+                         mode="overlap-linear", ramp_start=False, ramp_end=False)
     assert torch.all(only == 1.0)
+    clamped = blend_weights(7, 20, device="cpu", dtype=torch.float32, mode="overlap-linear")
+    assert torch.allclose(clamped, torch.tensor([0.25, 0.625, 1, 1, 1, 0.625, 0.25]))
+
+
+def test_blend_rejects_unknown_modes():
+    with pytest.raises(ValueError, match="unknown blend mode"):
+        blend_weights(7, 2, device="cpu", dtype=torch.float32, mode="mystery")
+    assert torch.equal(
+        blend_weights(7, 2, device="cpu", dtype=torch.float32, mode="flat"),
+        torch.ones(7),
+    )
+
+
+def test_ordered_halving_first_eight_values():
+    assert [ordered_halving(i) for i in range(8)] == [
+        0, 0.5, 0.25, 0.75, 0.125, 0.625, 0.375, 0.875,
+    ]
+
+
+def test_context_wrapper_uses_ordered_halving_and_validates_the_first_64_phases(monkeypatch):
+    from h3forge import context as context_module
+
+    seen_phases = []
+
+    def recording_starts(total, window, overlap, phase=0):
+        seen_phases.append(phase)
+        return [0, total - window]
+
+    monkeypatch.setattr(context_module, "window_starts", recording_starts)
+    monkeypatch.setattr(context_module, "unreachable_segments", lambda *args, **kwargs: [])
+
+    def stop_after_reachability(*args, **kwargs):
+        raise RuntimeError("reachability recorded")
+
+    monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_reachability)
+
+    def executor(x, timestep, context, transformer_options, **kwargs):
+        return x
+
+    stride = 101
+    wrapper = make_context_wrapper(ContextPolicy(window_frames=107, overlap_frames=6, stagger=True))
+    video = torch.zeros(1, 1, 427, 1, 1)
+    audio = torch.zeros(1, 1, 1, 854)
+    prompt_segments = (torch.zeros(1, 1, 1), torch.ones(1, 1, 1))
+    result = wrapper(
+        executor,
+        [video, audio],
+        timestep=None,
+        context=prompt_segments[0],
+        transformer_options={
+            "sample_sigmas": torch.tensor([1.0, 0.7, 0.3, 0.0]),
+            "sigmas": torch.tensor([0.69]),
+        },
+        minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
+    )
+
+    expected_reachability_phases = {
+        int(ordered_halving(step) * stride) for step in range(64)
+    } | {0}
+    assert result == [video, audio]
+    assert seen_phases[0] == int(ordered_halving(1) * stride) == 50
+    assert set(seen_phases[1:]) == expected_reachability_phases
+    assert len(seen_phases[1:]) == len(expected_reachability_phases)
+
+
+@pytest.mark.parametrize("total,window,overlap", [(427, 112, 6), (427, 80, 28)])
+def test_pyramid_blend_covers_every_latent_at_static_and_half_stride_phases(total, window, overlap):
+    stride = window - overlap
+    for phase in (0, stride // 2):
+        accumulated = torch.zeros(total, dtype=torch.float32)
+        for start in window_starts(total, window, overlap, phase):
+            weights = blend_weights(window, overlap, device="cpu", dtype=torch.float32, mode="pyramid")
+            accumulated[start:start + window] += weights
+        assert torch.all(accumulated > 0)
 
 
 def test_audio_overlap_is_zero_when_video_windows_do_not_overlap():
@@ -184,7 +293,7 @@ def test_segment_selection_ties_are_exact():
 
 
 def test_unreachable_segments_detected_when_segments_outnumber_windows():
-    # 30 latents with the default 25/5 policy give windows [0,25) and [5,30);
+    # This explicit 25/5 policy gives windows [0,25) and [5,30);
     # both midpoints land in segment 2 of 3, so segments 1 and 3 would vanish.
     starts = window_starts(30, 25, 5, 0)
     assert starts == [0, 5]
@@ -201,11 +310,17 @@ def test_context_plan_reports_work_and_prompt_assignment():
         window=25,
         overlap=5,
         phase=0,
+        blend="overlap-linear",
+        stagger=True,
         prompt_count=3,
         prompt_durations=(2.0, 18.0, 40.0),
     )
     assert "windows=3" in summary
     assert "video_latent_visits=1.25x" in summary
+    assert "stride=20" in summary
+    assert "min_overlap=5" in summary
+    assert "blend=overlap-linear" in summary
+    assert "stagger=on" in summary
     assert "prompt_windows=2x1,3x2" in summary
 
 
@@ -233,6 +348,7 @@ def test_single_window_path_emits_step_zero_context_plan(capsys):
     receipt = capsys.readouterr().out
     assert "context plan video_latents=10 windows=1 window/overlap=10/0" in receipt
     assert "phase=0 video_latent_visits=1.00x" in receipt
+    assert "stride=10 min_overlap=0 blend=pyramid stagger=off" in receipt
 
 
 class _Clip:

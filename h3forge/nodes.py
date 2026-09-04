@@ -250,9 +250,9 @@ class H3ForgeContextWindows:
         return {"required": {
             "model": ("MODEL",),
             "window_frames": ("INT", {"default": 25, "min": 2, "max": 512}),
-            "overlap_frames": ("INT", {"default": 5, "min": 0, "max": 256}),
+            "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
             "stagger": ("BOOLEAN", {"default": True}),
-            "blend": (["pyramid", "flat"], {"default": "pyramid"}),
+            "blend": (["pyramid", "overlap-linear", "flat"], {"default": "pyramid"}),
             "strict": ("BOOLEAN", {"default": False}),
         }}
 
@@ -265,6 +265,8 @@ class H3ForgeContextWindows:
         diffusion = _require_h3(model)
         if overlap_frames >= window_frames:
             raise ValueError("overlap_frames must be smaller than window_frames")
+        if stagger and window_frames - overlap_frames < 3:
+            raise ValueError("stagger requires a window stride of at least 3")
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend, strict=strict)
         patched = model.clone()
