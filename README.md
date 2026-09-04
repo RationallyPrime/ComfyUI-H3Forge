@@ -13,7 +13,7 @@ The project is deliberately a custom-node patch layer. It does **not** fork or m
 
 ## Status
 
-The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`, staggered pyramid blend), peaking **under 50 GB of VRAM**.
+The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`), peaking **under 50 GB of VRAM**. That run predates the current fusion-parity change: its then-named `pyramid` mode was the edge ramp now exposed as `overlap-linear`, so it is not yet a GPU receipt for the full-window pyramid.
 
 Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. Peak denoising memory is governed mainly by the active window, while wall time and total work continue to grow with the number of windows. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
 
@@ -57,13 +57,13 @@ This is overlap-add context denoising rather than "generate clip A, then feed it
 
 For every denoising step it:
 
-1. creates overlapping target-video latent windows;
+1. distributes overlapping target-video latent windows evenly between fixed first and last anchors;
 2. maps each video interval to the physically overlapping H3 audio-latent interval;
 3. constructs a window-local `PackedLayout`;
 4. transplants the **original global audio/video position IDs** into that layout;
 5. evaluates H3 jointly on the synchronized A/V window;
-6. pyramid-blends video and audio predictions into their full latent canvases;
-7. optionally shifts interior window boundaries between sampler steps.
+6. fuses video and audio predictions into their full latent canvases with a full-window pyramid by default;
+7. optionally shifts interior boundaries with ComfyUI's ordered-halving phase sequence over the whole stride while preserving coverage.
 
 That absolute-position transplant is important: a context window beginning at latent frame 26 must not pretend it begins at H3 frame zero and restart the `1,4,4,4,4` RoPE cadence.
 
@@ -86,7 +86,7 @@ Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 
 
 Every segment is encoded independently. Write each local segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`). Put concrete identity, wardrobe, location, lighting, voice, and style anchors in `global_prompt`, or repeat them manually when they change between segments. Do not rely on cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; the local segment encoder cannot see a previous segment. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.
 
-At sampler step zero, the context node prints one compact plan containing the actual latent length, window count, effective stagger phase, window/overlap settings, total video-latent visits, and a run-length-compressed prompt-to-window assignment. `video_latent_visits` is an overlap accounting ratio, not a wall-time or VRAM prediction.
+At sampler step zero, the context node prints one compact plan containing the actual latent length, window count, effective stagger phase, window/overlap and stride settings, minimum realized adjacent overlap, blend mode, stagger state, total video-latent visits, and a run-length-compressed prompt-to-window assignment. `video_latent_visits` is an overlap accounting ratio, not a wall-time or VRAM prediction.
 
 ### H3 Forge — Reference Pipe Timeline Prompt
 
@@ -221,7 +221,7 @@ Start with a generation whose target video latent length is larger than the wind
 
 ```text
 window_frames   25
-overlap_frames  5
+overlap_frames  8
 stagger         true
 blend           pyramid
 strict          true
@@ -243,7 +243,7 @@ Only after Runs 2–4 each behave independently:
 
 ```text
 H3 attention: flex_sliding + conservative FETA
-H3 context:   25 / 5 / stagger / pyramid
+H3 context:   25 / 8 / stagger / pyramid
 ```
 
 If the combined result regresses, disable FETA first. Sparse routing and context windows change the model's information topology; FETA is an amplifier and should be the last variable introduced.
@@ -281,10 +281,15 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 : Number of **H3 video latent frames** in each context invocation, not decoded output frames.
 
 `overlap_frames`
-: Video-latent overlap. Audio overlap is derived from physical H3 time rather than copied index-for-index.
+: Requested minimum video-latent overlap before staggering; the node default is `8` for a `25`-latent window. Audio overlap is derived from physical H3 time rather than copied index-for-index.
 
 `stagger`
-: Moves interior window boundaries by at most the overlap amount across sampling steps while preserving complete coverage.
+: Moves only interior window boundaries using ComfyUI's bit-reversed ordered-halving phases across the whole stride. The first and last starts remain anchored, and phase projection preserves complete coverage.
+
+`blend`
+: `pyramid` applies weights `1,2,...,peak,...,2,1` across each complete window before normalized overlap-add. `overlap-linear` preserves H3Forge's former Kijai-style edge ramp, including first/last boundary handling. `flat` gives every covered prediction equal weight.
+
+Existing saved workflows whose blend is `pyramid` intentionally acquire the new full-window triangle. Select `overlap-linear` to retain the former H3Forge weighting.
 
 ### Timeline prompt
 
@@ -346,7 +351,7 @@ selected H3 model
 
 ## Test locally
 
-The included CPU tests cover scheduler coverage, unequal prompt-span routing, global-anchor propagation, context-plan reporting, blend-edge correction, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
+The included CPU tests cover evenly spaced and staggered scheduler coverage, full-window pyramid and retained overlap-linear fusion, unequal prompt-span routing, global-anchor propagation, context-plan reporting, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
 
 ```bash
 PYTHONPATH=. python -m pytest -q tests
@@ -362,7 +367,7 @@ The CPU tests cannot validate GPU/model correctness on their own — that requir
 
 ## Design lineage and nearby work
 
-H3Forge is an original implementation informed by native ComfyUI's MiniMax-H3 packed layout and wrapper seams, WanVideoWrapper's context scheduling, and Enhance-A-Video/FETA's off-diagonal temporal-attention gain. The H3 ecosystem now has several useful neighboring projects:
+H3Forge is an original implementation informed by native ComfyUI's MiniMax-H3 packed layout and wrapper seams, [ComfyUI's context-window pyramid and ordered-halving sequence](https://github.com/Comfy-Org/ComfyUI/blob/master/comfy/context_windows.py), WanVideoWrapper's context scheduling, and Enhance-A-Video/FETA's off-diagonal temporal-attention gain. The H3 ecosystem now has several useful neighboring projects:
 
 - [ComfyUI-SolAttn-H3](https://github.com/quzopl/ComfyUI-SolAttn-H3) demonstrates disciplined sparse-attention integration, named fallback reasons, self-tests, and per-run telemetry. H3Forge keeps its own H3-aware sparse topology and now applies the same principle of reporting the actual context plan it ran.
 - [ComfyUI-YCNodes-MiniMax-H3](https://github.com/yichengup/ComfyUI-YCNodes-MiniMax-H3) introduced a practical global/local Prompt Relay UI with explicit segment lengths. [T8's MiniMax H3 nodes](https://github.com/T8mars/comfyui-minimax-h3-audio-T8) go further with validated frame/second/percent ranges and absolute-timeline projection across sequential long-video segments. H3Forge independently adopts the small composable part that fits its different mechanism: a repeated global anchor and exact unequal relative spans for independently encoded context-window prompts.
