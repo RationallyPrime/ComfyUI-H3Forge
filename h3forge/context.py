@@ -27,6 +27,23 @@ def ordered_halving(value: int) -> float:
     return int(binary[::-1], 2) / (1 << 64)
 
 
+def max_stagger_phase(window: int, overlap: int) -> int:
+    """Largest interior-boundary shift that still keeps every adjacent overlap.
+
+    Staggering exists to move seams between steps, not to let a window jump
+    across its neighbour: a shift larger than the requested overlap lets two
+    windows abut with no blend and puts every latent under a different
+    prompt/neighbour pair on alternate steps, which reads as constant morphing.
+    """
+    stride = window - overlap
+    return max(0, min(overlap, stride - 1))
+
+
+def stagger_phase(step: int, window: int, overlap: int) -> int:
+    """Ordered-halving phase for ``step`` bounded to ``[0, max_stagger_phase]``."""
+    return int(ordered_halving(step) * (max_stagger_phase(window, overlap) + 1))
+
+
 def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list[int]:
     if window >= total:
         return [0]
@@ -48,8 +65,12 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
     starts = [0]
     for i in range(1, count - 1):
         remaining = count - 1 - i
-        lower = max(starts[-1] + 1, final_start - remaining * window)
-        upper = min(starts[-1] + window, final_start - remaining)
+        # Every adjacent pair keeps at least ``overlap`` latents in common:
+        # the next start is never more than one stride away from the last one,
+        # and never so far back that the remaining windows could not reach the
+        # final anchor within a stride each.
+        lower = max(starts[-1] + 1, final_start - remaining * stride)
+        upper = min(starts[-1] + stride, final_start - remaining)
         starts.append(min(max(base[i] + phase, lower), upper))
     starts.append(final_start)
     return sorted(set(starts))
@@ -116,6 +137,7 @@ def context_plan_summary(
     stagger: bool = False,
     prompt_count: int = 0,
     prompt_durations=None,
+    max_phase: int | None = None,
 ) -> str:
     """Return one compact, truthful account of a context-window pass."""
     ranges = [(start, min(start + window, total)) for start in starts]
@@ -131,6 +153,8 @@ def context_plan_summary(
         f"blend={blend}",
         f"stagger={'on' if stagger else 'off'}",
     ]
+    if max_phase is not None:
+        bits.append(f"max_phase={max_phase}")
     if prompt_count:
         assigned = [
             select_segment_index(start, end, total, prompt_count, prompt_durations) + 1
@@ -208,25 +232,28 @@ def make_context_wrapper(policy: ContextPolicy):
                                            audio_x.shape[-1], keyframes=payload.get("keyframes"),
                                            refs=payload.get("refs"))
 
-            stride = policy.window_frames - policy.overlap_frames
             phase = 0
             if policy.stagger and step is not None:
-                phase = int(ordered_halving(step) * stride)
+                phase = stagger_phase(step, policy.window_frames, policy.overlap_frames)
+            # The nominal (phase 0) geometry decides how many windows exist and
+            # which prompt segment each one carries. Staggering only moves the
+            # interior seams; it never changes a window's prompt, so no latent
+            # is denoised under one segment on even steps and another on odd.
+            nominal_starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, 0)
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
+            if len(starts) != len(nominal_starts):
+                raise RuntimeError(
+                    f"stagger phase {phase} changed the window count "
+                    f"({len(nominal_starts)} -> {len(starts)})")
+            segment_indices: list[int] = []
             if prompt_segments:
-                # Validate reachability over every stagger phase the run can
-                # visit, not just this step's starts: a config that survives
-                # step 0 must not strict-abort or silently drop a segment once
-                # the window boundaries shift on later steps.
-                phases = {0}
-                if policy.stagger:
-                    phases.update(int(ordered_halving(s) * stride) for s in range(64))
-                missing_union: set[int] = set()
-                for p in sorted(phases):
-                    missing_union.update(unreachable_segments(
-                        window_starts(total_t, policy.window_frames, policy.overlap_frames, p),
-                        policy.window_frames, total_t, len(prompt_segments), prompt_durations))
-                missing = sorted(missing_union)
+                segment_indices = [
+                    select_segment_index(v0, min(v0 + policy.window_frames, total_t), total_t,
+                                         len(prompt_segments), prompt_durations)
+                    for v0 in nominal_starts
+                ]
+                missing = unreachable_segments(
+                    nominal_starts, policy.window_frames, total_t, len(prompt_segments), prompt_durations)
                 if missing:
                     message = (
                         f"{LOG} pipe prompt segments {[m + 1 for m in missing]} are never selected by any "
@@ -252,7 +279,7 @@ def make_context_wrapper(policy: ContextPolicy):
                 print(
                     f"{LOG} context plan " + context_plan_summary(
                         total_t,
-                        starts,
+                        nominal_starts,
                         policy.window_frames,
                         policy.overlap_frames,
                         phase=phase,
@@ -260,6 +287,8 @@ def make_context_wrapper(policy: ContextPolicy):
                         stagger=policy.stagger,
                         prompt_count=len(prompt_segments) if prompt_segments else 0,
                         prompt_durations=prompt_durations,
+                        max_phase=max_stagger_phase(policy.window_frames, policy.overlap_frames)
+                        if policy.stagger else 0,
                     ),
                     flush=True,
                 )
@@ -269,17 +298,15 @@ def make_context_wrapper(policy: ContextPolicy):
             audio_acc = torch.zeros_like(audio_x)
             audio_den = torch.zeros((1, 1, 1, audio_x.shape[-1]), device=audio_x.device, dtype=torch.float32)
 
-            for v0, (a0, a1) in zip(starts, audio_ranges):
+            for index, (v0, (a0, a1)) in enumerate(zip(starts, audio_ranges)):
                 v1 = min(v0 + policy.window_frames, total_t)
                 local_context = context
                 if prompt_segments:
-                    # Hard per-window selection: contextualized token slots from
-                    # different prompts do not correspond, so windows never mix
-                    # hidden states — boundary crossfade happens in output space
-                    # through the overlap-add below.
-                    segment_index = select_segment_index(
-                        v0, v1, total_t, len(prompt_segments), prompt_durations)
-                    local_context = prompt_segments[segment_index]
+                    # Hard per-window selection frozen from the nominal geometry:
+                    # contextualized token slots from different prompts do not
+                    # correspond, so windows never mix hidden states — boundary
+                    # crossfade happens in output space through the overlap-add.
+                    local_context = prompt_segments[segment_indices[index]]
                 local_layout = clone_window_layout(
                     full_layout=full_layout,
                     text_len=local_context.shape[1],

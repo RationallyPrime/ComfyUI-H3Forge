@@ -10,7 +10,9 @@ from h3forge.context import (
     blend_weights,
     context_plan_summary,
     make_context_wrapper,
+    max_stagger_phase,
     ordered_halving,
+    stagger_phase,
     window_starts,
 )
 from h3forge.layout import expand_audio_range, padded_spatial_shape
@@ -111,31 +113,55 @@ def test_ordered_halving_first_eight_values():
     ]
 
 
-def test_context_wrapper_uses_ordered_halving_and_validates_the_first_64_phases(monkeypatch):
+@pytest.mark.parametrize("total,window,overlap", [(427, 80, 10), (427, 80, 11), (427, 107, 6), (427, 25, 8)])
+def test_every_phase_keeps_the_requested_overlap_and_window_count(total, window, overlap):
+    nominal = window_starts(total, window, overlap, 0)
+    for phase in range(window - overlap):
+        starts = window_starts(total, window, overlap, phase)
+        assert len(starts) == len(nominal)
+        assert starts[0] == 0 and starts[-1] == total - window
+        overlaps = [window - (right - left) for left, right in pairwise(starts)]
+        assert min(overlaps) >= overlap, (phase, starts)
+
+
+def test_stagger_phase_is_bounded_by_the_overlap_not_the_stride():
+    assert max_stagger_phase(80, 10) == 10
+    assert max_stagger_phase(80, 0) == 0
+    assert max_stagger_phase(25, 20) == 4  # stride 5 -> phases stay inside it
+    phases = {stagger_phase(step, 80, 10) for step in range(64)}
+    assert phases == set(range(11))
+    assert stagger_phase(1, 80, 10) == 5
+    assert stagger_phase(0, 80, 10) == 0
+
+
+def test_context_wrapper_freezes_prompt_assignment_across_stagger_phases(monkeypatch):
+    """Each window keeps the segment chosen by the nominal (phase 0) geometry."""
     from h3forge import context as context_module
 
     seen_phases = []
+    real_starts = window_starts
 
     def recording_starts(total, window, overlap, phase=0):
         seen_phases.append(phase)
-        return [0, total - window]
+        return real_starts(total, window, overlap, phase)
 
     monkeypatch.setattr(context_module, "window_starts", recording_starts)
-    monkeypatch.setattr(context_module, "unreachable_segments", lambda *args, **kwargs: [])
+
+    captured = []
 
     def stop_after_reachability(*args, **kwargs):
-        raise RuntimeError("reachability recorded")
+        captured.append(args)
+        raise RuntimeError("geometry recorded")
 
     monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_reachability)
 
     def executor(x, timestep, context, transformer_options, **kwargs):
         return x
 
-    stride = 101
-    wrapper = make_context_wrapper(ContextPolicy(window_frames=107, overlap_frames=6, stagger=True))
+    wrapper = make_context_wrapper(ContextPolicy(window_frames=80, overlap_frames=10, stagger=True))
     video = torch.zeros(1, 1, 427, 1, 1)
     audio = torch.zeros(1, 1, 1, 854)
-    prompt_segments = (torch.zeros(1, 1, 1), torch.ones(1, 1, 1))
+    prompt_segments = tuple(torch.full((1, 1, 1), float(i)) for i in range(6))
     result = wrapper(
         executor,
         [video, audio],
@@ -147,14 +173,22 @@ def test_context_wrapper_uses_ordered_halving_and_validates_the_first_64_phases(
         },
         minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
     )
-
-    expected_reachability_phases = {
-        int(ordered_halving(step) * stride) for step in range(64)
-    } | {0}
     assert result == [video, audio]
-    assert seen_phases[0] == int(ordered_halving(1) * stride) == 50
-    assert set(seen_phases[1:]) == expected_reachability_phases
-    assert len(seen_phases[1:]) == len(expected_reachability_phases)
+    # Nominal geometry first, then this step's bounded phase (step 1 -> 5).
+    assert seen_phases == [0, stagger_phase(1, 80, 10)] == [0, 5]
+
+
+def test_frozen_assignment_matches_nominal_selection_for_six_windows_six_segments():
+    nominal = window_starts(427, 80, 10, 0)
+    assert len(nominal) == 6
+    assigned = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in nominal]
+    assert assigned == [0, 1, 2, 3, 4, 5]
+    # The former full-stride stagger produced these abutting starts on odd steps
+    # and re-routed the tail windows; assignment now comes from the nominal
+    # geometry regardless of where the seams sit on a given step.
+    abutting = [0, 80, 160, 240, 320, 347]
+    drifted = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in abutting]
+    assert drifted == [0, 1, 2, 3, 5, 5] != assigned
 
 
 @pytest.mark.parametrize("total,window,overlap", [(427, 112, 6), (427, 80, 28)])
@@ -322,6 +356,9 @@ def test_context_plan_reports_work_and_prompt_assignment():
     assert "blend=overlap-linear" in summary
     assert "stagger=on" in summary
     assert "prompt_windows=2x1,3x2" in summary
+    assert "max_phase" not in summary
+    assert "max_phase=5" in context_plan_summary(
+        total=60, starts=[0, 20, 35], window=25, overlap=5, phase=0, max_phase=5)
 
 
 def test_single_window_path_emits_step_zero_context_plan(capsys):
