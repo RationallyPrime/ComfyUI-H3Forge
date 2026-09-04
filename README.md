@@ -63,7 +63,7 @@ For every denoising step it:
 4. transplants the **original global audio/video position IDs** into that layout;
 5. evaluates H3 jointly on the synchronized A/V window;
 6. fuses video and audio predictions into their full latent canvases with a full-window pyramid by default;
-7. optionally shifts interior boundaries with ComfyUI's ordered-halving phase sequence, bounded to the requested overlap so adjacent windows always keep it, while the window count and each window's prompt segment stay fixed by the phase-0 geometry.
+7. optionally shifts interior boundaries with ComfyUI's ordered-halving phase sequence, bounded to the requested overlap so adjacent windows always keep it; a segmented pipe prompt pins the boundaries at phase 0 instead, because a moving seam there would change which latents mix two prompts from step to step.
 
 That absolute-position transplant is important: a context window beginning at latent frame 26 must not pretend it begins at H3 frame zero and restart the `1,4,4,4,4` RoPE cadence.
 
@@ -284,7 +284,7 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 : Requested minimum video-latent overlap before staggering; the node default is `8` for a `25`-latent window. Audio overlap is derived from physical H3 time rather than copied index-for-index.
 
 `stagger`
-: Moves only interior window boundaries using ComfyUI's bit-reversed ordered-halving phases, bounded to `min(overlap_frames, stride - 1)`. The first and last starts remain anchored, every adjacent pair keeps at least `overlap_frames` latents in common, and the window count and per-window prompt segment are frozen from the phase-0 geometry, so a latent is never denoised under different prompts on different steps. A full-stride shift would let windows abut with no blend and swap prompts between steps, which shows up as continuous morphing and repeated dialogue.
+: Moves only interior window boundaries using ComfyUI's bit-reversed ordered-halving phases, bounded to `min(overlap_frames, stride - 1)`. The first and last starts remain anchored and every adjacent pair keeps at least `overlap_frames` latents in common. With a pipe prompt of two or more segments the stagger is pinned off and the plan says so: each window is denoised under one hard-selected segment, so a seam that moved would change which latents blend two prompts from step to step, and that per-latent prompt drift shows up as continuous morphing and repeated dialogue. A full-stride shift would additionally let windows abut with no blend.
 
 `blend`
 : `pyramid` applies weights `1,2,...,peak,...,2,1` across each complete window before normalized overlap-add. `overlap-linear` preserves H3Forge's former Kijai-style edge ramp, including first/last boundary handling. `flat` gives every covered prediction equal weight.

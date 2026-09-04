@@ -134,8 +134,8 @@ def test_stagger_phase_is_bounded_by_the_overlap_not_the_stride():
     assert stagger_phase(0, 80, 10) == 0
 
 
-def test_context_wrapper_freezes_prompt_assignment_across_stagger_phases(monkeypatch):
-    """Each window keeps the segment chosen by the nominal (phase 0) geometry."""
+def test_context_wrapper_pins_stagger_off_under_a_segmented_prompt(monkeypatch, capsys):
+    """A segmented prompt keeps fixed window coverage; a single prompt still staggers."""
     from h3forge import context as context_module
 
     seen_phases = []
@@ -147,13 +147,10 @@ def test_context_wrapper_freezes_prompt_assignment_across_stagger_phases(monkeyp
 
     monkeypatch.setattr(context_module, "window_starts", recording_starts)
 
-    captured = []
-
-    def stop_after_reachability(*args, **kwargs):
-        captured.append(args)
+    def stop_after_geometry(*args, **kwargs):
         raise RuntimeError("geometry recorded")
 
-    monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_reachability)
+    monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_geometry)
 
     def executor(x, timestep, context, transformer_options, **kwargs):
         return x
@@ -161,21 +158,38 @@ def test_context_wrapper_freezes_prompt_assignment_across_stagger_phases(monkeyp
     wrapper = make_context_wrapper(ContextPolicy(window_frames=80, overlap_frames=10, stagger=True))
     video = torch.zeros(1, 1, 427, 1, 1)
     audio = torch.zeros(1, 1, 1, 854)
-    prompt_segments = tuple(torch.full((1, 1, 1), float(i)) for i in range(6))
-    result = wrapper(
-        executor,
-        [video, audio],
-        timestep=None,
-        context=prompt_segments[0],
-        transformer_options={
-            "sample_sigmas": torch.tensor([1.0, 0.7, 0.3, 0.0]),
-            "sigmas": torch.tensor([0.69]),
-        },
-        minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
-    )
-    assert result == [video, audio]
-    # Nominal geometry first, then this step's bounded phase (step 1 -> 5).
-    assert seen_phases == [0, stagger_phase(1, 80, 10)] == [0, 5]
+    segments = tuple(torch.full((1, 1, 1), float(i)) for i in range(6))
+
+    def run(prompt_segments, sigma):
+        return wrapper(
+            executor,
+            [video, audio],
+            timestep=None,
+            context=prompt_segments[0],
+            transformer_options={
+                "sample_sigmas": torch.tensor([1.0, 0.7, 0.3, 0.0]),
+                "sigmas": torch.tensor([sigma]),
+            },
+            minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
+        )
+
+    # Six segments at step 1: the seams would move by up to the overlap and
+    # hand the latents inside each seam a different prompt mixture per step,
+    # so the wrapper runs the phase-0 geometry instead.
+    assert run(segments, 0.69) == [video, audio]
+    assert seen_phases == [0]
+    assert "stagger pinned off" not in capsys.readouterr().out
+
+    # The pin is announced once, at step 0.
+    seen_phases.clear()
+    assert run(segments, 1.0) == [video, audio]
+    assert seen_phases == [0]
+    assert "stagger pinned off: 6 pipe prompt segments" in capsys.readouterr().out
+
+    # One segment: every window carries the same prompt, so step 1 staggers.
+    seen_phases.clear()
+    assert run(segments[:1], 0.69) == [video, audio]
+    assert seen_phases == [stagger_phase(1, 80, 10)] == [5]
 
 
 def test_frozen_assignment_matches_nominal_selection_for_six_windows_six_segments():
@@ -184,8 +198,8 @@ def test_frozen_assignment_matches_nominal_selection_for_six_windows_six_segment
     assigned = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in nominal]
     assert assigned == [0, 1, 2, 3, 4, 5]
     # The former full-stride stagger produced these abutting starts on odd steps
-    # and re-routed the tail windows; assignment now comes from the nominal
-    # geometry regardless of where the seams sit on a given step.
+    # and re-routed the tail windows; a segmented prompt now pins the geometry
+    # at phase 0, so the seams and their segments never move.
     abutting = [0, 80, 160, 240, 320, 347]
     drifted = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in abutting]
     assert drifted == [0, 1, 2, 3, 5, 5] != assigned

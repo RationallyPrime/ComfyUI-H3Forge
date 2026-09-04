@@ -232,28 +232,33 @@ def make_context_wrapper(policy: ContextPolicy):
                                            audio_x.shape[-1], keyframes=payload.get("keyframes"),
                                            refs=payload.get("refs"))
 
+            # Each window is denoised under one hard-selected prompt, so with a
+            # segmented prompt every seam is a prompt boundary: moving it moves
+            # which latents blend segments N and N+1 from step to step, and that
+            # per-latent prompt drift is the morphing this wrapper exists to
+            # prevent. Staggering therefore runs only when every window carries
+            # the same prompt; segmented prompts keep fixed window coverage.
+            segmented = bool(prompt_segments) and len(prompt_segments) > 1
+            stagger = policy.stagger and not segmented
+            if policy.stagger and segmented and step in (None, 0):
+                print(
+                    f"{LOG} stagger pinned off: {len(prompt_segments)} pipe prompt segments need "
+                    "fixed window coverage so no latent changes prompt between steps",
+                    flush=True,
+                )
             phase = 0
-            if policy.stagger and step is not None:
+            if stagger and step is not None:
                 phase = stagger_phase(step, policy.window_frames, policy.overlap_frames)
-            # The nominal (phase 0) geometry decides how many windows exist and
-            # which prompt segment each one carries. Staggering only moves the
-            # interior seams; it never changes a window's prompt, so no latent
-            # is denoised under one segment on even steps and another on odd.
-            nominal_starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, 0)
             starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
-            if len(starts) != len(nominal_starts):
-                raise RuntimeError(
-                    f"stagger phase {phase} changed the window count "
-                    f"({len(nominal_starts)} -> {len(starts)})")
             segment_indices: list[int] = []
             if prompt_segments:
                 segment_indices = [
                     select_segment_index(v0, min(v0 + policy.window_frames, total_t), total_t,
                                          len(prompt_segments), prompt_durations)
-                    for v0 in nominal_starts
+                    for v0 in starts
                 ]
                 missing = unreachable_segments(
-                    nominal_starts, policy.window_frames, total_t, len(prompt_segments), prompt_durations)
+                    starts, policy.window_frames, total_t, len(prompt_segments), prompt_durations)
                 if missing:
                     message = (
                         f"{LOG} pipe prompt segments {[m + 1 for m in missing]} are never selected by any "
@@ -279,16 +284,16 @@ def make_context_wrapper(policy: ContextPolicy):
                 print(
                     f"{LOG} context plan " + context_plan_summary(
                         total_t,
-                        nominal_starts,
+                        starts,
                         policy.window_frames,
                         policy.overlap_frames,
                         phase=phase,
                         blend=policy.blend,
-                        stagger=policy.stagger,
+                        stagger=stagger,
                         prompt_count=len(prompt_segments) if prompt_segments else 0,
                         prompt_durations=prompt_durations,
                         max_phase=max_stagger_phase(policy.window_frames, policy.overlap_frames)
-                        if policy.stagger else 0,
+                        if stagger else 0,
                     ),
                     flush=True,
                 )
@@ -302,10 +307,10 @@ def make_context_wrapper(policy: ContextPolicy):
                 v1 = min(v0 + policy.window_frames, total_t)
                 local_context = context
                 if prompt_segments:
-                    # Hard per-window selection frozen from the nominal geometry:
-                    # contextualized token slots from different prompts do not
-                    # correspond, so windows never mix hidden states — boundary
-                    # crossfade happens in output space through the overlap-add.
+                    # Hard per-window selection: contextualized token slots from
+                    # different prompts do not correspond, so windows never mix
+                    # hidden states — boundary crossfade happens in output space
+                    # through the overlap-add, at seams that never move.
                     local_context = prompt_segments[segment_indices[index]]
                 local_layout = clone_window_layout(
                     full_layout=full_layout,
