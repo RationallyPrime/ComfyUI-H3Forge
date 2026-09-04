@@ -5,7 +5,9 @@ import torch
 
 from fake_minimax import PackedLayout
 from h3forge.attention import (
+    _FlexRunner,
     _make_block_mask,
+    _release_runner,
     _run_flex,
     _runtime_int,
     _scale_video_output,
@@ -159,12 +161,9 @@ def test_bridge_stride_zero_disables_bridges(monkeypatch):
     assert not allow(video_row(5, 3), video_row(3, 0))
 
 
-def test_flex_attention_compiles_one_runner_per_shape(monkeypatch):
+def _fake_runner_factory(monkeypatch, compile_calls, marker):
     import h3forge.attention as attention
     import torch.nn.attention.flex_attention as flex_module
-
-    compile_calls = []
-    marker = object()
 
     def fake_flex(q, k, v, *, block_mask):
         assert block_mask is marker
@@ -178,8 +177,21 @@ def test_flex_attention_compiles_one_runner_per_shape(monkeypatch):
     monkeypatch.setattr(torch, "compile", fake_compile)
     monkeypatch.setattr(attention, "_make_block_mask", lambda state, q, device: marker)
     monkeypatch.setattr(attention, "_COMPILED_FLEX_CACHE", {})
+    monkeypatch.setattr(attention, "_RELEASED_KERNELS", [])
+    return fake_flex
 
+
+def _runner_state():
     state = RuntimeState(AttentionPolicy())
+    state.layout = _Layout((8, 2, 2, 2, 2), [(0, 8, "text"), (8, 12, "audio"), (12, 14, "video")])
+    return state
+
+
+def test_flex_attention_compiles_one_runner_per_shape_and_mask(monkeypatch):
+    compile_calls = []
+    fake_flex = _fake_runner_factory(monkeypatch, compile_calls, object())
+
+    state = _runner_state()
     q = torch.ones(1, 2, 3, 4)
     assert torch.equal(_run_flex(state, q, q, q), q * 3)
     assert len(compile_calls) == 1
@@ -196,6 +208,57 @@ def test_flex_attention_compiles_one_runner_per_shape(monkeypatch):
     first, second = (call[0] for call in compile_calls)
     assert first.__code__ is not fake_flex.__code__
     assert first.__code__ is not second.__code__
+
+    # mask_mod closes over policy and segment values, and Dynamo guards a
+    # closure on those values: a changed window at an unchanged shape would be
+    # a second specialization of the same runner, spending its budget. It gets
+    # its own runner instead.
+    state.policy.temporal_window += 1.0
+    _run_flex(state, q, q, q)
+    assert len(compile_calls) == 3
+    state.layout.segments = [(0, 6, "text"), (6, 12, "audio"), (12, 14, "video")]
+    _run_flex(state, q, q, q)
+    assert len(compile_calls) == 4
+    # Stagger offsets are tensor captures, never guard values: not a new runner.
+    state.layout._h3forge_video_offset = 3
+    _run_flex(state, q, q, q)
+    assert len(compile_calls) == 4
+
+
+def test_evicted_runner_resets_dynamo_state_and_recycles_its_kernel(monkeypatch):
+    import torch._dynamo as dynamo
+
+    import h3forge.attention as attention
+
+    compile_calls = []
+    _fake_runner_factory(monkeypatch, compile_calls, object())
+    monkeypatch.setattr(attention, "_COMPILED_FLEX_CACHE_LIMIT", 2)
+    resets = []
+    monkeypatch.setattr(dynamo, "reset_code", resets.append)
+
+    state = _runner_state()
+    shapes = [torch.ones(1, 2, s, 4) for s in (3, 5, 7, 9)]
+    for q in shapes[:2]:
+        _run_flex(state, q, q, q)
+    assert resets == []
+
+    # The third shape evicts the first runner: its private code object has its
+    # Dynamo entries dropped and waits in the pool.
+    _run_flex(state, shapes[2], shapes[2], shapes[2])
+    evicted = compile_calls[0][0]
+    assert resets == [evicted.__code__]
+    assert attention._RELEASED_KERNELS == [evicted]
+    assert len(attention._COMPILED_FLEX_CACHE) == 2
+
+    # The fourth shape reuses that code object instead of minting another, and
+    # the runner it evicts refills the pool: the module never holds more than
+    # limit + 1 code objects.
+    _run_flex(state, shapes[3], shapes[3], shapes[3])
+    assert compile_calls[3][0] is evicted
+    assert attention._RELEASED_KERNELS == [compile_calls[1][0]]
+    assert resets == [evicted.__code__, compile_calls[1][0].__code__]
+    # code.replace() copies compare equal, so count identities, not values.
+    assert len({id(call[0].__code__) for call in compile_calls}) == 3
 
 
 def _feta_state():
@@ -291,5 +354,48 @@ def test_each_runner_owns_its_dynamo_recompile_budget():
                        for _ in inputs]
             for runner, x in zip(runners, inputs):
                 assert torch.equal(runner(x), x * 3)
+    finally:
+        dynamo.reset()
+
+
+def test_released_runner_refunds_its_dynamo_budget(monkeypatch):
+    """Eviction must give Dynamo state back, not just drop our reference.
+
+    Dynamo pins every traced code object, so an evicted runner's compiled
+    graphs would otherwise outlive the LRU. Releasing resets the code object:
+    its installed ``__compiled_fn_*`` globals disappear, and its budget is
+    refunded exactly (a fresh compile succeeds, the next shape trips the limit
+    again), so the pooled kernel can back a new runner.
+    """
+    import torch._dynamo as dynamo
+
+    import h3forge.attention as attention
+
+    monkeypatch.setattr(attention, "_RELEASED_KERNELS", [])
+
+    def kernel(x):
+        return x * 2 + 1
+
+    def installed(fn):
+        return [name for name in fn.__globals__ if name.startswith("__compiled_fn")]
+
+    dynamo.reset()
+    try:
+        with dynamo.config.patch(recompile_limit=1, fail_on_recompile_limit_hit=True):
+            private = _with_private_code(kernel)
+            runner = _FlexRunner(private, torch.compile(private, dynamic=False, backend="eager"))
+            assert torch.equal(runner.run(torch.ones(3)), torch.full((3,), 3.0))
+            assert len(installed(private)) == 1
+            with pytest.raises(Exception, match="recompile_limit"):
+                runner.run(torch.ones(4))
+
+            _release_runner(runner)
+            assert attention._RELEASED_KERNELS == [private]
+            assert installed(private) == []
+
+            reused = torch.compile(private, dynamic=False, backend="eager")
+            assert torch.equal(reused(torch.ones(4)), torch.full((4,), 3.0))
+            with pytest.raises(Exception, match="recompile_limit"):
+                reused(torch.ones(5))
     finally:
         dynamo.reset()

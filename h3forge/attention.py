@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import types
+from typing import Callable, NamedTuple
 
 import torch
 
@@ -10,6 +11,15 @@ from .nag import apply_nag
 LOG = "[H3Forge]"
 _COMPILED_FLEX_CACHE: dict = {}
 _COMPILED_FLEX_CACHE_LIMIT = 8
+# Private flex_attention copies whose runners were evicted, Dynamo state already
+# reset. A cache miss takes one of these before minting another, so this module
+# never holds more than _COMPILED_FLEX_CACHE_LIMIT + 1 code objects.
+_RELEASED_KERNELS: list = []
+
+
+class _FlexRunner(NamedTuple):
+    kernel: types.FunctionType  # private copy of flex_attention; owns one Dynamo budget
+    run: Callable  # torch.compile(kernel)
 
 
 def _with_private_code(fn):
@@ -40,6 +50,29 @@ def _with_private_code(fn):
     copy.__doc__ = fn.__doc__
     copy.__dict__.update(fn.__dict__)
     return copy
+
+
+def _acquire_kernel(flex_attention):
+    if _RELEASED_KERNELS:
+        return _RELEASED_KERNELS.pop()
+    return _with_private_code(flex_attention)
+
+
+def _release_runner(runner):
+    """Evict a runner: drop its Dynamo state and pool its kernel for reuse.
+
+    Deleting the cache entry alone frees nothing. Dynamo hangs a runner's cache
+    entries -- guard managers, traced graphs, the compiled graph and its
+    kernels -- off the private code object, and keeps that code object alive
+    in an lru_cache of cleaned bytecode, so an evicted runner would retain
+    every artifact it ever compiled. ``reset_code`` drops the entries (their
+    installed ``__compiled_fn_*`` globals go with them) and refunds the budget,
+    so the kernel can back the next runner with a clean slate.
+    """
+    from torch._dynamo import reset_code
+
+    reset_code(runner.kernel.__code__)
+    _RELEASED_KERNELS.append(runner.kernel)
 
 
 def _unwrap(x):
@@ -100,6 +133,29 @@ def _runtime_int(value: int, *, device):
     return torch.tensor(int(value), dtype=torch.int64, device=device)
 
 
+def _mask_specialization(state):
+    """Every Python value ``mask_mod`` closes over, as one hashable key.
+
+    Dynamo guards a traced closure on the values it captured, so two masks
+    built from different policy or segment values are two specializations of
+    whichever runner consumes them, even at one tensor shape. Two packed
+    layouts can share one total sequence length while placing text,
+    references, audio, and video at different boundaries, and the signature
+    alone does not describe reference/keyframe prefix structure, so the full
+    segment table is part of the key. The stagger offsets are not: they are
+    captured as tensors and never specialize anything.
+    """
+    layout = state.layout
+    p = state.policy
+    return (
+        tuple(layout.signature),
+        tuple(tuple(segment) for segment in layout.segments),
+        p.temporal_window,
+        p.spatial_radius,
+        p.bridge_stride,
+    )
+
+
 def _make_block_mask(state, q, *, device):
     from torch.nn.attention.flex_attention import create_block_mask
 
@@ -111,18 +167,8 @@ def _make_block_mask(state, q, *, device):
     grid_w = max(int(latent_w) // 2, 1)
     video_offset = int(getattr(layout, "_h3forge_video_offset", 0))
     audio_offset = int(getattr(layout, "_h3forge_audio_offset", 0))
-    # Two packed layouts can share one total sequence length while placing text,
-    # references, audio, and video at different boundaries, and the signature
-    # alone does not describe reference/keyframe prefix structure. Key on the
-    # full segment table so a mask compiled for one segmentation is never
-    # reused for another.
-    layout_key = (
-        tuple(layout.signature),
-        tuple(tuple(segment) for segment in layout.segments),
-        video_offset,
-        audio_offset,
-    )
-    key = (str(device), layout_key, p.temporal_window, p.spatial_radius, p.bridge_stride)
+    # Each concrete BlockMask is one specialization plus one pair of offsets.
+    key = (str(device), _mask_specialization(state), video_offset, audio_offset)
     cached = state.mask_cache.get(key)
     if cached is not None:
         state.mask_cache.move_to_end(key)
@@ -199,23 +245,30 @@ def _run_flex(state, q, k, v):
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Fixed-shape
     # compilation avoids PyTorch Inductor's symbolic BlockMask lowering path,
     # while tensor-captured offsets can still vary at runtime without causing
-    # value-specialized recompiles. One runner is kept per concrete shape so a
-    # duration/resolution/window change triggers an observable compile instead
-    # of relying on hidden Dynamo guard-cache semantics, and each runner wraps
-    # a private copy of flex_attention so Dynamo's per-code-object recompile
-    # budget is per runner too (see _with_private_code).
-    key = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
+    # value-specialized recompiles. One runner is kept per concrete shape and
+    # mask specialization, so a duration/resolution/window change triggers an
+    # observable compile instead of relying on hidden Dynamo guard-cache
+    # semantics, and each runner wraps a private copy of flex_attention so
+    # Dynamo's per-code-object recompile budget is per runner too (see
+    # _with_private_code). A runner therefore never meets a second mask
+    # specialization and never approaches that budget.
+    shape = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
+    spec = _mask_specialization(state)
+    key = (shape, spec)
     runner = _COMPILED_FLEX_CACHE.pop(key, None)
     if runner is None:
-        print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={key}", flush=True)
-        runner = torch.compile(_with_private_code(flex_attention), dynamic=False)
+        print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={shape} "
+              f"with mask (temporal_window, spatial_radius, bridge_stride)={spec[-3:]}", flush=True)
+        kernel = _acquire_kernel(flex_attention)
+        runner = _FlexRunner(kernel, torch.compile(kernel, dynamic=False))
     # Re-insert as most recent and bound the cache like mask_cache: a session
-    # sweeping durations/resolutions must not accumulate runners forever.
+    # sweeping durations/resolutions must not accumulate runners forever, and
+    # an evicted runner gives its Dynamo state back (see _release_runner).
     _COMPILED_FLEX_CACHE[key] = runner
     while len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
-        del _COMPILED_FLEX_CACHE[next(iter(_COMPILED_FLEX_CACHE))]
+        _release_runner(_COMPILED_FLEX_CACHE.pop(next(iter(_COMPILED_FLEX_CACHE))))
     mask = _make_block_mask(state, q, device=q.device)
-    return runner(q, k, v, block_mask=mask)
+    return runner.run(q, k, v, block_mask=mask)
 
 
 @torch.no_grad()
