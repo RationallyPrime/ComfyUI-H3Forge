@@ -299,6 +299,14 @@ class H3ForgePipePrompt:
                     "default": "",
                     "tooltip": "One positive number per segment, comma-separated. Empty means equal time.",
                 }),
+                "delimiter": ("STRING", {
+                    "default": "|",
+                    "tooltip": (
+                        "Segment separator. Defaults to | for existing workflows; ||| or %%% "
+                        "read more clearly in prompts that carry MiniMax <|...|> tokens. Text "
+                        "inside <|...|> is never split whatever you choose."
+                    ),
+                }),
             },
         }
 
@@ -306,15 +314,16 @@ class H3ForgePipePrompt:
     FUNCTION = "encode"
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
-        "Encode | separated MiniMax-H3 prompts independently; each H3Forge context window uses the "
+        "Encode delimiter-separated MiniMax-H3 prompts independently; each H3Forge context window uses the "
         "segment covering its midpoint. Optional segment_durations assigns unequal spans (for example "
         "2,18,40); global_prompt repeats a shared anchor in every independent encoding. Windows under "
-        "different prompts crossfade in output space. Escape a literal pipe as \\|."
+        "different prompts crossfade in output space. Escape a literal delimiter with a backslash; "
+        "MiniMax's own <|cutoff|>-style tokens are never split."
     )
 
-    def encode(self, clip, prompt, global_prompt="", segment_durations=""):
+    def encode(self, clip, prompt, global_prompt="", segment_durations="", delimiter="|"):
         try:
-            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations),)
+            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations, delimiter),)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
 
@@ -348,6 +357,14 @@ class H3ForgeReferencePipePrompt:
                     "default": "",
                     "tooltip": "One positive number per segment, comma-separated. Empty means equal time.",
                 }),
+                "delimiter": ("STRING", {
+                    "default": "|",
+                    "tooltip": (
+                        "Segment separator. Defaults to | for existing workflows; ||| or %%% "
+                        "read more clearly in prompts that carry MiniMax <|...|> tokens. Text "
+                        "inside <|...|> is never split whatever you choose."
+                    ),
+                }),
             },
         }
 
@@ -356,7 +373,7 @@ class H3ForgeReferencePipePrompt:
     FUNCTION = "encode"
     CATEGORY = "conditioning/minimax"
     DESCRIPTION = (
-        "Encode | separated MiniMax-H3 Ref2VA prompts independently with the same one-to-four "
+        "Encode delimiter-separated MiniMax-H3 Ref2VA prompts independently with the same one-to-four "
         "reference images. Optional global_prompt anchors every segment and segment_durations assigns "
         "unequal timeline spans. Returns native reference conditioning plus the H3 AV latent for use "
         "with H3Forge context windows. Reference video/audio inputs are not supported by this node."
@@ -364,10 +381,11 @@ class H3ForgeReferencePipePrompt:
 
     def encode(self, clip, vae, audio_vae, ref_image_1, prompt, width, height, length,
                ref_image_size, ref_image_2=None, ref_image_3=None, ref_image_4=None,
-               global_prompt="", segment_durations=""):
-        texts = split_pipe_prompt(prompt)
+               global_prompt="", segment_durations="", delimiter="|"):
+        texts = split_pipe_prompt(prompt, delimiter)
         if len(texts) < 2:
-            raise ValueError(f"{LOG} reference pipe prompt requires at least two | separated segments")
+            raise ValueError(
+                f"{LOG} reference pipe prompt requires at least two {delimiter!r} separated segments")
         if len(texts) > 8:
             raise ValueError(f"{LOG} reference pipe prompt supports at most eight segments")
         durations = parse_segment_durations(segment_durations, len(texts))

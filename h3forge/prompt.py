@@ -9,26 +9,66 @@ import torch
 import torch.nn.functional as F
 
 
-def split_pipe_prompt(prompt: str) -> list[str]:
-    r"""Split a pipe timeline, supporting ``\|`` as a literal pipe."""
+DEFAULT_SEGMENT_DELIMITER = "|"
+_TOKEN_OPEN = "<|"
+_TOKEN_CLOSE = "|>"
+
+
+def validate_segment_delimiter(delimiter: str) -> str:
+    """Reject delimiters that cannot be scanned unambiguously."""
+    if not delimiter:
+        raise ValueError("segment delimiter must not be empty")
+    if "\\" in delimiter:
+        raise ValueError("segment delimiter must not contain a backslash; it introduces an escape")
+    if "<" in delimiter or ">" in delimiter:
+        raise ValueError(
+            "segment delimiter must not contain < or >; those bracket MiniMax's "
+            f"{_TOKEN_OPEN}...{_TOKEN_CLOSE} tokens, which are never split"
+        )
+    return delimiter
+
+
+def split_pipe_prompt(prompt: str, delimiter: str = DEFAULT_SEGMENT_DELIMITER) -> list[str]:
+    r"""Split a timeline prompt on ``delimiter``; ``\<delimiter>`` is a literal.
+
+    MiniMax spells its own special tokens ``<|cutoff|>``, ``<|lyrics_start|>`` and so on,
+    so the historical ``|`` delimiter cuts one in half and silently turns a single prompt
+    into extra empty-ish segments. Text between ``<|`` and ``|>`` is therefore never
+    split, whatever the delimiter, and the delimiter itself may not contain the brackets
+    that would make that rule ambiguous.
+    """
+    validate_segment_delimiter(delimiter)
     segments: list[str] = []
     current: list[str] = []
-    escaped = False
-    for char in prompt:
-        if escaped:
-            if char not in ("|", "\\"):
+    index, length = 0, len(prompt)
+    while index < length:
+        char = prompt[index]
+        if char == "\\":
+            if prompt.startswith(delimiter, index + 1):
+                current.append(delimiter)
+                index += 1 + len(delimiter)
+                continue
+            if index + 1 < length and prompt[index + 1] == "\\":
                 current.append("\\")
-            current.append(char)
-            escaped = False
-        elif char == "\\":
-            escaped = True
-        elif char == "|":
+                index += 2
+                continue
+            current.append("\\")
+            index += 1
+            continue
+        if prompt.startswith(_TOKEN_OPEN, index):
+            close = prompt.find(_TOKEN_CLOSE, index + len(_TOKEN_OPEN))
+            if close != -1:
+                stop = close + len(_TOKEN_CLOSE)
+                current.append(prompt[index:stop])
+                index = stop
+                continue
+        if prompt.startswith(delimiter, index):
             segments.append("".join(current).strip())
             current = []
-        else:
-            current.append(char)
-    if escaped:
-        current.append("\\")
+            index += len(delimiter)
+            continue
+        current.append(char)
+        index += 1
     segments.append("".join(current).strip())
 
     empty = [str(i + 1) for i, segment in enumerate(segments) if not segment]
@@ -280,9 +320,10 @@ def encode_pipe_prompt(
     prompt: str,
     global_prompt: str = "",
     segment_durations: str = "",
+    delimiter: str = DEFAULT_SEGMENT_DELIMITER,
 ):
-    """Encode each text-only pipe segment and return one annotated conditioning."""
-    texts = split_pipe_prompt(prompt)
+    """Encode each text-only timeline segment and return one annotated conditioning."""
+    texts = split_pipe_prompt(prompt, delimiter)
     durations = parse_segment_durations(segment_durations, len(texts))
     texts = compose_segment_prompts(texts, global_prompt)
     conditionings = [

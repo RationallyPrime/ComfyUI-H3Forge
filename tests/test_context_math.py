@@ -25,6 +25,7 @@ from h3forge.prompt import (
     select_segment_index,
     split_pipe_prompt,
     unreachable_segments,
+    validate_segment_delimiter,
 )
 
 
@@ -252,6 +253,34 @@ def test_pipe_prompt_split_and_escape():
     assert split_pipe_prompt(r"first | second with a \| literal | third") == [
         "first", "second with a | literal", "third",
     ]
+
+
+def test_minimax_special_tokens_are_never_split():
+    """<|cutoff|> and friends contain the historical delimiter but are single tokens."""
+    assert split_pipe_prompt("say <|cutoff|> now | and rest") == ["say <|cutoff|> now", "and rest"]
+    assert split_pipe_prompt("a <|lyrics_start|>la<|lyrics_end|> b") == ["a <|lyrics_start|>la<|lyrics_end|> b"]
+    # An unterminated "<|" is not a token, so its pipe stays an ordinary delimiter. That
+    # fails visibly on a malformed prompt instead of swallowing the rest into one segment.
+    assert split_pipe_prompt("broken <| open | tail") == ["broken <", "open", "tail"]
+
+
+def test_custom_delimiters_split_and_escape():
+    assert split_pipe_prompt("one ||| two <|cutoff|> ||| three", "|||") == [
+        "one", "two <|cutoff|>", "three",
+    ]
+    assert split_pipe_prompt(r"a %%% b with \%%% inside %%% c", "%%%") == [
+        "a", "b with %%% inside", "c",
+    ]
+    # A single pipe is ordinary text once the delimiter is longer.
+    assert split_pipe_prompt("a | b ||| c", "|||") == ["a | b", "c"]
+
+
+@pytest.mark.parametrize("delimiter", ["", "<|", "|>", "a>b", "back\\slash"])
+def test_unscannable_delimiters_are_rejected(delimiter):
+    with pytest.raises(ValueError, match="segment delimiter"):
+        validate_segment_delimiter(delimiter)
+    with pytest.raises(ValueError, match="segment delimiter"):
+        split_pipe_prompt("a b c", delimiter)
 
 
 def test_pipe_prompt_rejects_empty_segments():
