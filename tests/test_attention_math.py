@@ -399,3 +399,61 @@ def test_released_runner_refunds_its_dynamo_budget(monkeypatch):
                 reused(torch.ones(5))
     finally:
         dynamo.reset()
+
+
+def test_evicted_runner_releases_its_inductor_artifacts(monkeypatch):
+    """Eviction must release the backend's artifacts, not only Dynamo's guards.
+
+    Inductor loads the compiled graph's wrapper module (and, on CUDA, each
+    Triton kernel module) into process-wide registries that nothing shrinks,
+    so ``reset_code`` alone leaves every evicted graph resident. The runner
+    attributes whatever Inductor loads during its calls to itself, and
+    releasing it drops those entries, after which the wrapper is collectable.
+    Real Inductor on CPU: the wrapper module is the same registry path CUDA
+    kernels take.
+    """
+    import gc
+    import sys
+    import weakref
+
+    import torch._dynamo as dynamo
+    from torch._inductor.codecache import PyCodeCache
+
+    import h3forge.attention as attention
+    from h3forge.attention import _call_runner
+
+    monkeypatch.setattr(attention, "_RELEASED_KERNELS", [])
+
+    def kernel(x):
+        return x * 2 + 1
+
+    dynamo.reset()
+    try:
+        private = _with_private_code(kernel)
+        runner = _FlexRunner(private, torch.compile(private, dynamic=False))
+        assert torch.equal(_call_runner(runner, torch.ones(3)), torch.full((3,), 3.0))
+        assert runner.artifacts, "the compile loaded no Inductor module"
+        loaded = list(runner.artifacts)
+        names = [mod.__name__ for mod in loaded]
+        assert all(mod in PyCodeCache.modules for mod in loaded)
+        assert all(sys.modules.get(mod.__name__) is mod for mod in loaded)
+        # The wrapper's entry point; its globals are the module namespace, so
+        # this dies only when every kernel object in that namespace can.
+        wrapper = weakref.ref(next(mod.call for mod in loaded if hasattr(mod, "call")))
+
+        # Dynamo state alone is not enough: the registries still pin the graph.
+        dynamo.reset_code(private.__code__)
+        del loaded
+        gc.collect()
+        assert wrapper() is not None
+
+        _release_runner(runner)
+        assert runner.artifacts == []
+        assert attention._RELEASED_KERNELS == [private]
+        assert not any(mod.__name__ in names for mod in PyCodeCache.modules)
+        assert not any(name in sys.modules for name in names)
+        del runner
+        gc.collect()
+        assert wrapper() is None
+    finally:
+        dynamo.reset()

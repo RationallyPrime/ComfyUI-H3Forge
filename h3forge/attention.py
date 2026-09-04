@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import sys
 import types
-from typing import Callable, NamedTuple
+from typing import Callable
 
 import torch
 
@@ -17,9 +18,15 @@ _COMPILED_FLEX_CACHE_LIMIT = 8
 _RELEASED_KERNELS: list = []
 
 
-class _FlexRunner(NamedTuple):
-    kernel: types.FunctionType  # private copy of flex_attention; owns one Dynamo budget
-    run: Callable  # torch.compile(kernel)
+class _FlexRunner:
+    """One compiled flex_attention runner and everything the process holds for it."""
+
+    __slots__ = ("kernel", "run", "artifacts")
+
+    def __init__(self, kernel: types.FunctionType, run: Callable):
+        self.kernel = kernel  # private copy of flex_attention; owns one Dynamo budget
+        self.run = run  # torch.compile(kernel)
+        self.artifacts: list[types.ModuleType] = []  # Inductor modules loaded on this runner's behalf
 
 
 def _with_private_code(fn):
@@ -58,20 +65,70 @@ def _acquire_kernel(flex_attention):
     return _with_private_code(flex_attention)
 
 
+def _call_runner(runner, *args, **kwargs):
+    """Run the runner and attribute every Inductor module it loads to it.
+
+    Dynamo compiles on the first call (and on any later recompile), and
+    Inductor registers each module it loads for the graph -- the wrapper and,
+    on CUDA, every Triton kernel -- in process-wide registries that nothing
+    ever shrinks. The attention path is single-threaded, so whatever joins
+    those registries during this call was loaded for this runner. A failed
+    compile is attributed too, so eviction still releases what it loaded.
+    """
+    from torch._inductor.codecache import PyCodeCache
+
+    before = len(PyCodeCache.modules)
+    try:
+        return runner.run(*args, **kwargs)
+    finally:
+        runner.artifacts.extend(PyCodeCache.modules[before:])
+
+
+def _forget_inductor_modules(modules):
+    """Drop evicted Inductor modules from the registries that pin them.
+
+    ``PyCodeCache.modules`` / ``modules_no_attr`` / ``linemaps`` and
+    ``sys.modules`` each hold a strong reference to every module Inductor has
+    loaded, for the life of the process. Removing the index entries is all it
+    takes: a live runner still reaches its own module through its compiled
+    graph, so only a module nothing runs anymore becomes collectable, and a
+    later compile of identical source simply reloads it from Inductor's disk
+    cache. Membership is checked first because these are registries, not
+    ledgers: a module already gone is the state this function exists to reach.
+    """
+    from torch._inductor.codecache import PyCodeCache
+
+    for mod in modules:
+        path, name = mod.__file__, mod.__name__
+        PyCodeCache.modules[:] = [m for m in PyCodeCache.modules if m is not mod]
+        if PyCodeCache.modules_no_attr.get(path) is mod:
+            del PyCodeCache.modules_no_attr[path]
+        if not any(m.__file__ == path for m in PyCodeCache.modules):
+            PyCodeCache.linemaps.pop(path, None)
+        if sys.modules.get(name) is mod:
+            del sys.modules[name]
+
+
 def _release_runner(runner):
-    """Evict a runner: drop its Dynamo state and pool its kernel for reuse.
+    """Evict a runner: drop its Dynamo and Inductor state, pool its kernel.
 
     Deleting the cache entry alone frees nothing. Dynamo hangs a runner's cache
-    entries -- guard managers, traced graphs, the compiled graph and its
-    kernels -- off the private code object, and keeps that code object alive
-    in an lru_cache of cleaned bytecode, so an evicted runner would retain
-    every artifact it ever compiled. ``reset_code`` drops the entries (their
-    installed ``__compiled_fn_*`` globals go with them) and refunds the budget,
-    so the kernel can back the next runner with a clean slate.
+    entries -- guard managers, traced graphs, the compiled graph -- off the
+    private code object and keeps that code object alive in an lru_cache of
+    cleaned bytecode; Inductor keeps every module it loaded for the graph in
+    process-wide registries. ``reset_code`` drops the Dynamo entries (their
+    installed ``__compiled_fn_*`` globals go with them) and refunds the
+    budget; forgetting the runner's modules lets the compiled graph, its
+    wrapper and its kernel objects be collected. What no eviction returns is
+    the device-side binary Triton loaded for each kernel: Triton never unloads
+    a module, so those stay resident per distinct shape at kernel-code size,
+    as for any ``torch.compile`` user.
     """
     from torch._dynamo import reset_code
 
     reset_code(runner.kernel.__code__)
+    _forget_inductor_modules(runner.artifacts)
+    runner.artifacts = []
     _RELEASED_KERNELS.append(runner.kernel)
 
 
@@ -263,12 +320,13 @@ def _run_flex(state, q, k, v):
         runner = _FlexRunner(kernel, torch.compile(kernel, dynamic=False))
     # Re-insert as most recent and bound the cache like mask_cache: a session
     # sweeping durations/resolutions must not accumulate runners forever, and
-    # an evicted runner gives its Dynamo state back (see _release_runner).
+    # an evicted runner gives its Dynamo and Inductor state back (see
+    # _release_runner).
     _COMPILED_FLEX_CACHE[key] = runner
     while len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
         _release_runner(_COMPILED_FLEX_CACHE.pop(next(iter(_COMPILED_FLEX_CACHE))))
     mask = _make_block_mask(state, q, device=q.device)
-    return runner.run(q, k, v, block_mask=mask)
+    return _call_runner(runner, q, k, v, block_mask=mask)
 
 
 @torch.no_grad()
