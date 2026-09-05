@@ -39,6 +39,7 @@ def _fake_mask_factory(monkeypatch, calls):
 
     import torch.nn.attention.flex_attention as flex_module
     monkeypatch.setattr(flex_module, "create_block_mask", fake_create_block_mask)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
 
 
 def test_block_mask_is_compiled_and_head_broadcast(monkeypatch):
@@ -50,7 +51,7 @@ def test_block_mask_is_compiled_and_head_broadcast(monkeypatch):
     q = torch.zeros(1, 56, state.layout.seq_len, 128)
     first = _make_block_mask(state, q, device=q.device)
     assert calls[0]["H"] is None
-    assert calls[0]["_compile"] is True
+    assert "_compile" not in calls[0]  # compiled explicitly through a private code object
 
     # A repeated layout reuses the compiled block mask and records the hit.
     assert _make_block_mask(state, q, device=q.device) is first
@@ -177,6 +178,24 @@ def test_audio_self_attention_keeps_the_whole_stereo_utterance(monkeypatch, brid
     assert not allow(video_row(5, 0), video_row(2, 0))
 
 
+@pytest.mark.parametrize("negative_length", [2, 8])
+def test_swapped_negative_text_preserves_sparse_target_visibility(monkeypatch, negative_length):
+    calls = []
+    _fake_mask_factory(monkeypatch, calls)
+    state = RuntimeState(AttentionPolicy(temporal_window=2, spatial_radius=.25, bridge_stride=0))
+    state.layout = _Layout((4, 6, 4, 4, 30), [(0, 4, "text"), (4, 64, "audio"), (64, 88, "video")])
+    q = torch.zeros(1, 2, 88, 8)
+    _make_block_mask(state, q, device=q.device)
+    _make_block_mask(state, q, device=q.device, negative_text_len=negative_length)
+    positive, negative = calls
+    queries = torch.arange(88)[:, None]
+    base = positive["mask_mod"](0, 0, queries, torch.arange(88)[None, :])
+    swapped = negative["mask_mod"](0, 0, queries, torch.arange(88 - 4 + negative_length)[None, :])
+    assert torch.all(swapped[:, :negative_length])
+    assert torch.equal(swapped[:, negative_length:], base[:, 4:])
+    assert not torch.all(swapped[:, negative_length:])  # it did not become dense
+
+
 def _fake_runner_factory(monkeypatch, compile_calls, marker):
     import h3forge.attention as attention
     import torch.nn.attention.flex_attention as flex_module
@@ -191,7 +210,7 @@ def _fake_runner_factory(monkeypatch, compile_calls, marker):
 
     monkeypatch.setattr(flex_module, "flex_attention", fake_flex)
     monkeypatch.setattr(torch, "compile", fake_compile)
-    monkeypatch.setattr(attention, "_make_block_mask", lambda state, q, device: marker)
+    monkeypatch.setattr(attention, "_make_block_mask", lambda state, q, device, **kwargs: marker)
     monkeypatch.setattr(attention, "_COMPILED_FLEX_CACHE", {})
     monkeypatch.setattr(attention, "_RELEASED_KERNELS", [])
     return fake_flex
@@ -275,6 +294,53 @@ def test_evicted_runner_resets_dynamo_state_and_recycles_its_kernel(monkeypatch)
     assert resets == [evicted.__code__, compile_calls[1][0].__code__]
     # code.replace() copies compare equal, so count identities, not values.
     assert len({id(call[0].__code__) for call in compile_calls}) == 3
+
+
+def test_active_prompt_shapes_survive_steps_then_release_at_run_end(monkeypatch):
+    import h3forge.attention as attention
+
+    calls = []
+    _fake_runner_factory(monkeypatch, calls, object())
+    state = _runner_state()
+    state.begin_run()
+    state.layout = _runner_state().layout
+    shapes = [torch.ones(1, 2, length, 4) for length in range(3, 15)]
+    for _ in range(2):
+        for q in shapes:
+            _run_flex(state, q, q, q)
+    assert len(calls) == len(shapes)
+    assert len(attention._COMPILED_FLEX_CACHE) == len(shapes)
+    state.in_run = False
+    attention.prune_run_caches(state)
+    assert len(attention._COMPILED_FLEX_CACHE) == attention._COMPILED_FLEX_CACHE_LIMIT
+    assert len(attention._RELEASED_KERNELS) == 1
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_flex_persistent_allocations_escape_native_model_graph(monkeypatch, fail):
+    from types import SimpleNamespace
+
+    _fake_runner_factory(monkeypatch, [], object())
+    events = []
+    graph = SimpleNamespace(pause=lambda: events.append("pause"), resume=lambda: events.append("resume"))
+    state = _runner_state()
+    state.diffusion = SimpleNamespace(_comfy_malloc_graph=graph)
+
+    def compile_kernel(fn, **kwargs):
+        assert events == ["pause"]
+        events.append("compile")
+        if fail:
+            raise RuntimeError("compilation failed")
+        return fn
+
+    monkeypatch.setattr(torch, "compile", compile_kernel)
+    q = torch.ones(1, 2, 3, 4)
+    if fail:
+        with pytest.raises(RuntimeError, match="compilation failed"):
+            _run_flex(state, q, q, q)
+    else:
+        assert torch.equal(_run_flex(state, q, q, q), q * 3)
+    assert events == ["pause", "compile", "resume"]
 
 
 def _feta_state():

@@ -5,9 +5,11 @@
 ./README.md
 ./VERSION
 ./__init__.py
+./docs/audit-repairs.md
 ./h3forge/__init__.py
 ./h3forge/attention.py
 ./h3forge/context.py
+./h3forge/control.py
 ./h3forge/layout.py
 ./h3forge/nag.py
 ./h3forge/nodes.py
@@ -15,6 +17,8 @@
 ./h3forge/state.py
 ./pyproject.toml
 ./tests/fake_minimax.py
+./tests/core_source.py
+./tests/test_audit_repairs.py
 ./tests/test_attention_math.py
 ./tests/test_context_math.py
 ./tests/test_layout_windows.py

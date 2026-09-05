@@ -1,4 +1,3 @@
-import copy
 import importlib
 import sys
 import types
@@ -34,7 +33,13 @@ class FakePatcher:
         clone = FakePatcher()
         # Mirrors ComfyUI's ModelPatcher.clone: model_options are deep-copied
         # (functions survive as themselves), patches are carried over.
-        clone.model_options = copy.deepcopy(self.model_options)
+        def copy_options(value):
+            if isinstance(value, dict):
+                return {k: copy_options(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [copy_options(v) for v in value]
+            return value
+        clone.model_options = copy_options(self.model_options)
         clone.wrappers = list(self.wrappers)
         clone.replacements = dict(self.replacements)
         clone.model = self.model
@@ -48,6 +53,12 @@ class FakePatcher:
 
     def set_model_patch_replace(self, fn, *keys):
         self.replacements[keys] = fn
+        name, block, index = keys
+        opts = self.model_options.setdefault("transformer_options", {}).copy()
+        opts["patches_replace"] = opts.get("patches_replace", {}).copy()
+        opts["patches_replace"][name] = opts["patches_replace"].get(name, {}).copy()
+        opts["patches_replace"][name][(block, index)] = fn
+        self.model_options["transformer_options"] = opts
 
 
 def test_h3forge_nodes_share_one_runtime_regardless_of_order(monkeypatch):
@@ -237,40 +248,47 @@ def test_bound_forward_wrapper_survives_runtime_option_reconstruction(monkeypatc
     assert run(nag_only) == ("dense", True)
 
 
-def test_reference_pipe_node_reuses_native_ref2va_for_each_segment(monkeypatch):
+def test_reference_pipe_node_prepares_native_refs_once(monkeypatch):
     nodes = _import_nodes(monkeypatch)
     core = types.ModuleType("comfy_extras.nodes_minimax_h3")
-    calls = []
+    calls, texts = [], []
+    shared = [{"kind": "image", "latent": torch.ones(1)}]
+
+    class Clip:
+        def tokenize(self, text, **kwargs):
+            texts.append((text, kwargs))
+            return text
+
+        def encode_from_tokens_scheduled(self, text):
+            count = len(text.split())
+            return [[torch.ones(1, count, 3), {"minimax_token_tags": torch.ones(count, dtype=torch.long)}]]
 
     class MiniMaxH3ReferenceToVideo:
         @classmethod
         def execute(cls, **kwargs):
             calls.append(kwargs)
-            token_count = len(kwargs["prompt"].split())
-            context = torch.full((1, token_count, 3), float(token_count))
-            tags = torch.ones(token_count, dtype=torch.long)
-            metadata = {"minimax_token_tags": tags, "minimax_refs": ["shared-ref"]}
-            return [[context, metadata]], {"samples": "native-latent"}
+            tokens = kwargs["clip"].tokenize(kwargs["prompt"], minimax_ref_items=["prepared image and voice"])
+            conditioning = kwargs["clip"].encode_from_tokens_scheduled(tokens)
+            conditioning[0][1]["minimax_refs"] = shared
+            return conditioning, {"samples": "native-latent"}
 
     core.MiniMaxH3ReferenceToVideo = MiniMaxH3ReferenceToVideo
-    comfy_extras = types.ModuleType("comfy_extras")
-    comfy_extras.nodes_minimax_h3 = core
-    monkeypatch.setitem(sys.modules, "comfy_extras", comfy_extras)
+    monkeypatch.setitem(sys.modules, "comfy_extras", types.ModuleType("comfy_extras"))
     monkeypatch.setitem(sys.modules, "comfy_extras.nodes_minimax_h3", core)
-
-    image = object()
+    image, voice, video = object(), object(), object()
     conditioning, latent = nodes.H3ForgeReferencePipePrompt().encode(
-        clip=object(), vae=object(), audio_vae=object(), ref_image_1=image,
-        prompt="short segment | a deliberately longer segment",
-        width=864, height=480, length=124, ref_image_size="match",
-        global_prompt="same woman and red coat",
-        segment_durations="2,8",
-    )
-
-    assert len(calls) == 2
-    assert all(call["ref_images"] == {"ref_image_0": image} for call in calls)
-    assert calls[0]["prompt"] == "same woman and red coat\n\nshort segment"
-    assert calls[1]["prompt"] == "same woman and red coat\n\na deliberately longer segment"
-    assert conditioning[0][1]["h3forge_prompt_segment_count"] == 2
-    assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2.0, 8.0)
+        clip=Clip(), vae=object(), audio_vae=object(), ref_image_1=image,
+        ref_audio_1=voice, ref_video_2=video, ref_video_audio_2=voice,
+        prompt="short segment | a deliberately longer segment", width=864, height=480, length=124,
+        global_prompt="same woman and red coat", segment_durations="2,8")
+    assert len(calls) == 1
+    assert calls[0]["ref_images"] == {"ref_image_1": image}
+    assert calls[0]["ref_audios"] == {"ref_audio_1": voice}
+    assert calls[0]["ref_videos"] == {"ref_video_2": video}
+    assert calls[0]["ref_video_audios"] == {"ref_video_audio_2": voice}
+    assert [text for text, _ in texts] == ["same woman and red coat\n\nshort segment",
+                                           "same woman and red coat\n\na deliberately longer segment"]
+    assert texts[0][1] == texts[1][1]
+    assert conditioning[0][1]["minimax_refs"] is shared
+    assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2, 8)
     assert latent == {"samples": "native-latent"}

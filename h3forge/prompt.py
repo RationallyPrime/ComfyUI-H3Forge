@@ -7,7 +7,6 @@ from decimal import Decimal, InvalidOperation
 from fractions import Fraction
 
 import torch
-import torch.nn.functional as F
 
 
 DEFAULT_SEGMENT_DELIMITER = "|"
@@ -143,90 +142,45 @@ def compose_segment_prompts(segments: Sequence[str], global_prompt: str = "") ->
     return [f"{anchor}\n\n{segment}" for segment in segments]
 
 
-def pad_segment_contexts(contexts: Sequence[torch.Tensor]) -> list[torch.Tensor]:
-    """Right-pad independently encoded [1, tokens, channels] contexts."""
-    if not contexts:
-        raise ValueError("at least one prompt segment is required")
-    hidden = contexts[0].shape[-1]
-    max_tokens = max(int(context.shape[1]) for context in contexts)
-    padded = []
-    for context in contexts:
-        if context.ndim != 3 or context.shape[0] != 1:
-            raise ValueError(f"expected segment context [1,T,C], got {tuple(context.shape)}")
-        if context.shape[-1] != hidden:
-            raise ValueError("all segment contexts must have the same channel width")
-        padded.append(F.pad(context, (0, 0, 0, max_tokens - context.shape[1])))
-    return padded
+def segment_ranges(total: int, count: int, durations=None) -> tuple[list[tuple[int, int]], list[int]]:
+    """Project relative durations to the nearest native video-token boundaries.
 
-
-def pad_text_tags(tags: torch.Tensor | None, tokens: int) -> torch.Tensor:
-    """Pad MiniMax text-modality tags to the common segment token length."""
-    if tags is None:
-        return torch.ones(tokens, dtype=torch.long)
-    tags = tags.reshape(-1)
-    if tags.shape[0] > tokens:
-        raise ValueError("MiniMax text token tags exceed the encoded context length")
-    return F.pad(tags, (0, tokens - tags.shape[0]), value=1)
-
-
-def select_segment_index(
-    v0: int,
-    v1: int,
-    total: int,
-    count: int,
-    durations: Sequence[Duration] | None = None,
-) -> int:
-    """Pick the prompt segment whose duration span contains the window midpoint.
-
-    Contextualized hidden states from independently encoded prompts do not
-    share a common token basis, so a boundary window uses the one segment that
-    dominates it; adjacent windows generated under different prompts crossfade
-    in output space through the context-window overlap-add blend instead.
+    Return half-open latent ranges and their decoded-frame cuts. A beat shorter
+    than the native grid is rejected before any denoiser forward, never dropped.
     """
+    from comfy.ldm.minimax.model import FRAME_PER_TOKEN
+
     if count < 1:
         raise ValueError("segment count must be positive")
-    if not (0 <= v0 < v1 <= total):
-        raise ValueError(f"invalid window [{v0}, {v1}) for total {total}")
-    weights = tuple(_duration_fraction(value) for value in (durations or (Fraction(1),) * count))
+    weights = tuple(_duration_fraction(v) for v in (durations or (1,) * count))
     if len(weights) != count:
         raise ValueError(f"expected {count} segment durations, got {len(weights)}")
-
-    # Only the durations' ratios carry meaning, so the boundary predicate is
-    # evaluated in exact rational arithmetic from their decimal representation.
-    # The float form
-    # ``midpoint * sum(weights) / total`` overflows to ``inf`` for large finite
-    # durations such as ``1e307,1e307`` and routes every window to the final
-    # segment; float normalization avoids the overflow but makes a midpoint
-    # sitting exactly on a boundary land on whichever side the rounding fell.
-    total_weight = sum(weights)
-    target = Fraction(v0 + v1, 2 * total) * total_weight
-    boundary = Fraction(0)
-    for index, weight in enumerate(weights[:-1]):
-        boundary += weight
-        if target < boundary:
-            return index
-    return count - 1
+    frames = [0]
+    for i in range(total):
+        frames.append(frames[-1] + FRAME_PER_TOKEN[i % len(FRAME_PER_TOKEN)])
+    cuts, cumulative = [0], Fraction(0)
+    for weight in weights[:-1]:
+        cumulative += weight
+        target = cumulative * frames[-1] / sum(weights)
+        cuts.append(min(range(total + 1), key=lambda i: abs(frames[i] - target)))
+    cuts.append(total)
+    if any(a >= b for a, b in zip(cuts, cuts[1:])):
+        raise ValueError("a prompt segment is shorter than the native video-token grid; lengthen that duration")
+    return list(zip(cuts, cuts[1:])), [frames[i] for i in cuts]
 
 
-def unreachable_segments(
-    starts: Sequence[int],
-    window: int,
-    total: int,
-    count: int,
-    durations: Sequence[Duration] | None = None,
-) -> list[int]:
-    """Return zero-based segment indices no context window would ever select.
-
-    Window midpoints are quantized to the scheduler's stride and confined to
-    [window/2, total - window/2], so when segments outnumber windows some
-    prompts are silently unreachable; callers surface that instead of letting
-    a prompt vanish without a trace.
-    """
-    selected = {
-        select_segment_index(v0, min(v0 + window, total), total, count, durations)
-        for v0 in starts
-    }
-    return sorted(set(range(count)) - selected)
+def _same_payload(a, b):
+    """Compare the tensor/list/dict values in native H3 reference payloads."""
+    if a is b:
+        return True
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)
+                and a.shape == b.shape and torch.equal(a, b))
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_same_payload(a[k], b[k]) for k in a)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_payload(x, y) for x, y in zip(a, b))
+    return type(a) is type(b) and a == b
 
 
 def make_segmented_extra_conds(
@@ -247,13 +201,21 @@ def make_segmented_extra_conds(
 
         device = kwargs["device"]
         dtype = base_model.get_dtype_inference()
-        processed = []
-        for segment in segments:
-            segment = segment.to(device=device, dtype=dtype)
-            processed.append(diffusion.preprocess_text_embeds(segment))
+        # Native extra_conds already refined the primary, at its real length.
+        processed = [out["c_crossattn"].cond]
+        processed.extend(diffusion.preprocess_text_embeds(segment.to(device=device, dtype=dtype))
+                         for segment in segments[1:])
 
         payload = dict(payload_cond.cond)
         payload["h3forge_prompt_segments"] = tuple(processed)
+        payload["h3forge_prompt_segment_tags"] = kwargs["h3forge_prompt_segment_tags"]
+        # This full layout is a coordinate template only. Local calls contain
+        # each segment's real tokens, with refs/targets at one common origin.
+        layout = payload.get("layout")
+        if layout is not None and max(c.shape[1] for c in processed) != layout.signature[0]:
+            from comfy.ldm.minimax.model import PackedLayout
+            payload["layout"] = PackedLayout(max(c.shape[1] for c in processed), *layout.signature[1:],
+                                              keyframes=payload.get("keyframes"), refs=payload.get("refs"))
         durations = kwargs.get("h3forge_prompt_segment_durations")
         if durations is not None:
             payload["h3forge_prompt_segment_durations"] = tuple(
@@ -273,7 +235,7 @@ def combine_conditioning_segments(
 
     Each input may already contain native reference-aware Qwen context and DiT
     payload metadata. The first entry supplies the shared payload while every
-    padded context remains available for per-window selection.
+    native-length context remains available for per-window selection.
     """
     encoded = []
     metadata = []
@@ -283,39 +245,39 @@ def combine_conditioning_segments(
         encoded.append(conditioning[0][0])
         metadata.append(conditioning[0][1])
 
-    padded = pad_segment_contexts(encoded)
-    resolved_durations = tuple(
-        _duration_fraction(value) for value in (durations or (Fraction(1),) * len(padded))
-    )
-    if len(resolved_durations) != len(padded):
-        raise ValueError(
-            f"expected one duration per prompt segment ({len(padded)} segments, "
-            f"{len(resolved_durations)} durations)"
-        )
-    tokens = padded[0].shape[1]
-    padded_tags = [pad_text_tags(meta.get("minimax_token_tags"), tokens) for meta in metadata]
-    # The run carries one set of conditioning metadata, so it is only correct
-    # when every segment shares it. Refuse divergent multimodal structure
-    # instead of silently stamping segment 1's tags onto every window.
-    for index, tags in enumerate(padded_tags[1:], start=2):
-        if not torch.equal(tags, padded_tags[0]):
-            raise ValueError(
-                f"pipe prompt segments 1 and {index} produce different MiniMax token tags; "
-                "multimodal inserts and presentation tags must be identical across segments"
-            )
+    if not encoded:
+        raise ValueError("at least one prompt segment is required")
+    for context in encoded:
+        if context.ndim != 3 or context.shape[0] != 1 or context.shape[1] < 1:
+            raise ValueError(f"expected segment context [1,T,C], got {tuple(context.shape)}")
+        if context.shape[-1] != encoded[0].shape[-1]:
+            raise ValueError("all segment contexts must have the same channel width")
+    resolved_durations = tuple(_duration_fraction(v) for v in (durations or (1,) * len(encoded)))
+    if len(resolved_durations) != len(encoded):
+        raise ValueError(f"expected one duration per prompt segment ({len(encoded)} segments)")
+    tags = [meta.get("minimax_token_tags", torch.ones(c.shape[1], dtype=torch.long)).reshape(-1)
+            for c, meta in zip(encoded, metadata)]
+    for context, tag in zip(encoded, tags):
+        if tag.numel() != context.shape[1]:
+            raise ValueError("MiniMax token tags must match the real encoded context length")
     for index, meta in enumerate(metadata[1:], start=2):
-        if set(meta.keys()) != set(metadata[0].keys()):
-            raise ValueError(
-                f"pipe prompt segments 1 and {index} produce different conditioning metadata keys; "
-                "segments must use the same conditioning structure"
-            )
+        if set(meta) != set(metadata[0]):
+            raise ValueError(f"pipe prompt segments 1 and {index} produce different conditioning metadata keys")
+        for key in ("minimax_refs", "minimax_keyframes", "minimax_visual_cond_noise_aug", "minimax_audio_cond_noise_aug"):
+            if not _same_payload(metadata[0].get(key), meta.get(key)):
+                raise ValueError(f"pipe prompt segments 1 and {index} have different shared {key} payloads")
+        # Text lengths may differ; the shared vision presentation may not.
+        for value in (0, 2):
+            if not torch.equal(torch.where(tags[0] == value)[0], torch.where(tags[index - 1] == value)[0]):
+                raise ValueError(f"pipe prompt segments 1 and {index} produce different MiniMax token tags")
 
     primary_meta = metadata[0].copy()
-    primary_meta["minimax_token_tags"] = padded_tags[0]
-    primary_meta["h3forge_prompt_segments"] = tuple(padded)
-    primary_meta["h3forge_prompt_segment_count"] = len(padded)
+    primary_meta["minimax_token_tags"] = tags[0]
+    primary_meta["h3forge_prompt_segments"] = tuple(encoded)
+    primary_meta["h3forge_prompt_segment_tags"] = tuple(tags)
+    primary_meta["h3forge_prompt_segment_count"] = len(encoded)
     primary_meta["h3forge_prompt_segment_durations"] = resolved_durations
-    return [[padded[0], primary_meta]]
+    return [[encoded[0], primary_meta]]
 
 
 def encode_pipe_prompt(

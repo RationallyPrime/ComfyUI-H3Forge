@@ -36,9 +36,11 @@ class RuntimeState:
     default_policy: AttentionPolicy | None = None
     layout: Any = None
     block_index: int | None = None
+    block_args: Any = None
     step_index: int | None = None
     total_steps: int | None = None
     current_sigma: float | None = None
+    in_run: bool = False
     nag: Any = None
     nag_runtime: Any = None
     diffusion: Any = None
@@ -58,8 +60,10 @@ class RuntimeState:
         self.declines[reason] = self.declines.get(reason, 0) + 1
 
     def begin_run(self) -> None:
+        self.in_run = True
         self.layout = None
         self.block_index = None
+        self.block_args = None
         self.step_index = None
         self.total_steps = None
         self.current_sigma = None

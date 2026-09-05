@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-h3forge"
-version = "0.2.0"
+version = "0.3.0"
 description = "H3-native sparse attention, FETA-style enrichment, and synchronized A/V context windows for ComfyUI MiniMax-H3"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}

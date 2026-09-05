@@ -98,6 +98,7 @@ def install(monkeypatch):
     """Register the fake module tree in sys.modules for one test."""
     model_module = types.ModuleType("comfy.ldm.minimax.model")
     model_module.PackedLayout = PackedLayout
+    model_module.FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
     model_module._video_t_spans = _video_t_spans
 
     minimax_module = types.ModuleType("comfy.ldm.minimax")

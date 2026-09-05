@@ -141,14 +141,14 @@ def test_unequal_pipe_encodings_keep_one_global_prefix_origin(monkeypatch):
     primary, metadata = combined[0]
     refs = [{"kind": "audio", "ref_audio_t": 40}]
     keyframes = keyframe_descriptors(2)
-    full = PackedLayout(primary.shape[1], 20, 4, 4, 114, refs=refs, keyframes=keyframes)
+    full = PackedLayout(12, 20, 4, 4, 114, refs=refs, keyframes=keyframes)
     src = target_segments(full)
     for start, context in zip((0, 10), metadata["h3forge_prompt_segments"]):
-        assert context.shape[1] == primary.shape[1] == 12
+        assert context.shape[1] in (7, 12)
         ar = audio_range_for_video_window(full, start, start + 10)
         local = clone_window_layout(full_layout=full, text_len=context.shape[1],
                                     video_shape=(10, 4, 4), audio_t=114,
                                     video_range=(start, start + 10), audio_range=ar,
                                     refs=refs, keyframes=keyframes)
         dst = target_segments(local)
-        assert torch.equal(local.position_ids[:dst.audio_start], full.position_ids[:src.audio_start])
+        assert torch.equal(local.position_ids[context.shape[1]:dst.audio_start], full.position_ids[12:src.audio_start])
