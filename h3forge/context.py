@@ -45,7 +45,51 @@ def stagger_phase(step: int, window: int, overlap: int) -> int:
     return int(ordered_halving(step) * (max_stagger_phase(window, overlap) + 1))
 
 
-def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list[int]:
+def _shifted_starts(anchor: list[int], phase: int, stride: int, *, snap: bool) -> list[int]:
+    """Greedy plan ``anchor`` shifted by ``phase``, keeping anchors, count and overlap.
+
+    Every adjacent pair keeps at least ``overlap`` latents in common: the next
+    start is never more than one stride away from the last one, and never so
+    far back that the remaining windows could not reach the final anchor within
+    a stride each. Because ``anchor`` itself satisfies those bounds, every
+    interior start lands in ``[anchor[i], anchor[i] + phase]``: a phase never
+    moves a seam further than itself, and a feasible ``anchor`` is a fixed point
+    at phase 0. With ``snap`` each interior start moves to the nearest cadence
+    point inside its feasible interval when one exists.
+    """
+    final_start = anchor[-1]
+    count = len(anchor)
+    starts = [0]
+    for i in range(1, count - 1):
+        remaining = count - 1 - i
+        lower = max(starts[-1] + 1, final_start - remaining * stride)
+        upper = min(starts[-1] + stride, final_start - remaining)
+        candidate = min(max(anchor[i] + phase, lower), upper)
+        if snap:
+            first = ((lower + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
+            last = (upper // _LATENT_CADENCE) * _LATENT_CADENCE
+            if first <= last:
+                candidate = min(max(round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE, first), last)
+        starts.append(candidate)
+    starts.append(final_start)
+    return starts
+
+
+def _stagger_layouts(anchor: list[int], stride: int, max_phase: int) -> int:
+    """Number of distinct plans the phases ``0..max_phase`` reach from ``anchor``."""
+    return len({tuple(_shifted_starts(anchor, phase, stride, snap=False)) for phase in range(max_phase + 1)})
+
+
+def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_phase: int = 0) -> list[int]:
+    """Window starts for ``phase`` of a run whose stagger visits phases ``0..max_phase``.
+
+    The phase-0 plan snaps interior starts to the latent cadence unless that
+    would leave the stagger fewer distinct layouts than the even spread does;
+    a static run (``max_phase == 0``) therefore always snaps, and a staggering
+    run keeps its off-cadence spread only where cadence and seam movement
+    collide. Every active phase is then derived from that same phase-0 plan,
+    so no seam ever moves further than the phase.
+    """
     if window >= total:
         return [0]
     if window < 2:
@@ -56,6 +100,8 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
 
     if not isinstance(phase, int) or not 0 <= phase < stride:
         raise ValueError(f"phase must be an integer in [0, {stride})")
+    if not isinstance(max_phase, int) or not 0 <= max_phase < stride:
+        raise ValueError(f"max_phase must be an integer in [0, {stride})")
 
     final_start = total - window
     count = 1 + (final_start + stride - 1) // stride
@@ -63,26 +109,12 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0) -> list
     if count <= 2:
         return base
 
-    starts = [0]
-    for i in range(1, count - 1):
-        remaining = count - 1 - i
-        # Every adjacent pair keeps at least ``overlap`` latents in common:
-        # the next start is never more than one stride away from the last one,
-        # and never so far back that the remaining windows could not reach the
-        # final anchor within a stride each.
-        lower = max(starts[-1] + 1, final_start - remaining * stride)
-        upper = min(starts[-1] + stride, final_start - remaining)
-        candidate = min(max(base[i] + phase, lower), upper)
-        # Align static plans. Active stagger phases retain their original
-        # geometry: snapping those too can collapse every phase onto the only
-        # feasible cadence plan, silently disabling seam movement.
-        first = ((lower + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
-        last = (upper // _LATENT_CADENCE) * _LATENT_CADENCE
-        if phase == 0 and first <= last:
-            candidate = min(max(round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE, first), last)
-        starts.append(candidate)
-    starts.append(final_start)
-    return starts
+    spread = _shifted_starts(base, 0, stride, snap=False)
+    snapped = _shifted_starts(base, 0, stride, snap=True)
+    anchor = snapped
+    if _stagger_layouts(snapped, stride, max_phase) < _stagger_layouts(spread, stride, max_phase):
+        anchor = spread
+    return _shifted_starts(anchor, phase, stride, snap=False)
 
 
 def blend_weights(length: int, overlap: int, *, device, dtype, mode="pyramid",
@@ -258,9 +290,12 @@ def make_context_wrapper(policy: ContextPolicy):
                     flush=True,
                 )
             phase = 0
-            if stagger and step is not None:
-                phase = stagger_phase(step, policy.window_frames, policy.overlap_frames)
-            starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase)
+            max_phase = 0
+            if stagger:
+                max_phase = max_stagger_phase(policy.window_frames, policy.overlap_frames)
+                if step is not None:
+                    phase = stagger_phase(step, policy.window_frames, policy.overlap_frames)
+            starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase, max_phase)
             segment_indices: list[int] = []
             if prompt_segments:
                 segment_indices = [
@@ -303,8 +338,7 @@ def make_context_wrapper(policy: ContextPolicy):
                         stagger=stagger,
                         prompt_count=len(prompt_segments) if prompt_segments else 0,
                         prompt_durations=prompt_durations,
-                        max_phase=max_stagger_phase(policy.window_frames, policy.overlap_frames)
-                        if stagger else 0,
+                        max_phase=max_phase,
                     ),
                     flush=True,
                 )
