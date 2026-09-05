@@ -25,6 +25,7 @@
 ./tests/test_layout_windows.py
 ./tests/test_nag.py
 ./tests/test_nodes.py
+./tests/test_merge_announcement.py
 ./tests/test_state.py
 ./docs/audit-repair-workflows/early_dense_context.json
 ./docs/audit-repair-workflows/long_dialogue.json

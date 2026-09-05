@@ -24,7 +24,7 @@ quality are separate results.
 | F12 — reference modalities absent | Expose nine image, three video, three paired soundtrack and three standalone audio inputs. Require only the VAEs needed by the supplied media. Allow one segment and remove the arbitrary eight-segment ceiling. | Input contract and native reference preparation checks; loaded-model reference receipt below. |
 | F13 — repeated shared preparation | Call native reference preparation once, reuse its prepared tokenizer presentation and shared latent payload, encode texts independently, and retain core's already-refined primary text. | One native preparation call for multiple independent prompts; actual loaded-model reference path. |
 | F14 — doubles hide core behavior | Pin and load the small real core definitions under test. CI always supplies that checkout. | Native patcher, wrapper, layout and DiT contracts supplement the math tests; real H3 renders exercise the GPU boundary. |
-| F15 — recurring review rounds | Remove the scheduled review router and its repeated-review instructions. Preserve CI and the existing merge-announcement action. | Workflow source now follows one review round, its fixes, green CI, then merge. |
+| F15 — recurring review rounds | Remove the scheduled review router and its repeated-review instructions. Preserve CI and a standalone merge announcement, including repository author aliases. | The live repeated-review workflow is disabled. The standalone announcement CLI is tested without the deleted router. |
 
 Native prompt lengths also require distinct sparse kernel shapes. A sampling run
 retains its working kernels and masks across steps, then trims the caches to eight
@@ -35,10 +35,12 @@ backend caches.
 
 ## Validation
 
-Local contract and math suite: **128 passed** on Torch 2.8.0, with the pinned core
+Local contract and math suite: **133 passed** on Torch 2.8.0, with the pinned core
 checkout supplied through `H3FORGE_COMFY_SOURCE`. Ruff and `git diff --check` pass.
 Core-dependent tests explicitly skip when the checkout is absent; CI does not
-permit that omission.
+permit that omission. The one review round found the announcement's deleted-module
+dependency. Its repair removes the unused cross-repository digest and tests the
+actual `announce` CLI; a read-only dry run against merged PR #15 also completed.
 
 GPU validation uses a separate checkout on an RTX PRO 6000 Blackwell, Torch
 2.13.0+cu130, the pinned core above, the pruned INT8 ConvRot H3 FL2VA checkpoint,
