@@ -67,6 +67,8 @@ For every denoising step it:
 6. fuses video and audio predictions into their full latent canvases with a full-window pyramid by default;
 7. optionally shifts interior boundaries with ComfyUI's ordered-halving phase sequence, bounded to the requested overlap so adjacent windows always keep it; a segmented pipe prompt pins the boundaries at phase 0 instead, because a moving seam there would change which latents mix two prompts from step to step.
 
+The phase-0 plan snaps interior starts to H3's five-latent cadence wherever the fixed anchors, minimum overlap and unchanged window count permit it, unless that would leave the stagger fewer distinct layouts than the even spread has: a static run always snaps, and a staggering run keeps its off-cadence spread only where cadence and seam movement collide (80/10 at 427 latents has three latents of slack, so its only aligned plan is the wall every phase clamps onto). Every active phase is derived from that same phase-0 plan, so no seam moves further than the phase. The exact tail may be off cadence; tight strides can also make interior snapping impossible (for example 25/8 at 427 latents). The context-plan receipt reports `cadence=5` and `off_cadence_starts`. Global target position IDs are still transplanted exactly, including at unsnapped starts; cadence alignment alone is not evidence of better dialogue.
+
 That absolute-position transplant is important: a context window beginning at latent frame 26 must not pretend it begins at H3 frame zero and restart the `1,4,4,4,4` RoPE cadence.
 
 ### H3 Forge — Pipe Timeline Prompt

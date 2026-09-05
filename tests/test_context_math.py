@@ -66,6 +66,86 @@ def test_window_at_least_total_uses_one_start():
     assert window_starts(24, 25, 8, 0) == [0]
 
 
+@pytest.mark.parametrize("window,overlap", [(80, 10), (80, 11), (107, 6)])
+def test_shipped_context_policies_snap_interiors_but_preserve_the_tail(window, overlap):
+    starts = window_starts(427, window, overlap, 0)
+    assert all(start % 5 == 0 for start in starts[:-1])
+    # The tail is exempt: moving it would lose coverage or change length.
+    assert starts[-1] == 427 - window
+    receipt = context_plan_summary(427, starts, window, overlap, phase=0)
+    assert "cadence=5" in receipt
+    assert f"off_cadence_starts={int((427 - window) % 5 != 0)}" in receipt
+
+
+def _stagger_plans(total, window, overlap):
+    max_phase = max_stagger_phase(window, overlap)
+    return [window_starts(total, window, overlap, phase, max_phase) for phase in range(max_phase + 1)]
+
+
+@pytest.mark.parametrize("window,overlap", [(80, 10), (80, 11), (107, 6), (25, 8)])
+def test_cadence_alignment_does_not_disable_staggering(window, overlap):
+    plans = _stagger_plans(427, window, overlap)
+    assert len({tuple(starts) for starts in plans}) > 1
+    schedule = {tuple(window_starts(427, window, overlap, stagger_phase(step, window, overlap),
+                                    max_stagger_phase(window, overlap))) for step in range(32)}
+    assert len(schedule) > 1
+    for starts in plans:
+        count = sum(start % 5 != 0 for start in starts)
+        receipt = context_plan_summary(427, starts, window, overlap, phase=1)
+        assert f"off_cadence_starts={count}" in receipt
+
+
+def test_rigid_stagger_keeps_the_off_cadence_spread_instead_of_collapsing():
+    # 80/10 at 427 latents has three latents of slack across five seams: the
+    # only fully aligned plan is the upper feasible wall, and every active phase
+    # shifted from it clamps back onto it. A static run takes the aligned plan;
+    # a staggering run keeps the even spread and its three distinct layouts.
+    assert window_starts(427, 80, 10, 0) == [0, 70, 140, 210, 280, 347]
+    assert window_starts(427, 80, 10, 0, max_stagger_phase(80, 10)) == [0, 69, 139, 208, 278, 347]
+    plans = {tuple(starts) for starts in _stagger_plans(427, 80, 10)}
+    assert plans == {
+        (0, 69, 139, 208, 278, 347),
+        (0, 70, 140, 209, 279, 347),
+        (0, 70, 140, 210, 280, 347),
+    }
+    # 80/11 has room for both: the aligned phase-0 plan survives and every
+    # phase still reaches its own layout.
+    assert window_starts(427, 80, 11, 0, max_stagger_phase(80, 11)) == [0, 60, 115, 175, 230, 290, 347]
+    assert len({tuple(starts) for starts in _stagger_plans(427, 80, 11)}) == 12
+
+
+@pytest.mark.parametrize("total,window,overlap", [(427, 80, 10), (427, 80, 11), (427, 107, 6), (427, 25, 8), (427, 112, 6)])
+def test_no_seam_moves_further_than_its_phase_from_the_phase_zero_plan(total, window, overlap):
+    max_phase = max_stagger_phase(window, overlap)
+    nominal = window_starts(total, window, overlap, 0, max_phase)
+    for phase in range(max_phase + 1):
+        starts = window_starts(total, window, overlap, phase, max_phase)
+        moved = [after - before for before, after in zip(nominal, starts)]
+        assert all(0 <= delta <= phase for delta in moved), (phase, nominal, starts)
+
+
+@pytest.mark.parametrize("max_phase", [-1, 101, 1.5])
+def test_max_phase_must_be_an_integer_inside_the_stride(max_phase):
+    with pytest.raises(ValueError, match="max_phase must be an integer"):
+        window_starts(427, 107, 6, 0, max_phase)
+
+
+def test_tight_stride_keeps_unsnappable_starts_and_reports_them():
+    starts = window_starts(13, 4, 1)
+    assert starts == [0, 3, 6, 9]
+    assert "off_cadence_starts=3" in context_plan_summary(13, starts, 4, 1, phase=0)
+
+    # For 25/8, 24 gaps must cover 402 latents. All interior starts on the
+    # cadence would allow gaps of at most 15, which cannot reach the tail.
+    # Adding windows would change the prompt-segment contract, so some
+    # interior starts must remain off cadence as well as the exact tail.
+    starts = window_starts(427, 25, 8)
+    assert len(starts) == 25
+    assert any(start % 5 for start in starts[1:-1])
+    count = sum(start % 5 != 0 for start in starts)
+    assert f"off_cadence_starts={count}" in context_plan_summary(427, starts, 25, 8, phase=0)
+
+
 def test_pyramid_blend_uses_the_whole_window_for_odd_and_even_lengths():
     odd = blend_weights(7, 2, device="cpu", dtype=torch.float32, mode="pyramid")
     even = blend_weights(6, 2, device="cpu", dtype=torch.float32, mode="pyramid")
@@ -142,9 +222,9 @@ def test_context_wrapper_pins_stagger_off_under_a_segmented_prompt(monkeypatch, 
     seen_phases = []
     real_starts = window_starts
 
-    def recording_starts(total, window, overlap, phase=0):
+    def recording_starts(total, window, overlap, phase=0, max_phase=0):
         seen_phases.append(phase)
-        return real_starts(total, window, overlap, phase)
+        return real_starts(total, window, overlap, phase, max_phase)
 
     monkeypatch.setattr(context_module, "window_starts", recording_starts)
 
