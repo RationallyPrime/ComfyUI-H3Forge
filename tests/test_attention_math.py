@@ -161,6 +161,22 @@ def test_bridge_stride_zero_disables_bridges(monkeypatch):
     assert not allow(video_row(5, 3), video_row(3, 0))
 
 
+@pytest.mark.parametrize("bridge_stride", [0, 5])
+def test_audio_self_attention_keeps_the_whole_stereo_utterance(monkeypatch, bridge_stride):
+    policy = AttentionPolicy(temporal_window=2.0, spatial_radius=0.25, bridge_stride=bridge_stride,
+                             first_dense_layers=0, first_dense_fraction=0.0)
+    allow = _bridge_mask_mod(monkeypatch, policy)
+    # Far-apart, non-bridge times in both channel-major stereo streams must
+    # remain mutually visible, including the last audio token in the sequence.
+    for query in (audio_row(1), audio_row(29), audio_row(1) + 30, audio_row(29) + 30):
+        for key in (audio_row(1), audio_row(29), audio_row(1) + 30, audio_row(29) + 30):
+            assert allow(query, key)
+    # Exempting audio pairs must leave cross-modal and video sparsity intact.
+    assert not allow(video_row(5, 0), audio_row(7))
+    assert not allow(audio_row(7), video_row(5, 0))
+    assert not allow(video_row(5, 0), video_row(2, 0))
+
+
 def _fake_runner_factory(monkeypatch, compile_calls, marker):
     import h3forge.attention as attention
     import torch.nn.attention.flex_attention as flex_module
