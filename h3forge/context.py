@@ -317,7 +317,7 @@ def make_context_wrapper(policy: ContextPolicy):
                         print(message, flush=True)
             raw_audio_ranges = [audio_range_for_video_window(full_layout, v0, min(v0 + policy.window_frames, total_t))
                                 for v0 in starts]
-            # H3's cadence can make otherwise equal video windows carry 141--143
+            # H3's 40 Hz grid makes 80-video-latent windows carry about 454--455
             # audio latents. Expand all of them to the longest interval so the
             # compiled attention shape stays constant within the forward.
             target_audio_t = max(a1 - a0 for a0, a1 in raw_audio_ranges)
