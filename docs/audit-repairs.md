@@ -35,7 +35,7 @@ backend caches.
 
 ## Validation
 
-Local contract and math suite: **129 passed** on Torch 2.8.0, with the pinned core
+Local contract and math suite: **128 passed** on Torch 2.8.0, with the pinned core
 checkout supplied through `H3FORGE_COMFY_SOURCE`. Ruff and `git diff --check` pass.
 Core-dependent tests explicitly skip when the checkout is absent; CI does not
 permit that omission.
@@ -45,6 +45,13 @@ GPU validation uses a separate checkout on an RTX PRO 6000 Blackwell, Torch
 Qwen3-VL 32B NVFP4 text encoder, and native H3 video/audio VAEs. The controlled
 dialogue comparisons use seed 12345, 20 `res_multistep` steps, 672×384, 24 fps,
 and no LoRA. The original runtime checkout is preserved.
+
+The pinned core's model allocation recorder produced fatal `cudaFreeAsync`
+errors in normal asynchronous NAG/sparse execution. Synchronous debugging
+completed, but a local pause/resume experiment also failed and was removed.
+The supported launch uses `--disable-comfy-compiler`; Forge fails with that
+instruction if the recorder is active. Its own sparse kernels remain compiled.
+Success under synchronous debugging is not counted as asynchronous acceptance.
 
 | Case | Result |
 | --- | --- |

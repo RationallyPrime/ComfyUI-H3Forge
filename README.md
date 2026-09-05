@@ -134,6 +134,8 @@ The node composes with `H3 Forge — Sliding Attention + FETA` in either wiring 
 
 Core-contract CI is pinned to ComfyUI `250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a`. Use a build containing the native H3 `rope_rotation_table` and Fun ControlNet wrapper contracts. GPU validation uses PyTorch `2.13.0+cu130`; CPU CI exercises the public Torch 2.8 API surface separately.
 
+With this core, launch ComfyUI with **`--disable-comfy-compiler`**. Its model allocation recorder caused fatal asynchronous CUDA allocator errors during the loaded-model NAG/sparse checks. Forge rejects an active recorder with a launch instruction before its custom forward; it does not change ComfyUI's global settings. This option leaves Forge's own compiled sparse FlexAttention enabled.
+
 ## Install
 
 Extract or clone into ComfyUI's custom nodes directory:

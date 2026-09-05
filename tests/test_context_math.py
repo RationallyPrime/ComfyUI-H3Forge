@@ -346,6 +346,8 @@ def test_context_plan_reports_work_and_prompt_assignment():
 
 def test_single_window_path_emits_step_zero_context_plan(capsys):
     class Executor:
+        class_obj = object()
+
         def __call__(self, x, timestep, context, transformer_options, **kwargs):
             return x
 

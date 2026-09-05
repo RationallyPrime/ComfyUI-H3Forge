@@ -16,7 +16,7 @@ from .prompt import (
     parse_segment_durations,
     split_pipe_prompt,
 )
-from .state import AttentionPolicy, RuntimeState, resolve_sigma, resolve_step
+from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
 
 ATTN_KEY = "h3forge_attention"
 CTX_KEY = "h3forge_context"
@@ -242,6 +242,7 @@ def _run_wrapper(state):
 
 def _forward_wrapper(state, configured_options=None):
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
+        require_eager_allocations(state.diffusion)
         # Resolve configuration from the model clone whose wrapper ComfyUI
         # preserved. Fall back to runtime options for direct/unit-test callers.
         # A sibling branch therefore cannot inherit whatever another branch

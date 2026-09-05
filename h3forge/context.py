@@ -8,7 +8,7 @@ import torch
 from .control import control_window
 from .layout import audio_range_for_video_window, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import resolve_step
+from .state import require_eager_allocations, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -243,6 +243,7 @@ def _segment_windows(total, window, overlap, ranges):
 def make_context_wrapper(policy: ContextPolicy):
     """Window video while every forward sees the complete shared audio timeline."""
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
+        require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
         total_t, audio_t = int(video_x.shape[2]), int(audio_x.shape[-1])
         payload = kwargs.get("minimax_payload") or {}

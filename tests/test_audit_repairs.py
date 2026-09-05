@@ -8,8 +8,14 @@ from core_source import definitions, native_h3
 from h3forge.attention import make_attention_override
 from h3forge.context import ContextPolicy, make_context_wrapper
 from h3forge.prompt import combine_conditioning_segments, segment_ranges
-from h3forge.state import AttentionPolicy, RuntimeState
+from h3forge.state import AttentionPolicy, RuntimeState, require_eager_allocations
 from test_nodes import FakePatcher, _import_nodes
+
+
+def test_native_allocation_recorder_is_rejected_before_forward():
+    require_eager_allocations(SimpleNamespace())
+    with pytest.raises(RuntimeError, match="--disable-comfy-compiler"):
+        require_eager_allocations(SimpleNamespace(_comfy_malloc_graph=object()))
 
 
 @pytest.mark.parametrize("order", [("attention", "nag"), ("nag", "attention")])

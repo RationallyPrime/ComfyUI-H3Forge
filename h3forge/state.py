@@ -5,6 +5,20 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+def require_eager_allocations(diffusion):
+    """Reject the native allocation recorder before custom window/guidance work.
+
+    With the pinned core, asynchronous allocator capture and Forge's persistent
+    sparse/guidance buffers can abort the process in cudaFreeAsync. A Python
+    exception cannot recover that crash. Use core's explicit compiler opt-out.
+    """
+    if getattr(diffusion, "_comfy_malloc_graph", None) is not None:
+        raise RuntimeError(
+            "[H3Forge] ComfyUI's model allocation compiler is incompatible with Forge. "
+            "Restart ComfyUI with --disable-comfy-compiler. Sparse FlexAttention compilation remains enabled."
+        )
+
+
 @dataclass
 class AttentionPolicy:
     mode: str = "flex_sliding"

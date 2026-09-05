@@ -316,33 +316,6 @@ def test_active_prompt_shapes_survive_steps_then_release_at_run_end(monkeypatch)
     assert len(attention._RELEASED_KERNELS) == 1
 
 
-@pytest.mark.parametrize("fail", [False, True])
-def test_flex_persistent_allocations_escape_native_model_graph(monkeypatch, fail):
-    from types import SimpleNamespace
-
-    _fake_runner_factory(monkeypatch, [], object())
-    events = []
-    graph = SimpleNamespace(pause=lambda: events.append("pause"), resume=lambda: events.append("resume"))
-    state = _runner_state()
-    state.diffusion = SimpleNamespace(_comfy_malloc_graph=graph)
-
-    def compile_kernel(fn, **kwargs):
-        assert events == ["pause"]
-        events.append("compile")
-        if fail:
-            raise RuntimeError("compilation failed")
-        return fn
-
-    monkeypatch.setattr(torch, "compile", compile_kernel)
-    q = torch.ones(1, 2, 3, 4)
-    if fail:
-        with pytest.raises(RuntimeError, match="compilation failed"):
-            _run_flex(state, q, q, q)
-    else:
-        assert torch.equal(_run_flex(state, q, q, q), q * 3)
-    assert events == ["pause", "compile", "resume"]
-
-
 def _feta_state():
     policy = AttentionPolicy(feta_enabled=True, feta_first_layer=0, feta_last_layer=49)
     state = RuntimeState(policy)
