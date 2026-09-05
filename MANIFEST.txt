@@ -6,6 +6,7 @@
 ./VERSION
 ./__init__.py
 ./docs/audit-repairs.md
+./docs/audit-repairs-validation.json
 ./h3forge/__init__.py
 ./h3forge/attention.py
 ./h3forge/context.py
@@ -25,3 +26,10 @@
 ./tests/test_nag.py
 ./tests/test_nodes.py
 ./tests/test_state.py
+./docs/audit-repair-workflows/early_dense_context.json
+./docs/audit-repair-workflows/long_dialogue.json
+./docs/audit-repair-workflows/nag_lite_final.json
+./docs/audit-repair-workflows/nag_shared_final.json
+./docs/audit-repair-workflows/reference_spoken_voice.json
+./docs/audit-repair-workflows/seam_continuous.json
+./docs/audit-repair-workflows/unequal_beats.json

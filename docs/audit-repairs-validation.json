@@ -1,0 +1,697 @@
+{
+  "comfyui_commit": "250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a",
+  "candidate": {
+    "archive": "candidate-v4-source.tgz",
+    "sha256": "e634f85bb8ad998a18884a702528f767903bd63093157788d95490380812c355",
+    "git_head": "3958401078c761c95af99cc8257292972abfc932",
+    "files": {
+      "h3forge/attention.py": "84bec7fb3039a8d00f7edabf6d17c9cea48f7ed0b278379bb0fb84be4864365f",
+      "h3forge/nag.py": "73886683e10ffa242a53bf51d688cf19b537c5efada4168bfbd9c62c583f5bea",
+      "h3forge/layout.py": "afa36dcabd88338df57978f1f3e5953ca2e2577188dea3f37d93e878771b0c7e",
+      "h3forge/control.py": "afdc8f6ac237ec6c6c8aef49f2c7b946b17f0630d3c56cdcda1917ebda983aa7",
+      "h3forge/__init__.py": "e82254de19f7695d06a0d474241ee5b86539bab5bb5c6f89bbbeaaebf31a91f3",
+      "h3forge/context.py": "71c77efec47bc291d145472f99d2e4ad77896339adffb65d93cf403d3417e60b",
+      "h3forge/prompt.py": "f2cba3113f4ed044b7b47075bfcd23899aa8778e34c1205d82e4c4c5ade0a4da",
+      "h3forge/nodes.py": "8c40e48c558182f4d8c0be396adc7f612f5f8858dd1aa8fbed142f6f7298a152",
+      "h3forge/state.py": "b1918e0089f35003b63f026eaf28e71a86cecb64201666141b4d777fdf5c3ee0",
+      "__init__.py": "f44519c116c97dbc10f80e1f5fc0999675d554353276b29ae29eebf82160f807",
+      "VERSION": "d7032b5d31fa5e3c8f241a186aef73878064a5e35ba6c9e7b73cbd456274e6a6",
+      "pyproject.toml": "5908818d5c3ac742c51447a3215cbac82c6f9e9fde37e5744ddf214f02d40ea7"
+    }
+  },
+  "runtime": {
+    "os": "linux",
+    "ram_total": 187999997952,
+    "ram_free": 138244993024,
+    "comfyui_version": "0.34.0",
+    "required_frontend_version": "1.51.9",
+    "installed_templates_version": "0.11.55",
+    "required_templates_version": "0.11.55",
+    "comfy_package_versions": [
+      {
+        "name": "comfyui-frontend-package",
+        "installed": "1.51.9",
+        "required": "1.51.9"
+      },
+      {
+        "name": "comfyui-workflow-templates",
+        "installed": "0.11.55",
+        "required": "0.11.55"
+      },
+      {
+        "name": "comfyui-embedded-docs",
+        "installed": "0.5.10",
+        "required": "0.5.10"
+      },
+      {
+        "name": "comfy-kitchen",
+        "installed": "0.2.31",
+        "required": "0.2.31"
+      },
+      {
+        "name": "comfy-aimdo",
+        "installed": "0.5.2",
+        "required": "0.5.2"
+      }
+    ],
+    "python_version": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+    "pytorch_version": "2.13.0+cu130",
+    "embedded_python": false,
+    "deploy_environment": "local-git",
+    "argv": [
+      "main.py",
+      "--listen",
+      "0.0.0.0",
+      "--port",
+      "8188",
+      "--use-pytorch-cross-attention",
+      "--disable-auto-launch",
+      "--disable-comfy-compiler"
+    ]
+  },
+  "initial_source_sha256": "d5beee93093e26fde9fc05378c1b7f017af887ed577814206f4b012aa1cb17fe",
+  "asr": "faster-whisper base.en, CPU int8, beam_size=5, no VAD, condition_on_previous_text=False; word timestamps where present",
+  "results": [
+    {
+      "case": "early_native",
+      "prompt_id": "cfde0a7b-b81d-49df-b611-d8fbac87c6d7",
+      "file": "early_native_00001_.mp4",
+      "sha256": "cbd12812a156f7db76ee745a87d8baa4ba0e6e75095c7889f0e07cc4dfccf2da",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 56.982,
+      "source": "initial-candidate-source.tgz",
+      "transcription": {
+        "file": "early_native_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 6.12,
+            "end": 7.74,
+            "text": " This one is finished.",
+            "words": [
+              {
+                "word": " This",
+                "start": 6.12,
+                "end": 6.88,
+                "probability": 0.9040673971176147
+              },
+              {
+                "word": " one",
+                "start": 6.88,
+                "end": 7.08,
+                "probability": 0.9974299073219299
+              },
+              {
+                "word": " is",
+                "start": 7.08,
+                "end": 7.36,
+                "probability": 0.9975773692131042
+              },
+              {
+                "word": " finished.",
+                "start": 7.36,
+                "end": 7.74,
+                "probability": 0.9956172704696655
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "early_sparse_context",
+      "prompt_id": "9d40ec4f-f28b-4ea2-9b35-8da73b33d922",
+      "file": "early_sparse_context_00001_.mp4",
+      "sha256": "a77340b33d702c453899e8165d39ba6c305dcdf5bb1a44716e1c52a0721290aa",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 229.313,
+      "source": "initial-candidate-source.tgz",
+      "transcription": {
+        "file": "early_sparse_context_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 0.0,
+            "end": 7.0,
+            "text": " This one is finished."
+          }
+        ]
+      }
+    },
+    {
+      "case": "early_dense_context",
+      "prompt_id": "0997d6c6-fefa-4367-a995-f3431d9d61ac",
+      "file": "early_dense_context_00001_.mp4",
+      "sha256": "11171872c3b9d37397711b5dc78599c8907982299cd9fee38a1cc6ec8787aa9e",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 59.813,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "early_dense_context_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 5.779999999999999,
+            "end": 8.24,
+            "text": " This one is finished.",
+            "words": [
+              {
+                "word": " This",
+                "start": 5.779999999999999,
+                "end": 6.9,
+                "probability": 0.8292109370231628
+              },
+              {
+                "word": " one",
+                "start": 6.9,
+                "end": 7.2,
+                "probability": 0.9979473948478699
+              },
+              {
+                "word": " is",
+                "start": 7.2,
+                "end": 7.78,
+                "probability": 0.9907750487327576
+              },
+              {
+                "word": " finished.",
+                "start": 7.78,
+                "end": 8.24,
+                "probability": 0.996575653553009
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "nag_lite_final",
+      "prompt_id": "0f90013e-d546-4c3a-992f-c469afa6e7c3",
+      "file": "nag_lite_final_00001_.mp4",
+      "sha256": "f931f8be7ddd9529dfe0a1d1476e39423316e5fef0498e69a55ba4b414fb1440",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 211.347,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "nag_lite_final_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 0.0,
+            "end": 7.0,
+            "text": " This one is finished."
+          }
+        ]
+      }
+    },
+    {
+      "case": "nag_shared_final",
+      "prompt_id": "3db6c3bc-90a9-4349-a9f2-1c022092445d",
+      "file": "nag_shared_final_00001_.mp4",
+      "sha256": "1f1769424f0514c369d2199b7bfc1dc5c5c2972ed7752ea2efb8596c4e2a905a",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 91.474,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "nag_shared_final_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 6.1400000000000015,
+            "end": 7.76,
+            "text": " This one is finished.",
+            "words": [
+              {
+                "word": " This",
+                "start": 6.1400000000000015,
+                "end": 6.94,
+                "probability": 0.8912743330001831
+              },
+              {
+                "word": " one",
+                "start": 6.94,
+                "end": 7.16,
+                "probability": 0.9974327683448792
+              },
+              {
+                "word": " is",
+                "start": 7.16,
+                "end": 7.36,
+                "probability": 0.99435955286026
+              },
+              {
+                "word": " finished.",
+                "start": 7.36,
+                "end": 7.76,
+                "probability": 0.9969760179519653
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "unequal_beats",
+      "prompt_id": "de261eae-5eb4-4f48-968d-3f20b076b6ba",
+      "file": "unequal_beats_00001_.mp4",
+      "sha256": "74151a02bf9c227def9da8efd59f39e8e8fc44179a4e8c970292e1393b71af87",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 113.652,
+      "source": "candidate-v4-source.tgz",
+      "transcription": null
+    },
+    {
+      "case": "seam_continuous",
+      "prompt_id": "a734bf15-7cd1-467e-81ea-a253002d8c1b",
+      "file": "seam_continuous_00001_.mp4",
+      "sha256": "e228ff427591a958db2f50e53c92431e690e379d0bb29bfce5ab0f306293c82c",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "226"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "296"
+          }
+        ],
+        "format": {
+          "duration": "9.417000"
+        }
+      },
+      "server_execution_seconds": 77.458,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "seam_continuous_00001_.mp4",
+        "duration": 9.44,
+        "segments": [
+          {
+            "start": 1.9199999999999995,
+            "end": 6.58,
+            "text": " Keep the blade steady while I turn the handle, then set it down gently on the bench.",
+            "words": [
+              {
+                "word": " Keep",
+                "start": 1.9199999999999995,
+                "end": 2.36,
+                "probability": 0.9334474802017212
+              },
+              {
+                "word": " the",
+                "start": 2.36,
+                "end": 2.52,
+                "probability": 0.9978017210960388
+              },
+              {
+                "word": " blade",
+                "start": 2.52,
+                "end": 2.64,
+                "probability": 0.9956974983215332
+              },
+              {
+                "word": " steady",
+                "start": 2.64,
+                "end": 3.02,
+                "probability": 0.9989834427833557
+              },
+              {
+                "word": " while",
+                "start": 3.02,
+                "end": 3.34,
+                "probability": 0.975064218044281
+              },
+              {
+                "word": " I",
+                "start": 3.34,
+                "end": 3.5,
+                "probability": 0.9743795394897461
+              },
+              {
+                "word": " turn",
+                "start": 3.5,
+                "end": 3.74,
+                "probability": 0.9927487969398499
+              },
+              {
+                "word": " the",
+                "start": 3.74,
+                "end": 3.9,
+                "probability": 0.9955090284347534
+              },
+              {
+                "word": " handle,",
+                "start": 3.9,
+                "end": 4.12,
+                "probability": 0.9994176626205444
+              },
+              {
+                "word": " then",
+                "start": 4.82,
+                "end": 5.02,
+                "probability": 0.9870766997337341
+              },
+              {
+                "word": " set",
+                "start": 5.02,
+                "end": 5.24,
+                "probability": 0.9937891364097595
+              },
+              {
+                "word": " it",
+                "start": 5.24,
+                "end": 5.38,
+                "probability": 0.9945216178894043
+              },
+              {
+                "word": " down",
+                "start": 5.38,
+                "end": 5.56,
+                "probability": 0.9988271594047546
+              },
+              {
+                "word": " gently",
+                "start": 5.56,
+                "end": 5.94,
+                "probability": 0.9939571619033813
+              },
+              {
+                "word": " on",
+                "start": 5.94,
+                "end": 6.12,
+                "probability": 0.9980412721633911
+              },
+              {
+                "word": " the",
+                "start": 6.12,
+                "end": 6.24,
+                "probability": 0.9991315007209778
+              },
+              {
+                "word": " bench.",
+                "start": 6.24,
+                "end": 6.58,
+                "probability": 0.9969565868377686
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "long_dialogue",
+      "prompt_id": "bc6448b0-02f3-455a-bb3c-77776af35b84",
+      "file": "long_dialogue_00001_.mp4",
+      "sha256": "84ad4dc20593d69067630f87298e10ca0fa294ec05c0fe4260706823f4a1ea33",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "481"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "628"
+          }
+        ],
+        "format": {
+          "duration": "20.042000"
+        }
+      },
+      "server_execution_seconds": 168.587,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "long_dialogue_00001_.mp4",
+        "duration": 20.064,
+        "segments": [
+          {
+            "start": 7.280000000000001,
+            "end": 8.7,
+            "text": " This one is finished.",
+            "words": [
+              {
+                "word": " This",
+                "start": 7.280000000000001,
+                "end": 8.0,
+                "probability": 0.8627154231071472
+              },
+              {
+                "word": " one",
+                "start": 8.0,
+                "end": 8.18,
+                "probability": 0.9976587295532227
+              },
+              {
+                "word": " is",
+                "start": 8.18,
+                "end": 8.34,
+                "probability": 0.984749436378479
+              },
+              {
+                "word": " finished.",
+                "start": 8.34,
+                "end": 8.7,
+                "probability": 0.9973216652870178
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "case": "reference_spoken_voice",
+      "prompt_id": "f7d0e8e6-0d44-4701-95ce-4cb2bc7dbd2f",
+      "file": "reference_spoken_voice_00001_.mp4",
+      "sha256": "b04896b410bacea22d16fdede25e777bf5fcd92efd39658110f51d99a73092e2",
+      "media": {
+        "programs": [],
+        "stream_groups": [],
+        "streams": [
+          {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_type": "video",
+            "width": 672,
+            "height": 384,
+            "nb_frames": "124"
+          },
+          {
+            "index": 1,
+            "codec_name": "aac",
+            "codec_type": "audio",
+            "sample_rate": "32000",
+            "nb_frames": "163"
+          }
+        ],
+        "format": {
+          "duration": "5.167000"
+        }
+      },
+      "server_execution_seconds": 50.136,
+      "source": "candidate-v4-source.tgz",
+      "transcription": {
+        "file": "reference_spoken_voice_00001_.mp4",
+        "duration": 5.184,
+        "segments": [
+          {
+            "start": 3.2999999999999994,
+            "end": 4.62,
+            "text": " The edge is ready.",
+            "words": [
+              {
+                "word": " The",
+                "start": 3.2999999999999994,
+                "end": 3.94,
+                "probability": 0.8688674569129944
+              },
+              {
+                "word": " edge",
+                "start": 3.94,
+                "end": 4.16,
+                "probability": 0.9293583631515503
+              },
+              {
+                "word": " is",
+                "start": 4.16,
+                "end": 4.3,
+                "probability": 0.9971457123756409
+              },
+              {
+                "word": " ready.",
+                "start": 4.3,
+                "end": 4.62,
+                "probability": 0.9995250701904297
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "limits": [
+    "ASR and sampled-frame inspection, not human-rated lip-sync or perceptual quality",
+    "No trained Fun ControlNet output comparison",
+    "No claim of improved NAG music suppression",
+    "Initial reference crop and late-onset seam attempt are excluded from acceptance"
+  ],
+  "reference_input_assets": {
+    "reference-workshop.png": "071407ef1254ebd49a0439857a0a89188ec09c9737dfa0e3bc37b4ecf80b9300",
+    "reference-spoken-voice.wav": "e0b6aac3b51ceb5414c7e05c157bf2a1443d0352a3e3fa3334f741ca0415eb90"
+  }
+}

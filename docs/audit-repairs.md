@@ -53,15 +53,43 @@ The supported launch uses `--disable-comfy-compiler`; Forge fails with that
 instruction if the recorder is active. Its own sparse kernels remain compiled.
 Success under synchronous debugging is not counted as asynchronous acceptance.
 
+The final runtime source matches commit `3958401078c761c95af99cc8257292972abfc932`.
+The complete source hashes, prompt IDs, media hashes, frame counts, execution
+receipts and ASR words are in [audit-repairs-validation.json](audit-repairs-validation.json).
+The [API workflows](audit-repair-workflows) retain the seven final-candidate graphs.
+Two initial native/sparse controls predate the allocator guard and compiler-cache
+lifetime changes; their separate source archive hash is recorded explicitly.
+
 | Case | Result |
 | --- | --- |
-| Native baseline, 226 frames | Render completed. `faster-whisper` base.en transcribed “This one is finished.” once. |
-| Strict sparse, two 42/10 video windows, same prompt/seed | Render completed: 1,632 sparse calls, 368 scheduled dense calls. The same line was transcribed once. Each window received all 377 audio ticks. |
-| NAG-Lite followed by Attention, same two-window scene | Render completed with 714 NAG calls and 1,632 sparse calls. |
+| Native baseline, 226 frames / 9.417 s | Completed; “This one is finished.” transcribed once. |
+| Strict sparse, two 42/10 video windows, same prompt/seed | Completed: 1,632 sparse calls, 368 scheduled dense calls. The same line was transcribed once. Each window received all 377 audio ticks. |
+| Dense attention with two context windows | Completed; the same line was transcribed once, giving a context-only control. |
+| NAG-Lite followed by Attention | Completed in normal asynchronous execution: 714 NAG calls and 1,632 sparse calls. The requested line was transcribed once. |
+| Shared-softmax NAG followed by Attention | Completed immediately after NAG-Lite in the same process: 714 NAG calls and 1,632 sparse calls, with separate positive and swapped-text masks. The line was transcribed once. |
+| Three unequal beats, durations 2 / 3 / 4.4 | Completed with three native text lengths and three windows; frame cuts `0,47,120,226`. Sampled frames show chisel inspection, arms folded with the chisel on the bench, and a turn toward the window. |
+| Continuous seam-crossing sentence | Completed; the full sentence was transcribed once from 1.92–6.58 s, spanning the full 3.542–5.875 s overlap region. |
+| 481-frame / 20.042 s continuous take | Completed with two 80/10 windows and all 802 audio ticks visible to both. “This one is finished.” appears once at 7.28–8.70 s; no further speech was recognized through the end. The second video window begins at 8.708 s. |
+| One segment with an image and verified spoken-audio reference | Completed: 124 frames / 5.167 s, two 25/8 windows. Generated the new line “The edge is ready.” once at 3.30–4.62 s. |
 
-The retained local evidence directory contains API graphs, source snapshots,
-execution histories, logs, generated MP4s and transcripts. Additional render
-results and the final candidate identity are recorded before release.
+All nine retained acceptance files contain the expected 672×384 video-frame count
+and a 32 kHz audio stream. ASR uses Faster Whisper `base.en`, CPU int8, beam size
+five, no VAD and no previous-text conditioning. Word timestamps establish that
+the continuous sentence crosses both overlap edges; they do not establish
+perfect lip-sync or a perceptually inaudible join. Contact sheets were inspected;
+these results are not a human listening panel or a motion-quality benchmark.
+
+The first short seam attempt spoke after the overlap and is not counted as a
+crossing result. An initial reference crop preceded the baseline's speech; it
+was replaced with the verified 5.8–8.1 s crop and rerendered. The successful
+reference receipt uses that corrected audio asset, containing “This one is
+finished.”, and the first decoded frame of the native baseline. Reference asset
+hashes are retained with the local evidence. No voice-similarity score or NAG
+music-suppression improvement is claimed.
+
+The local `MiniMax-audit-fixes-evidence` directory retains API graphs, source
+snapshots, histories, logs, all generated MP4s, reference inputs, contact sheets
+and transcripts, including unsuccessful and non-decisive trials.
 
 ## Practical boundaries
 
