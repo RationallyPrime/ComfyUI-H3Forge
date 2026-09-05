@@ -1,7 +1,9 @@
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
+
+from core_source import native_h3
 
 import h3forge.nag as nag
 from fake_minimax import PackedLayout
@@ -36,11 +38,13 @@ def _make_state(**config_overrides):
                   video_strength=1.0, audio_strength=0.5, strict=True)
     config.update(config_overrides)
     state.nag = NAGConfig(**config)
-    state.diffusion = SimpleNamespace()
-    state.blocks = [
-        SimpleNamespace(attn=SimpleNamespace(qkv_proj=_CountingLinear(CHANNELS, 3 * HEADS * HEAD_DIM)))
-        for _ in range(12)
-    ]
+    core = native_h3()
+    state.diffusion = SimpleNamespace(rope=SimpleNamespace(inv_freq=torch.tensor([0.1])), hidden_size=CHANNELS)
+    state.diffusion.preprocess_text_embeds = MethodType(core.MiniMaxH3Model.preprocess_text_embeds, state.diffusion)
+    state.diffusion.rope_freqs = MethodType(core.MiniMaxH3Model.rope_freqs, state.diffusion)
+    state.blocks = [core.DiTBlock(CHANNELS, HEADS, HEAD_DIM, 32, 4, 1e-5, 1e-5,
+                    operations=SimpleNamespace(Linear=_CountingLinear, RMSNorm=torch.nn.RMSNorm)) for _ in range(12)]
+    state.block_args = {"t_emb": torch.ones(1, 4), "mod_segments": [(0, layout.seq_len, 1)]}
     return state
 
 
@@ -145,12 +149,12 @@ def test_delta_is_zero_when_sidecar_equals_positive_text(monkeypatch):
         q, k, v = _qkv(state.layout)
         monkeypatch.setattr(nag, "negative_text_kv",
                             lambda *args, **kwargs: (k[:, :, 0:3], v[:, :, 0:3]))
-        out = torch.zeros(1, HEADS, state.layout.seq_len, HEAD_DIM)
+        out = torch.nn.functional.scaled_dot_product_attention(q, k, v)
         result = apply_nag(state, q, k, v, out, skip_output_reshape=True)
         assert torch.allclose(result, out, atol=1e-5)
 
 
-def test_sidecar_projection_and_refiner_run_once_per_block_per_run():
+def test_sidecar_keys_cache_per_sigma_and_refiner_per_run():
     state = _make_state()
     preprocess_calls = []
 
@@ -158,7 +162,7 @@ def test_sidecar_projection_and_refiner_run_once_per_block_per_run():
         preprocess_calls.append(context.shape)
         return context * 2.0
 
-    state.diffusion = SimpleNamespace(preprocess_text_embeds=preprocess)
+    state.diffusion.preprocess_text_embeds = preprocess
     q, k, v = _qkv(state.layout)
     out = torch.zeros(1, HEADS, state.layout.seq_len, HEAD_DIM)
     apply_nag(state, q, k, v, out, skip_output_reshape=True)
@@ -166,28 +170,47 @@ def test_sidecar_projection_and_refiner_run_once_per_block_per_run():
     assert len(preprocess_calls) == 1
     assert state.blocks[5].attn.qkv_proj.calls == 1
 
+    state.current_sigma = 0.9
+    state.block_args["t_emb"] = torch.full((1, 4), 0.5)
+    apply_nag(state, q, k, v, out, skip_output_reshape=True)
+    assert state.blocks[5].attn.qkv_proj.calls == 2
+    assert len(preprocess_calls) == 1
+
     # A new run clears the sidecar caches.
     state.begin_run()
     assert state.nag_runtime is None
 
 
-def test_missing_qkv_projection_raises_named_error():
+def test_native_attention_shape_mismatch_is_named():
     state = _make_state()
-    state.blocks = [SimpleNamespace() for _ in range(12)]
-    with pytest.raises(RuntimeError, match="qkv projection"):
-        negative_text_kv(state, state.nag, 5, heads=HEADS, head_dim=HEAD_DIM,
+    with pytest.raises(RuntimeError, match="shape differs"):
+        negative_text_kv(state, state.nag, 5, heads=HEADS + 1, head_dim=HEAD_DIM,
                          device="cpu", dtype=torch.float32)
 
 
-def test_qkv_width_mismatch_raises_named_error():
+@torch.no_grad()
+def test_sidecar_matches_native_block_text_keys_with_modulation_and_rope():
+    core = native_h3()
     state = _make_state()
-    state.blocks = [
-        SimpleNamespace(attn=SimpleNamespace(qkv_proj=torch.nn.Linear(CHANNELS, 3 * HEADS * HEAD_DIM + 3)))
-        for _ in range(12)
-    ]
-    with pytest.raises(RuntimeError, match="does not factor"):
-        negative_text_kv(state, state.nag, 5, heads=HEADS, head_dim=HEAD_DIM,
-                         device="cpu", dtype=torch.float32)
+    negative = state.nag.negative_context
+    state.layout = core.PackedLayout(negative.shape[1], 2, 4, 2, 2)
+    block = state.blocks[state.block_index]
+    h = torch.randn(state.layout.seq_len, CHANNELS)
+    h[:negative.shape[1]] = negative[0]
+    rope = core.rope_rotation_table(state.diffusion.rope_freqs(state.layout.position_ids, "cpu"), h.dtype)
+    captured = []
+
+    def capture(func, q, k, v, heads, **kwargs):
+        captured.append((k[:, :, :negative.shape[1]].clone(), v[:, :, :negative.shape[1]].clone()))
+        return q.new_zeros((1, q.shape[2], heads * q.shape[-1]))
+
+    args = state.block_args
+    block(h, args["t_emb"], [(0, h.shape[0], 1)], rope,
+          transformer_options={"optimized_attention_override": capture})
+    actual = negative_text_kv(state, state.nag, state.block_index, heads=HEADS, head_dim=HEAD_DIM,
+                              device="cpu", dtype=torch.float32)
+    for expected, value in zip(captured[0], actual):
+        torch.testing.assert_close(value, expected)
 
 
 def test_nag_config_validation():

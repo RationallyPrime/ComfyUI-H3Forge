@@ -18,8 +18,6 @@ LOG = "[H3Forge]"
 # re-evolved through earlier blocks, and standalone text attention does not
 # share the packed softmax denominator (lite mode) — hence the name NAG-Lite,
 # not "the official NAG implementation for H3".
-_QKV_PATHS = ("attn.qkv_proj", "attn.qkv", "attn.to_qkv", "self_attn.qkv_proj", "attention.qkv_proj")
-_NORM_PATHS = ("attn_norm", "norm1", "norm_attn", "attention_norm", "pre_norm")
 NAG_MODES = ("lite", "faithful_selective")
 
 
@@ -59,6 +57,7 @@ class NAGConfig:
 class NAGRuntime:
     refined: torch.Tensor | None = None
     kv_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    cache_key: tuple | None = None
 
 
 def nag_combine(z_pos: torch.Tensor, z_neg: torch.Tensor, scale: float, tau: float, alpha: float) -> torch.Tensor:
@@ -76,32 +75,6 @@ def nag_combine(z_pos: torch.Tensor, z_neg: torch.Tensor, scale: float, tau: flo
     return (guided * alpha + pos * (1.0 - alpha)).to(dtype)
 
 
-def _resolve_module(root, path: str):
-    node = root
-    for name in path.split("."):
-        node = getattr(node, name, None)
-        if node is None:
-            return None
-    return node
-
-
-def discover_projection(block):
-    """Locate a DiT block's fused qkv projection and (optionally) its pre-attention norm."""
-    qkv = None
-    for path in _QKV_PATHS:
-        candidate = _resolve_module(block, path)
-        if candidate is not None and callable(candidate):
-            qkv = candidate
-            break
-    if qkv is None:
-        return None, None
-    for path in _NORM_PATHS:
-        norm = _resolve_module(block, path)
-        if norm is not None and callable(norm):
-            return qkv, norm
-    return qkv, None
-
-
 def text_segment(layout) -> tuple[int, int]:
     text = [s for s in layout.segments if s[2] == "text"]
     if len(text) != 1:
@@ -115,53 +88,56 @@ def negative_text_kv(state, cfg: NAGConfig, block_index: int, *, heads: int, hea
     """Project the once-refined negative text through one block's qkv projection.
 
     The sidecar hidden state is frozen at the refined embedding: it is not
-    re-evolved through earlier blocks and skips per-step modulated norms.
+    re-evolved through earlier blocks. Native timestep modulation, Q/K norm,
+    and rotary positioning are applied before the keys are captured.
     """
+    from comfy.ldm.minimax.model import rope_rotation_table
+
     runtime = state.nag_runtime
     if runtime is None:
         runtime = state.nag_runtime = NAGRuntime()
-    cached = runtime.kv_cache.get(block_index)
-    if cached is not None:
-        return cached
-
+    key = (state.current_sigma, str(device), dtype)
+    if key != runtime.cache_key:
+        runtime.kv_cache.clear()
+        runtime.cache_key = key
+    if block_index in runtime.kv_cache:
+        return runtime.kv_cache[block_index]
     if runtime.refined is None:
-        negative = cfg.negative_context.to(device=device, dtype=dtype)
-        preprocess = getattr(state.diffusion, "preprocess_text_embeds", None)
-        runtime.refined = preprocess(negative) if preprocess is not None else negative
+        runtime.refined = state.diffusion.preprocess_text_embeds(cfg.negative_context.to(device=device, dtype=dtype))
+    block = state.blocks[block_index]
+    args = state.block_args
+    if args is None:
+        raise RuntimeError("NAG requires the current native H3 block arguments")
+    _, text_stop = text_segment(state.layout)
+    text_row = next(row for a, _, row in args["mod_segments"]
+                    if a < text_stop and isinstance(row, int) and row % 3 == 1)
+    shift, scale, *_ = block.adaln_proj(args["t_emb"])
+    hidden = block.norm1(runtime.refined[0])
+    hidden = hidden * (1 + scale[text_row].to(hidden.dtype)) + shift[text_row].to(hidden.dtype)
+    positions = torch.zeros(hidden.shape[0], 3, dtype=torch.float64)
+    positions[:, 0] = torch.arange(hidden.shape[0], dtype=torch.float64)
+    rope = rope_rotation_table(state.diffusion.rope_freqs(positions, device), dtype)
+    captured = []
 
-    blocks = state.blocks
-    if blocks is None or not 0 <= block_index < len(blocks):
-        raise RuntimeError(f"no DiT block module available for index {block_index}")
-    qkv_module, norm_module = discover_projection(blocks[block_index])
-    if qkv_module is None:
-        raise RuntimeError(
-            f"could not locate a fused qkv projection on DiT block {block_index}; "
-            f"tried {', '.join(_QKV_PATHS)}"
-        )
+    def capture(func, q, k, v, native_heads, *args, **kwargs):
+        if native_heads != heads or k.shape[-1] != head_dim:
+            raise RuntimeError("negative attention shape differs from the native positive stream")
+        captured.append((k, v))
+        # Native Attention owns Q/K norm, partial rotary layout, and quantized
+        # projection semantics. Its normal output projection receives zeros;
+        # there is no negative SxS attention or second DiT traversal here.
+        return q.new_zeros((1, q.shape[2], native_heads * q.shape[-1]))
 
-    hidden = runtime.refined
-    if norm_module is not None:
-        try:
-            hidden = norm_module(hidden)
-        except TypeError:
-            # Modulated norms need per-step conditioning the sidecar does not carry.
-            pass
-    qkv = qkv_module(hidden)
-    inner = qkv.shape[-1] // 3
-    if qkv.shape[-1] != 3 * inner or inner != heads * head_dim:
-        raise RuntimeError(
-            f"qkv projection width {qkv.shape[-1]} does not factor into 3 x {heads} heads x {head_dim} dims"
-        )
-    tokens = int(qkv.shape[1])
-    k = qkv[..., inner:2 * inner].reshape(1, tokens, heads, head_dim).transpose(1, 2).to(dtype)
-    v = qkv[..., 2 * inner:].reshape(1, tokens, heads, head_dim).transpose(1, 2).to(dtype)
-    runtime.kv_cache[block_index] = (k, v)
-    return k, v
+    block.attn(hidden, rope_freqs=rope, transformer_options={"optimized_attention_override": capture})
+    if len(captured) != 1:
+        raise RuntimeError("native H3 attention did not expose exactly one negative K/V pair")
+    runtime.kv_cache[block_index] = captured[0]
+    return captured[0]
 
 
 def apply_nag(state, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, *,
               skip_output_reshape: bool, transformer_options: dict | None = None,
-              attn_mask: torch.Tensor | None = None) -> torch.Tensor:
+              attn_mask: torch.Tensor | None = None, packed_attention=None) -> torch.Tensor:
     """Inject the NAG text-guidance delta into target audio/video attention rows."""
     cfg = state.nag
     if cfg is None or state.layout is None or state.block_index is None:
@@ -197,15 +173,17 @@ def apply_nag(state, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: tor
     heads, head_dim = int(q.shape[1]), int(q.shape[-1])
     k_neg, v_neg = negative_text_kv(state, cfg, state.block_index, heads=heads, head_dim=head_dim,
                                     device=q.device, dtype=q.dtype)
+    positive = out if skip_output_reshape else out.reshape(1, q.shape[2], heads, head_dim).transpose(1, 2)
+    negative = None
     if cfg.mode == "faithful_selective":
-        # Genuinely shared softmax: rerun full-key attention for target rows with
-        # the text partition swapped to the negative sidecar.
-        k_pos_all, v_pos_all = k, v
         k_neg_all = torch.cat([k[:, :, :t0], k_neg, k[:, :, t1:]], dim=2)
         v_neg_all = torch.cat([v[:, :, :t0], v_neg, v[:, :, t1:]], dim=2)
-    else:
-        k_pos_all, v_pos_all = k[:, :, t0:t1], v[:, :, t0:t1]
-        k_neg_all, v_neg_all = k_neg, v_neg
+        if packed_attention is None:
+            negative = F.scaled_dot_product_attention(q, k_neg_all, v_neg_all)
+        else:
+            # Reuse the positive result and the same configured backend/mask for
+            # the swapped text. Sparse execution must keep its visibility rule.
+            negative = packed_attention(q, k_neg_all, v_neg_all, k_neg.shape[2])
 
     out = out.clone()
     for start, stop, strength in ((seg.audio_start, seg.audio_stop, cfg.audio_strength),
@@ -213,8 +191,11 @@ def apply_nag(state, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: tor
         if strength == 0.0 or stop <= start:
             continue
         q_rows = q[:, :, start:stop, :]
-        z_pos = F.scaled_dot_product_attention(q_rows, k_pos_all, v_pos_all)
-        z_neg = F.scaled_dot_product_attention(q_rows, k_neg_all, v_neg_all)
+        if negative is None:
+            z_pos = F.scaled_dot_product_attention(q_rows, k[:, :, t0:t1], v[:, :, t0:t1])
+            z_neg = F.scaled_dot_product_attention(q_rows, k_neg, v_neg)
+        else:
+            z_pos, z_neg = positive[:, :, start:stop], negative[:, :, start:stop]
         delta = nag_combine(z_pos, z_neg, cfg.scale, cfg.tau, cfg.alpha) - z_pos
         if strength != 1.0:
             delta = delta * strength

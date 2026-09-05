@@ -1,88 +1,40 @@
 #!/usr/bin/env python3
-"""Machine-merge digest — the retrospective human word over machine merges.
+"""Announce this repository's machine-authored merges without a review router.
 
-KRA-1074 A1 moved Hákon's merge word from prospective to retrospective: the
-composed boundary (exact-head CLEAN, findings burned, green required checks, no
-conflicts, Theoros at the exhaustion gate) admits the merge, and the human reads
-afterwards.  This helper is the reading surface, in the two cadences A1's rider
-fixed:
-
-``announce``
-    One substance line to ``#hive`` at merge time, from the merging repository's
-    own workflow.  Says what the change *does* — the one thing a green tick
-    cannot carry — plus its revert anchor.  Claims no reversal cost: at merge
-    time nothing has been measured.
-``digest``
-    The scheduled cross-repo rollup.  Every repository in ``weave-repos.json``
-    is reported: entries, an explicit zero, or a loud read failure.  Each entry
-    carries what the change does, why, what gated it (reported, never
-    re-derived), and what reversing it would cost *right now* — measured by
-    attempting the revert, not guessed from a proxy.
-
-What this is not: a re-verification of the gates, a second evidence store, and
-above all not a veto window.  The veto never expires — Hákon owns the
-repositories.  What the digest preserves is the *cheap* option, by putting the
-account in front of him while a revert is still one command.
-
-The gate half of every entry is read through ``review_loop`` — the same
-resolution the review-loop hook publishes.  Two audit trails that can disagree
-are worse than one, so this file contains no second implementation of exact-head
-verdict resolution, finding counts, or round numbering.
-
-Standard library only, like its sibling: the cx53 self-hosted runners have a
-deliberately small tool surface.
+The closed-PR event supplies the result and the PR body supplies its substance.
+This helper neither requests reviews nor reconstructs a merge-admission policy.
+The former cross-repository digest has no workflow in this repository.
 """
-
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
-from collections.abc import Mapping, Sequence
-from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.request
 from pathlib import Path
-from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-REPOS_FILE = REPO_ROOT / "weave-repos.json"
-DIGEST_WORKFLOW_FILE = "merge-digest.yml"
-DIGEST_DRY_RUN_MARKER = "dry-run"
-BOOTSTRAP_WINDOW_HOURS = 24
+# Preserve the author filter of this repository's existing announcement job.
+SEAT_AUTHORS = {"Fable", "Ariadne", "gnomon", "Talos", "Theoros"}
+
 SUBSTANCE_FLOOR = 180
+
+
 MAX_SUBSTANCE = 900
-MAX_AREAS = 4
-MAX_RESIDUE_LINES = 3
-DIGEST_CHUNK_BUDGET = 12000
-LINEAR_ISSUE_URL = "https://linear.app/krates-ehf/issue/"
-TICKET_PATTERN = re.compile(r"\bKRA-\d+\b")
-CLOSES_PATTERN = re.compile(r"(?im)^\s*(?:closes|fixes|resolves)\s+(KRA-\d+)")
+
+
 HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
 BOILERPLATE_PATTERN = re.compile(
     r"(?im)^\s*(?:closes|fixes|resolves)\s+KRA-\d+\s*$"
     r"|^\s*(?:co-authored-by|generated with|🤖).*$"
     r"|^\s*<?https?://\S*claude\.com/claude-code>?\s*$"
 )
-RESIDUE_VOCABULARY = (
-    "trade-off",
-    "tradeoff",
-    "residue",
-    "deliberate choice",
-    "known gap",
-    "known limitation",
-    "follow-up",
-    "follow up",
-    "out of scope",
-    "not addressed",
-    "caveat",
-    "judgement call",
-    "judgment call",
-    "design call",
-)
+
+
 SECRET_PATTERNS = (
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
     re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
@@ -105,46 +57,9 @@ SECRET_PATTERNS = (
         r"\s*[:=]\s*[\"']?([A-Za-z0-9/+_.\-]{12,})"
     ),
 )
+
+
 REDACTED = "[redacted]"
-
-# Reversal-cost tiers, most expensive first.  The order is the display order:
-# the entries whose cheap option is disappearing fastest are the ones where
-# reading sooner changes anything.  "unmeasured" ranks above the known-cheap
-# tiers: its true cost may be deployed or conflicting, and an unmeasured cost
-# reported below "clean" is exactly the cheap claim this file promises never
-# to make.
-TIER_ORDER = ("deployed", "conflicting", "unmeasured", "dependents", "clean")
-
-
-def _load_review_loop() -> Any:
-    """Load the sibling review-loop helper, reusing an already-loaded copy.
-
-    The digest reports gate outcomes; it must read them through the same code
-    that published them.
-    """
-    existing = sys.modules.get("weave_review_loop")
-    if existing is not None:
-        return existing
-    path = Path(__file__).resolve().parent / "review_loop.py"
-    spec = importlib.util.spec_from_file_location("weave_review_loop", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load review-loop helper from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-review_loop = _load_review_loop()
-
-ApiHttpError = review_loop.ApiHttpError
-GitHubApi = review_loop.GitHubApi
-SlackApi = review_loop.SlackApi
-required_env = review_loop.required_env
-
-
-def env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() == "true"
 
 
 def redact(text: str) -> str:
@@ -164,184 +79,6 @@ def redact(text: str) -> str:
         else:
             result = pattern.sub(REDACTED, result)
     return result
-
-
-def load_repos(path: Path | None = None) -> list[dict[str, str]]:
-    """Read the declared repository set; an unreadable list is fatal, not empty.
-
-    Reporting zero repositories and reporting zero merges look identical in a
-    channel.  Refusing to run keeps the difference visible.
-    """
-    source = path or REPOS_FILE
-    data = json.loads(source.read_text(encoding="utf-8"))
-    repos = data.get("repos") if isinstance(data, Mapping) else None
-    if not isinstance(repos, list) or not repos:
-        raise RuntimeError(f"{source} declares no repositories")
-    resolved: list[dict[str, str]] = []
-    for entry in repos:
-        slug = str(entry.get("slug", "")).strip() if isinstance(entry, Mapping) else ""
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
-            raise RuntimeError(
-                f"{source} contains an invalid repository slug: {slug!r}"
-            )
-        role = str(entry.get("role", "")).strip() if isinstance(entry, Mapping) else ""
-        resolved.append({"slug": slug, "role": role})
-    return resolved
-
-
-def parse_time(value: Any) -> datetime | None:
-    """Parse a GitHub timestamp into an aware UTC datetime, or ``None``.
-
-    Every timestamp in this file is compared against a window bound, and a naive
-    datetime raises rather than compares — so the aware-ness is forced here, at
-    the one place timestamps enter.
-    """
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        parsed = review_loop.parse_github_time(value.strip())
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
-
-
-def stamp(moment: datetime) -> str:
-    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-
-
-def window_start(
-    github: GitHubApi,
-    *,
-    now: datetime,
-    current_run_id: str,
-    workflow_file: str = DIGEST_WORKFLOW_FILE,
-) -> tuple[datetime, str]:
-    """Start the window at the previous successful digest run.
-
-    The routine's own run record is the watermark: no state file, no committed
-    marker, no second store to drift.  A run that failed never advances it, so a
-    failure widens the next window instead of dropping the merges it missed.
-    A successful dry run is not a watermark either — it posted nothing, and
-    treating it as coverage would permanently skip the merges it only rendered.
-    The list is newest-first and paginated until a posting run is found: a
-    page of later dry runs is not "no watermark".  Overlap is the safe
-    direction and is disclosed in the header — a merge reported twice is
-    noise, a merge reported never is the failure this whole ticket exists
-    to prevent.
-    """
-    page = 1
-    per_page = 100
-    try:
-        while True:
-            runs = github.request(
-                "GET",
-                f"repos/{github.repository}/actions/workflows/{workflow_file}/runs",
-                query={"status": "success", "per_page": per_page, "page": page},
-            )
-            entries = runs.get("workflow_runs") if isinstance(runs, Mapping) else None
-            if not isinstance(entries, list) or not entries:
-                break
-            for run in entries:
-                if not isinstance(run, Mapping):
-                    continue
-                if str(run.get("id")) == str(current_run_id):
-                    continue
-                if not _run_posted_digest(run):
-                    continue
-                started = parse_time(run.get("created_at"))
-                if started is not None:
-                    # Newest-first: the first posting run is the watermark.
-                    # Stopping at page one would treat a page of later dry
-                    # runs as "no watermark" and permanently skip merges
-                    # between the real posted run and the 24h bootstrap.
-                    return started, "since the previous successful digest run"
-            if len(entries) < per_page:
-                break
-            page += 1
-    except ApiHttpError as error:
-        if error.status_code != 404:
-            raise
-    bootstrap = (
-        f"first run — bootstrap window of {BOOTSTRAP_WINDOW_HOURS}h, "
-        "merges older than that are not covered"
-    )
-    return now - timedelta(hours=BOOTSTRAP_WINDOW_HOURS), bootstrap
-
-
-def resolve_window(
-    github: GitHubApi,
-    *,
-    now: datetime,
-    current_run_id: str,
-    since_override: datetime | None,
-) -> tuple[datetime, str]:
-    """Apply an optional ``--since`` only when it widens the watermark window.
-
-    A later override would render a narrower digest, then become the next
-    ``window_start()`` watermark and permanently drop the merges between the
-    old watermark and the override.  Overlap is the safe direction.
-    """
-    watermark, watermark_source = window_start(
-        github, now=now, current_run_id=current_run_id
-    )
-    if since_override is None:
-        return watermark, watermark_source
-    if since_override > watermark:
-        return (
-            watermark,
-            (
-                "explicit --since is later than the previous posted digest; "
-                "using the watermark so the override cannot drop coverage"
-            ),
-        )
-    return since_override, "explicit --since override"
-
-
-def _run_posted_digest(run: Mapping[str, Any]) -> bool:
-    """True when this successful run actually posted, not merely rendered.
-
-    ``merge-digest.yml`` tags dry runs in ``run-name`` so they appear in
-    ``display_title``.  The list endpoint does not carry dispatch inputs, so
-    the title is the discriminator the watermark can see.
-    """
-    title = str(run.get("display_title") or "")
-    return DIGEST_DRY_RUN_MARKER not in title.lower()
-
-
-def merged_pulls_since(github: GitHubApi, since: datetime) -> list[Mapping[str, Any]]:
-    """Every pull merged into this repository at or after ``since``.
-
-    Listing closed pulls by descending update time and stopping at the first
-    page older than the window is exact here: merging always updates the pull,
-    so a merge inside the window cannot sit behind the cutoff.
-    """
-    merged: list[Mapping[str, Any]] = []
-    page = 1
-    while True:
-        batch = github.get(
-            "pulls",
-            query={
-                "state": "closed",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": 100,
-                "page": page,
-            },
-        )
-        if not isinstance(batch, list):
-            raise TypeError("GET pulls did not return a list")
-        for pull in batch:
-            if not isinstance(pull, Mapping):
-                continue
-            merged_at = parse_time(pull.get("merged_at"))
-            if merged_at is not None and merged_at >= since:
-                merged.append(pull)
-        if not batch or len(batch) < 100:
-            return merged
-        oldest = parse_time(batch[-1].get("updated_at"))
-        if oldest is not None and oldest < since:
-            return merged
-        page += 1
 
 
 def substance(body: str) -> tuple[str, bool]:
@@ -374,913 +111,114 @@ def substance(body: str) -> tuple[str, bool]:
         prose = f"{prose[:cut].rstrip()}\n…(body continues)"
     return prose, measured < SUBSTANCE_FLOOR
 
-
-def residue_lines(body: str) -> list[str]:
-    """Lines where the author flagged a trade-off, a known gap, or a follow-up."""
-    found: list[str] = []
-    for raw in HTML_COMMENT_PATTERN.sub("", body or "").splitlines():
-        line = raw.strip().lstrip("*-• ").strip()
-        if not line or BOILERPLATE_PATTERN.match(raw):
-            continue
-        lowered = line.lower()
-        if any(word in lowered for word in RESIDUE_VOCABULARY):
-            found.append(line if len(line) <= 220 else f"{line[:219]}…")
-        if len(found) >= MAX_RESIDUE_LINES:
-            break
-    return found
+def required_env(name):
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"required environment variable {name} is missing")
+    return value
 
 
-def ticket_refs(body: str, title: str) -> list[str]:
-    """Resolving tickets first, then any other ticket the body names."""
-    closes = CLOSES_PATTERN.findall(body or "")
-    mentioned = TICKET_PATTERN.findall(f"{title}\n{body or ''}")
-    ordered: list[str] = []
-    for key in [*closes, *mentioned]:
-        if key not in ordered:
-            ordered.append(key)
-    return ordered
-
-
-def change_shape(files: Sequence[Mapping[str, Any]]) -> str:
-    """Where the change landed and how big it was, rolled up by area."""
-    if not files:
-        return "no files reported"
-    areas: dict[str, list[int]] = {}
-    for item in files:
-        name = str(item.get("filename") or "")
-        parts = name.split("/")
-        area = "/".join(parts[:2]) if len(parts) > 2 else (parts[0] if parts else "?")
-        bucket = areas.setdefault(area, [0, 0, 0])
-        bucket[0] += int(item.get("additions") or 0)
-        bucket[1] += int(item.get("deletions") or 0)
-        bucket[2] += 1
-    ranked = sorted(areas.items(), key=lambda pair: -(pair[1][0] + pair[1][1]))
-    shown = ", ".join(
-        f"`{area}` +{added}/-{removed}"
-        for area, (added, removed, _) in ranked[:MAX_AREAS]
+def request_json(url, token, payload=None):
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json",
+                 "Accept": "application/json", "User-Agent": "h3forge-merge-announcement"},
     )
-    if len(ranked) > MAX_AREAS:
-        shown = f"{shown}, +{len(ranked) - MAX_AREAS} more areas"
-    return f"{shown} ({len(files)} files)"
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"merge announcement request failed with HTTP {exc.code}") from exc
 
 
-def check_report(github: GitHubApi, sha: str) -> dict[str, Any]:
-    """Conclusions of every check run recorded at one commit.
-
-    The checks list endpoint pages at 100. A later-page failure or
-    cancellation is still a conclusion of this merge commit; reading only
-    page one can report an all-green summary that the remaining runs refute.
-    """
-    counts = {"success": 0, "failure": 0, "cancelled": 0, "other": 0}
-    failed: list[str] = []
+def machine_author(github, pull):
+    names = []
     page = 1
-    per_page = 100
-    seen = 0
     while True:
-        payload = github.get(
-            f"commits/{sha}/check-runs", query={"per_page": per_page, "page": page}
-        )
-        runs = payload.get("check_runs") if isinstance(payload, Mapping) else None
-        if not isinstance(runs, list) or not runs:
-            break
-        for run in runs:
-            if not isinstance(run, Mapping):
-                continue
-            conclusion = str(run.get("conclusion") or run.get("status") or "other")
-            if conclusion in {"success", "neutral", "skipped"}:
-                counts["success" if conclusion == "success" else "other"] += 1
-            elif conclusion in {"failure", "timed_out", "action_required"}:
-                counts["failure"] += 1
-                failed.append(str(run.get("name") or "?"))
-            elif conclusion == "cancelled":
-                counts["cancelled"] += 1
-            else:
-                counts["other"] += 1
-        seen += len(runs)
-        total = payload.get("total_count") if isinstance(payload, Mapping) else None
-        if isinstance(total, int) and seen >= total:
-            break
-        if len(runs) < per_page:
+        commits = github(f"pulls/{pull['number']}/commits?per_page=100&page={page}")
+        names.extend(commit["commit"]["author"]["name"] for commit in commits)
+        if len(commits) < 100:
             break
         page += 1
-    counts["total"] = sum(
-        counts[key] for key in ("success", "failure", "cancelled", "other")
-    )
-    return {"counts": counts, "failed": failed}
+    burn = os.environ.get("REVIEW_BURN_ACTOR", "").strip().lower() or "talos"
 
+    def choose(seats):
+        return (next((name for name in names if name in seats and seats[name] != burn), None)
+                or next((name for name in names if name in seats), None))
 
-def check_line(report: Mapping[str, Any]) -> str:
-    counts = report["counts"]
-    if not counts["total"]:
-        return "no check run is recorded at this merge commit"
-    parts = [f"{counts['success']} green"]
-    if counts["failure"]:
-        parts.append(
-            f"*{counts['failure']} failed* ({', '.join(report['failed'][:3])})"
-        )
-    if counts["cancelled"]:
-        parts.append(f"{counts['cancelled']} cancelled (superseded by a later head)")
-    if counts["other"]:
-        parts.append(f"{counts['other']} other")
-    return ", ".join(parts)
-
-
-def gate_report(
-    github: GitHubApi, pull: Mapping[str, Any], codex_login: str
-) -> dict[str, Any]:
-    """Report — never re-derive — what the review loop already established.
-
-    Every verdict, round number and finding count here comes out of
-    ``review_loop``.  A merged head with no exact-head verdict is stated as
-    exactly that: an absence establishes nothing, and hiding it would make the
-    digest complicit in the gap.
-    """
-    number = int(pull["number"])
-    merged_head = str((pull.get("head") or {}).get("sha") or "").lower()
-    merged_at = parse_time(pull.get("merged_at"))
-    reviews = _items_at_or_before(
-        github.paginate(f"pulls/{number}/reviews"), merged_at, "submitted_at"
-    )
-    review_comments = _items_at_or_before(
-        github.paginate(f"pulls/{number}/comments"), merged_at, "created_at"
-    )
-    issue_comments = _items_at_or_before(
-        github.paginate(f"issues/{number}/comments"), merged_at, "created_at"
-    )
-    events = review_loop.codex_result_events(
-        github, reviews, issue_comments, codex_login
-    )
-    heads = review_loop.result_heads_from_events(events)
-    history = review_loop.round_history(
-        heads,
-        reviews,
-        review_comments,
-        codex_login,
-        latest_kind_by_head=review_loop.latest_result_kind_by_head(events),
-    )
-    closing = next((row for row in history if row["head"] == merged_head), None)
-    burned = sum(
-        row["counts"]["total"] for row in history if row["head"] != merged_head
-    )
-    # The merged head is checked explicitly: a fourth unreviewed head merged by
-    # human override never appears in ``history`` (it has no Codex result
-    # event), yet its exhaustion marker is precisely the gate fact to report.
-    marker_heads = {row["head"] for row in history} | (
-        {merged_head} if merged_head else set()
-    )
-    exhausted = any(
-        review_loop.marker_comment_exists(
-            issue_comments, review_loop.exhaustion_marker(head)
-        )
-        for head in marker_heads
-    )
-    return {
-        "merged_head": merged_head,
-        "rounds": len(history),
-        "closing": closing,
-        "findings_burned": burned,
-        "exhaustion_gate": exhausted,
-    }
-
-
-def gate_line(report: Mapping[str, Any]) -> str:
-    closing = report["closing"]
-    head = report["merged_head"][:8] or "?"
-    if closing is None:
-        verdict = (
-            f"*no Codex verdict resolves to the merged head* `{head}` "
-            f"({report['rounds']} reviewed head(s) on this PR)"
-        )
-    else:
-        verdict = (
-            f"{closing['verdict']} at `{head}` "
-            f"(round {closing['round']}/{closing['rounds']})"
-        )
-    parts = [verdict]
-    if report["findings_burned"]:
-        parts.append(f"{report['findings_burned']} findings burned on earlier heads")
-    if report["exhaustion_gate"]:
-        parts.append("reached the exhaustion gate")
-    return " · ".join(parts)
-
-
-def _items_at_or_before(
-    items: Sequence[Any], deadline: datetime | None, *stamp_keys: str
-) -> list[Any]:
-    """Keep pre-merge evidence; a later verdict cannot rewrite the gate record."""
-    if deadline is None:
-        return [item for item in items]
-    kept: list[Any] = []
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        when = None
-        for key in stamp_keys:
-            when = parse_time(item.get(key))
-            if when is not None:
-                break
-        if when is None or when <= deadline:
-            kept.append(item)
-    return kept
-
-
-class RevertProbe:
-    """Measure reversal cost by attempting the revert, not by proxy.
-
-    "Accurate when checked" is the acceptance criterion, so the check is the
-    measurement: clone once per repository, try ``git revert --no-commit`` on
-    the live default branch, and count the commits that have since touched the
-    same files.  A proxy that says "clean" where the revert conflicts is worse
-    than saying nothing, because it is the one claim a reader would act on.
-
-    The credential is passed through the environment into a credential helper.
-    It never enters a URL, an argv, or an error message.
-    """
-
-    def __init__(self, workdir: Path, token_env: str = "WEAVE_DIGEST_TOKEN") -> None:
-        self.workdir = workdir
-        self.token_env = token_env
-        self.clones: dict[str, Path | None] = {}
-
-    def _git(
-        self, args: Sequence[str], cwd: Path | None = None
-    ) -> subprocess.CompletedProcess[str]:
-        helper = (
-            f'!f() {{ echo "username=x-access-token"; '
-            f'echo "password=${self.token_env}"; }}; f'
-        )
-        command = [
-            "git",
-            "-c",
-            "credential.helper=",
-            "-c",
-            f"credential.helper={helper}",
-            "-c",
-            "user.name=weave-merge-digest",
-            "-c",
-            "user.email=digest@sokrates.is",
-            *args,
-        ]
-        return subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            capture_output=True,
-            text=True,
-            timeout=600,
-            check=False,
-        )
-
-    def clone(self, slug: str) -> Path | None:
-        if slug in self.clones:
-            return self.clones[slug]
-        target = self.workdir / slug.replace("/", "__")
-        result = self._git(
-            [
-                "clone",
-                "--filter=blob:none",
-                "--no-tags",
-                f"https://github.com/{slug}.git",
-                str(target),
-            ]
-        )
-        self.clones[slug] = target if result.returncode == 0 else None
-        return self.clones[slug]
-
-    def cost(self, slug: str, merge_sha: str, default_branch: str) -> dict[str, Any]:
-        repo = self.clone(slug)
-        if repo is None:
-            return {
-                "tier": "unmeasured",
-                "dependents": 0,
-                "detail": "repository could not be cloned on this runner",
-            }
-        fetched = self._git(
-            ["fetch", "--filter=blob:none", "origin", merge_sha], cwd=repo
-        )
-        if fetched.returncode != 0:
-            return {
-                "tier": "unmeasured",
-                "dependents": 0,
-                "detail": "merge commit is not reachable from this clone",
-            }
-        checkout = self._git(
-            ["checkout", "--force", "--detach", f"origin/{default_branch}"], cwd=repo
-        )
-        if checkout.returncode != 0:
-            return {
-                "tier": "unmeasured",
-                "dependents": 0,
-                "detail": f"default branch `{default_branch}` could not be checked out",
-            }
-        self._git(["reset", "--hard"], cwd=repo)
-        self._git(["clean", "-ffdq"], cwd=repo)
-        parents = self._git(["rev-list", "--parents", "-n", "1", merge_sha], cwd=repo)
-        is_merge = len(parents.stdout.split()) > 2
-        revert_args = ["revert", "--no-commit"]
-        if is_merge:
-            revert_args += ["-m", "1"]
-        attempt = self._git([*revert_args, merge_sha], cwd=repo)
-        clean = attempt.returncode == 0
-        # A revert of an already-reverted merge "succeeds" while staging nothing;
-        # reporting that as an applicable revert promises work that would fail
-        # with nothing-to-commit.
-        noop = (
-            clean and not self._git(["status", "--porcelain"], cwd=repo).stdout.strip()
-        )
-        self._git(["revert", "--quit"], cwd=repo)
-        self._git(["reset", "--hard"], cwd=repo)
-        self._git(["clean", "-ffdq"], cwd=repo)
-        paths = self._changed_paths(repo, merge_sha, is_merge)
-        dependents = (
-            None
-            if paths is None
-            else self._dependent_commits(repo, merge_sha, default_branch, paths)
-        )
-        anchor = f"git revert {'-m 1 ' if is_merge else ''}{merge_sha[:12]}"
-        if dependents is None:
-            # A failed probe is not "0 later commits". Folding the failure
-            # into zero would report a clean revert the evidence does not
-            # carry — the cheap claim this file promises never to make.
-            return {
-                "tier": "unmeasured",
-                "dependents": 0,
-                "detail": (f"`{anchor}` — dependent history could not be measured"),
-            }
-        if noop:
-            return {
-                "tier": "clean",
-                "dependents": dependents,
-                "detail": (
-                    f"`{anchor}` is a no-op — this merge appears already reverted "
-                    f"on `{default_branch}`; nothing is left to revert"
-                ),
-            }
-        if not clean:
-            return {
-                "tier": "conflicting",
-                "dependents": dependents,
-                "detail": (
-                    f"`{anchor}` no longer applies — the revert conflicts and must "
-                    "be untangled by hand"
-                ),
-            }
-        if dependents:
-            return {
-                "tier": "dependents",
-                "dependents": dependents,
-                "detail": (
-                    f"`{anchor}` still applies, but {dependents} later commit(s) "
-                    "touch the same files and would need follow-up repair if "
-                    "the revert drops required behavior"
-                ),
-            }
-        return {
-            "tier": "clean",
-            "dependents": 0,
-            "detail": f"clean revert — `{anchor}` applies with no conflict and nothing stacked on it",
-        }
-
-    def _changed_paths(
-        self, repo: Path, merge_sha: str, is_merge: bool
-    ) -> list[str] | None:
-        spec = [f"{merge_sha}^1", merge_sha] if is_merge else [f"{merge_sha}^!"]
-        result = self._git(["diff", "--name-only", *spec], cwd=repo)
-        if result.returncode != 0:
-            return None
-        return [line for line in result.stdout.splitlines() if line.strip()]
-
-    def _dependent_commits(
-        self, repo: Path, merge_sha: str, default_branch: str, paths: Sequence[str]
-    ) -> int | None:
-        if not paths:
-            return 0
-        # Union across path chunks: one truncated invocation would silently drop
-        # commits touching only paths past the cutoff and misreport "clean".
-        shas: set[str] = set()
-        for start in range(0, len(paths), 200):
-            result = self._git(
-                [
-                    "log",
-                    "--format=%H",
-                    f"{merge_sha}..origin/{default_branch}",
-                    "--",
-                    *paths[start : start + 200],
-                ],
-                cwd=repo,
-            )
-            if result.returncode != 0:
-                return None
-            shas.update(line for line in result.stdout.splitlines() if line.strip())
-        return len(shas)
-
-
-def deployment_note(
-    github: GitHubApi,
-    merged_at: datetime | None,
-    *,
-    merge_sha: str = "",
-    default_branch: str = "",
-) -> str:
-    """Whether state has been shipped behind this merge, or whether that is unknown.
-
-    A repository that publishes no deployment records cannot answer the
-    question.  Saying so is the honest half of the tier — reporting "not
-    deployed" from an empty list would be a claim the evidence does not carry.
-    Only a successful deployment of this revision (the merge commit or the
-    default branch it landed on) establishes the shipped tier.  Staging,
-    failed, and unrelated-ref records do not.  Newer preview or staging
-    records commonly fill the first page, so pagination continues until a
-    covering production success is found or remaining records predate the
-    merge — stopping at page one would leave shipped code in a cheaper tier.
-    """
-    page = 1
-    saw_records = False
-    try:
-        while True:
-            payload = github.get("deployments", query={"per_page": 100, "page": page})
-            if not isinstance(payload, list):
-                return "deployment records unreadable"
-            if not payload:
-                if not saw_records:
-                    return (
-                        "repo publishes no deployment records — "
-                        "deployed state not established"
-                    )
-                return ""
-            saw_records = True
-            if merged_at is None:
-                return ""
-            page_predates_merge = False
-            for deployment in payload:
-                if not isinstance(deployment, Mapping):
-                    continue
-                created = parse_time(deployment.get("created_at"))
-                if created is None or created < merged_at:
-                    if created is not None:
-                        page_predates_merge = True
-                    continue
-                if not _deployment_covers_merge(
-                    deployment, merge_sha=merge_sha, default_branch=default_branch
-                ):
-                    continue
-                if not _deployment_is_production(deployment):
-                    continue
-                succeeded = _deployment_succeeded(github, deployment)
-                if succeeded is None:
-                    return (
-                        "deployment status unreadable for a covering production "
-                        "deployment — shipped state unknown"
-                    )
-                if not succeeded:
-                    continue
-                environment = str(deployment.get("environment") or "production")
-                return (
-                    f"deployed since this merge to `{environment}` — "
-                    "reverting now means reverting shipped state"
-                )
-            if page_predates_merge or len(payload) < 100:
-                return ""
-            page += 1
-    except ApiHttpError:
-        return "deployment records unreadable"
-
-
-_NON_PRODUCTION_ENVIRONMENTS = frozenset(
-    {"staging", "preview", "dev", "development", "qa", "test"}
-)
-
-
-def _deployment_covers_merge(
-    deployment: Mapping[str, Any], *, merge_sha: str, default_branch: str
-) -> bool:
-    sha = str(deployment.get("sha") or "").lower()
-    if merge_sha and sha == merge_sha.lower():
-        return True
-    ref = str(deployment.get("ref") or "")
-    return bool(
-        default_branch and ref in {default_branch, f"refs/heads/{default_branch}"}
-    )
-
-
-def _deployment_is_production(deployment: Mapping[str, Any]) -> bool:
-    if deployment.get("production_environment") is False:
-        return False
-    environment = str(deployment.get("environment") or "").lower()
-    return environment not in _NON_PRODUCTION_ENVIRONMENTS
-
-
-def _deployment_succeeded(
-    github: GitHubApi, deployment: Mapping[str, Any]
-) -> bool | None:
-    """True/False from the latest status; ``None`` when the status is unreadable.
-
-    A transient 403/5xx on the status endpoint is not evidence the deployment
-    failed — folding it into ``False`` silently drops the shipped tier.
-    """
-    deployment_id = deployment.get("id")
-    if deployment_id is None:
-        return False
-    try:
-        statuses = github.get(
-            f"deployments/{deployment_id}/statuses", query={"per_page": 100}
-        )
-    except ApiHttpError:
+    author = choose({name: name.lower() for name in SEAT_AUTHORS})
+    if author:
+        return author
+    head_author = github(f"commits/{pull['head']['sha']}")["commit"]["author"]["name"]
+    if head_author in SEAT_AUTHORS:
+        return head_author
+    names.append(head_author)
+    head_repo = (pull["head"].get("repo") or {}).get("full_name")
+    base_repo = (pull["base"].get("repo") or {}).get("full_name")
+    if not head_repo or head_repo != base_repo:
         return None
-    if not isinstance(statuses, list) or not statuses:
-        return False
-    latest = statuses[0]
-    if not isinstance(latest, Mapping):
-        return False
-    return str(latest.get("state") or "") == "success"
+    aliases = {}
+    for entry in re.split(r"[,\n]", os.environ.get("REVIEW_AUTHOR_ALIASES", "")):
+        if not entry.strip():
+            continue
+        name, separator, seat = entry.partition("=")
+        seat = seat.strip().lower()
+        if not separator or not name.strip() or not re.fullmatch(r"[a-z0-9-]+", seat):
+            raise ValueError("REVIEW_AUTHOR_ALIASES must contain Author Name=seat entries")
+        aliases[name.strip()] = seat
+    return choose(aliases)
 
 
-def revert_anchor(github: GitHubApi, merge_sha: str) -> str:
-    """The exact revert command for this commit.
-
-    ``-m 1`` belongs on a merge commit and breaks on a squash commit, so the
-    parent count decides it rather than an assumption about how the repository
-    merges.
-    """
-    if not merge_sha:
-        return "git revert <merge commit unknown>"
-    try:
-        commit = github.get(f"commits/{merge_sha}")
-    except ApiHttpError:
-        return (
-            f"git revert {merge_sha[:12]} (commit lookup failed — parent count "
-            "unknown; check whether this is a merge commit and add -m 1 by hand)"
-        )
-    parents = commit.get("parents") if isinstance(commit, Mapping) else None
-    mainline = "-m 1 " if isinstance(parents, list) and len(parents) > 1 else ""
-    return f"git revert {mainline}{merge_sha[:12]}"
-
-
-def build_entry(
-    github: GitHubApi,
-    *,
-    slug: str,
-    pull: Mapping[str, Any],
-    codex_login: str,
-    probe: RevertProbe | None,
-    default_branch: str,
-) -> dict[str, Any]:
-    number = int(pull["number"])
-    body = str(pull.get("body") or "")
-    title = str(pull.get("title") or "")
-    merged_at = parse_time(pull.get("merged_at"))
-    merge_sha = str(pull.get("merge_commit_sha") or "").lower()
-    files = github.paginate(f"pulls/{number}/files")
-    account, thin = substance(body)
-    gate = gate_report(github, pull, codex_login)
-    checks = (
-        check_report(github, merge_sha)
-        if merge_sha
-        else {"counts": {"total": 0}, "failed": []}
-    )
-    if probe is not None and merge_sha:
-        reversal = probe.cost(slug, merge_sha, default_branch)
-        shipped = deployment_note(
-            github,
-            merged_at,
-            merge_sha=merge_sha,
-            default_branch=default_branch,
-        )
-        if shipped.startswith("deployed since"):
-            reversal = {
-                **reversal,
-                "tier": "deployed",
-                "detail": f"{reversal['detail']}; {shipped}",
-            }
-        elif shipped:
-            reversal = {**reversal, "detail": f"{reversal['detail']} ({shipped})"}
-    else:
-        reversal = {
-            "tier": "unmeasured",
-            "dependents": 0,
-            "detail": (
-                f"`{revert_anchor(github, merge_sha)}` — the anchor only. "
-                "Nothing has been measured at merge time, and an unmeasured "
-                "cost is never reported as a cheap one; the scheduled digest "
-                "measures it."
-            ),
-        }
-    merged_by = (pull.get("merged_by") or {}).get("login") or "?"
-    return {
-        "slug": slug,
-        "number": number,
-        "title": title,
-        "url": str(pull.get("html_url") or ""),
-        "merge_sha": merge_sha,
-        "merged_at": merged_at,
-        "merged_by": str(merged_by),
-        "seat": "",
-        "account": account,
-        "thin": thin,
-        "shape": change_shape(files),
-        "tickets": ticket_refs(body, title),
-        "residue": residue_lines(body),
-        "gate": gate,
-        "checks": checks,
-        "reversal": reversal,
-    }
-
-
-def ticket_links(keys: Sequence[str]) -> str:
-    return (
-        ", ".join(f"<{LINEAR_ISSUE_URL}{key}|{key}>" for key in keys[:4])
-        or "no ticket named"
-    )
-
-
-def urgency_key(entry: Mapping[str, Any]) -> tuple[int, int, float]:
-    tier = entry["reversal"]["tier"]
-    rank = TIER_ORDER.index(tier) if tier in TIER_ORDER else len(TIER_ORDER)
-    merged_at = entry.get("merged_at")
-    return (
-        rank,
-        -int(entry["reversal"].get("dependents") or 0),
-        merged_at.timestamp() if merged_at else 0.0,
-    )
-
-
-def render_entry(entry: Mapping[str, Any], index: int) -> str:
-    lines = [
-        f"*{index}. <{entry['url']}|{entry['slug']}#{entry['number']}>* — {entry['title']}",
-        entry["account"] if entry["account"] else "_(empty body)_",
-    ]
-    if entry["thin"]:
-        lines.append(
-            "⚠️ *This body is too thin to be cold-readable.* The digest cannot "
-            "manufacture the account the author did not write — open the PR to "
-            "judge this one."
-        )
-    lines.append(f"• *Ticket:* {ticket_links(entry['tickets'])}")
-    lines.append(f"• *Shape:* {entry['shape']}")
-    lines.append(f"• *Gated by:* {gate_line(entry['gate'])}")
-    lines.append(f"• *Checks at the merge commit:* {check_line(entry['checks'])}")
-    merged = stamp(entry["merged_at"]) if entry["merged_at"] else "?"
-    seat = f", authored by {entry['seat']}" if entry["seat"] else ""
-    lines.append(f"• *Merged:* {merged} by `{entry['merged_by']}`{seat}")
-    lines.append(f"• *Reversing it now:* {entry['reversal']['detail']}")
-    for residue in entry["residue"]:
-        lines.append(f"• *Author flagged:* {residue}")
-    lines.append(f"• *Veto:* reply `VETO {entry['slug']}#{entry['number']} — <reason>`")
-    return "\n".join(lines) + "\n"
-
-
-def digest_header(
-    *,
-    since: datetime,
-    until: datetime,
-    window_source: str,
-    entry_count: int,
-    repo_status: Sequence[str],
-) -> str:
-    coverage = " · ".join(repo_status)
-    if entry_count:
-        opening = f"{entry_count} machine merge(s) landed in this window."
-    else:
-        opening = (
-            "*No machine merges in this window.* Nothing landed without Hákon "
-            "authoring it — this is a reported result, not a missing report."
-        )
-    return (
-        "*Machine-merge digest*\n"
-        f"Window: {stamp(since)} → {stamp(until)} ({window_source}). "
-        "Windows overlap rather than gap: a failed run widens the next one.\n"
-        f"{opening}\n"
-        f"Repos read: {coverage}\n"
-        "The merge-ready boundary is unchanged — this reports desirability, not "
-        "correctness, and re-verifies nothing.\n"
-        "*Your veto never expires.* Ordered by what exercising it costs today, "
-        "most expensive first; a veto is an instruction to a seat, and the "
-        "reversal travels the ordinary reviewed path.\n\n"
-    )
-
-
-def chunk(
-    header: str, blocks: Sequence[str], *, budget: int = DIGEST_CHUNK_BUDGET
-) -> list[str]:
-    return review_loop.chunk_digest(
-        header, blocks, label="machine-merge digest", budget=budget
-    )
-
-
-def emit(messages: Sequence[str], *, dry_run: bool) -> None:
-    safe = [redact(message) for message in messages]
-    if dry_run:
-        for message in safe:
-            print(message)
-            print("---")
-        return
-    slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
-    review_loop.post_threaded_messages(slack, safe)
-
-
-def seat_for_pull(github: GitHubApi, pull: Mapping[str, Any]) -> tuple[str, str] | None:
-    """The authoring seat, resolved exactly as the review loop resolves it.
-
-    Merge actor is not the discriminator: a seat and a human both merge with a
-    credential that authenticates as Hákon.  Authorship is what separates work
-    the machines produced from work he wrote himself, and it is already the
-    review loop's seat identity — so it stays one implementation.
-    """
-    head_sha = str((pull.get("head") or {}).get("sha") or "")
-    return review_loop.author_for_pr(github, int(pull["number"]), head_sha)
-
-
-def run_digest(*, dry_run: bool = False, since_override: str | None = None) -> None:
-    token = required_env("WEAVE_DIGEST_TOKEN")
-    codex_login = os.environ.get("CODEX_LOGIN", review_loop.CODEX_LOGIN)
-    now = datetime.now(timezone.utc)
-    self_repo = os.environ.get("GITHUB_REPOSITORY", "RationallyPrime/weave-doctrine")
-    run_id = os.environ.get("GITHUB_RUN_ID", "")
-    parsed_override: datetime | None = None
-    if since_override:
-        parsed_override = parse_time(since_override)
-        if parsed_override is None:
-            raise RuntimeError(
-                f"--since is not an ISO-8601 UTC timestamp: {since_override!r}"
-            )
-    since, window_source = resolve_window(
-        GitHubApi(token, self_repo),
-        now=now,
-        current_run_id=run_id,
-        since_override=parsed_override,
-    )
-    entries: list[dict[str, Any]] = []
-    repo_status: list[str] = []
-    failures: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="weave-merge-digest-") as tmp:
-        probe = RevertProbe(Path(tmp))
-        for repo in load_repos():
-            slug = repo["slug"]
-            github = GitHubApi(token, slug)
-            try:
-                meta = github.request("GET", f"repos/{slug}")
-                if not isinstance(meta, Mapping):
-                    raise TypeError("repository lookup did not return an object")
-                default_branch = str(meta.get("default_branch") or "main")
-                pulls = merged_pulls_since(github, since)
-                counted = 0
-                repo_entries: list[dict[str, Any]] = []
-                for pull in pulls:
-                    seat = seat_for_pull(github, pull)
-                    if seat is None:
-                        continue
-                    # Who pressed merge is only on the detail endpoint, never on
-                    # the list one — and it is read after the seat filter so the
-                    # extra call is paid once per machine merge, not per closed PR.
-                    detail = github.get(f"pulls/{int(pull['number'])}")
-                    resolved = detail if isinstance(detail, Mapping) else pull
-                    # Probe the branch the merge actually landed on: reverting a
-                    # release-branch merge against the default branch measures an
-                    # unrelated tree.
-                    base_ref = str(
-                        (resolved.get("base") or {}).get("ref") or default_branch
-                    )
-                    entry = build_entry(
-                        github,
-                        slug=slug,
-                        pull=resolved,
-                        codex_login=codex_login,
-                        probe=probe,
-                        default_branch=base_ref,
-                    )
-                    entry["seat"] = seat[0]
-                    repo_entries.append(entry)
-                    counted += 1
-                entries.extend(repo_entries)
-                repo_status.append(f"`{slug}` {counted}")
-            except (ApiHttpError, RuntimeError, TypeError) as error:
-                repo_status.append(f"`{slug}` *UNREAD*")
-                failures.append(f"`{slug}`: {error}")
-                continue
-        entries.sort(key=urgency_key)
-        blocks = [
-            render_entry(entry, index) for index, entry in enumerate(entries, start=1)
-        ]
-        header = digest_header(
-            since=since,
-            until=now,
-            window_source=window_source,
-            entry_count=len(entries),
-            repo_status=repo_status,
-        )
-        messages = chunk(header, blocks)
-        if failures:
-            messages.append(
-                "*Machine-merge digest — repositories that could not be read.* "
-                "These are not zero-merge repos; they are unknown, and the "
-                "digest above is incomplete by exactly this much:\n"
-                + "\n".join(f"• {failure}" for failure in failures)
-            )
-        emit(messages, dry_run=dry_run)
-    print(
-        f"machine-merge digest: {len(entries)} entries, {len(failures)} unreadable repos"
-    )
-    if failures:
-        raise RuntimeError(
-            "digest incomplete: "
-            + "; ".join(failures)
-            + " — this run must not become the watermark"
-        )
-
-
-def announce_message(entry: Mapping[str, Any]) -> str:
-    """One substance line at merge time — what it does, plus the revert anchor."""
-    headline = (
-        f"*Machine merge* — <{entry['url']}|{entry['slug']}#{entry['number']}> "
-        f"{entry['title']}"
-    )
-    lines = [headline, entry["account"] if entry["account"] else "_(empty body)_"]
-    if entry["thin"]:
-        lines.append(
-            "⚠️ *Thin body* — this merge landed without a cold-readable account "
-            "of what it does."
-        )
-    lines.append(f"• *Ticket:* {ticket_links(entry['tickets'])}")
-    lines.append(f"• *Gated by:* {gate_line(entry['gate'])}")
-    lines.append(f"• *Checks at the merge commit:* {check_line(entry['checks'])}")
-    merged = stamp(entry["merged_at"]) if entry["merged_at"] else "?"
-    lines.append(
-        f"• *Merged:* {merged} by `{entry['merged_by']}`, authored by {entry['seat']}"
-    )
-    lines.append(f"• *Revert anchor:* {entry['reversal']['detail']}")
-    for residue in entry["residue"]:
-        lines.append(f"• *Author flagged:* {residue}")
-    lines.append(
-        f"• *Veto:* reply `VETO {entry['slug']}#{entry['number']} — <reason>`. "
-        "The veto never expires; only its price rises."
-    )
-    return "\n".join(lines)
-
-
-def run_announce(*, dry_run: bool = False) -> None:
-    token = required_env("GITHUB_TOKEN")
-    slug = required_env("GITHUB_REPOSITORY")
-    codex_login = os.environ.get("CODEX_LOGIN", review_loop.CODEX_LOGIN)
-    event = review_loop.load_event()
-    pull = event.get("pull_request")
-    if not isinstance(pull, Mapping):
-        raise TypeError("announce requires a pull_request event payload")
+def run_announce(*, dry_run=False):
+    event = json.loads(Path(required_env("GITHUB_EVENT_PATH")).read_text())
+    pull = event["pull_request"]
     if not pull.get("merged"):
-        print(
-            f"{slug}#{pull.get('number')} closed without merging; nothing to announce"
-        )
+        print("Pull request closed without merging; nothing to announce.")
         return
-    github = GitHubApi(token, slug)
-    live = github.get(f"pulls/{int(pull['number'])}")
-    if not isinstance(live, Mapping):
-        raise TypeError("pull request lookup did not return an object")
-    seat = seat_for_pull(github, live)
-    if seat is None:
-        print(
-            f"{slug}#{live['number']} is not seat-authored; no machine-merge announcement"
-        )
+    slug = required_env("GITHUB_REPOSITORY")
+    token = required_env("GITHUB_TOKEN")
+    api = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+
+    def github(path):
+        return request_json(f"{api}/repos/{slug}/{path}", token)
+
+    author = machine_author(github, pull)
+    if author is None:
+        print(f"{slug}#{pull['number']} is not machine-authored; nothing to announce.")
         return
-    entry = build_entry(
-        github,
-        slug=slug,
-        pull=live,
-        codex_login=codex_login,
-        probe=None,
-        default_branch=str((live.get("base") or {}).get("ref") or "main"),
+    sha = pull["merge_commit_sha"]
+    parents = github(f"commits/{sha}")["parents"]
+    revert = f"git revert {'-m 1 ' if len(parents) > 1 else ''}{sha}"
+    account, thin = substance(pull.get("body") or "")
+    message = (
+        f"*Machine merge* — <{pull['html_url']}|{slug}#{pull['number']}> {pull['title']}\n"
+        f"{account or '_(empty body)_'}\n"
+        f"Merged {pull['merged_at']} by {(pull.get('merged_by') or {}).get('login', '?')}; "
+        f"authored by {author}.\nRevert anchor: `{revert}` (reversal cost not measured)."
     )
-    entry["seat"] = seat[0]
-    emit([announce_message(entry)], dry_run=dry_run)
-    print(f"announced machine merge {slug}#{live['number']}")
+    if thin:
+        message += "\nPR body contains little detail; follow the PR link for context."
+    message = redact(message)
+    if dry_run:
+        print(message)
+        return
+    result = request_json("https://slack.com/api/chat.postMessage", required_env("HIVE_BOT_TOKEN"),
+                          {"channel": required_env("HIVE_CHANNEL"), "text": message})
+    if result.get("ok") is not True:
+        raise RuntimeError(f"Slack rejected the announcement: {result.get('error', 'unknown error')}")
+    print(f"Announced {slug}#{pull['number']}, message {result['ts']}.")
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("announce", "digest"))
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="render to stdout instead of posting to Hive",
-    )
-    parser.add_argument(
-        "--since",
-        default=None,
-        help=(
-            "ISO-8601 UTC window start; only widens the previous-run watermark "
-            "(a later value is ignored so the override cannot drop coverage)"
-        ),
-    )
+    parser.add_argument("command", choices=("announce",))
+    parser.add_argument("--dry-run", action="store_true", help="Render without posting to Hive.")
     args = parser.parse_args(argv)
-    # Workflow-dispatch inputs arrive through the environment rather than the
-    # command line, so a dispatched value can never become part of a shell
-    # command in a step that holds credentials.
-    dry_run = args.dry_run or env_flag("DIGEST_DRY_RUN")
-    since = args.since or os.environ.get("DIGEST_SINCE", "").strip() or None
     try:
-        if args.command == "digest":
-            run_digest(dry_run=dry_run, since_override=since)
-        else:
-            run_announce(dry_run=dry_run)
-    except Exception as error:  # noqa: BLE001 - CLI boundary must terminalize visibly.
-        print(f"merge-digest {args.command} failed: {error}", file=sys.stderr)
+        run_announce(dry_run=args.dry_run or os.environ.get("DIGEST_DRY_RUN", "").lower() == "true")
+    except Exception as exc:
+        print(f"merge announcement failed: {exc}", file=sys.stderr)
         return 1
     return 0
 

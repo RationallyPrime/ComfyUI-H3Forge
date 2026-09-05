@@ -4,18 +4,20 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 
 1. **H3-native sliding/radial sparse attention** using PyTorch FlexAttention.
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
-3. **Synchronized audio/video context windows** with overlap-add blending and absolute H3 RoPE preservation.
+3. **Video context windows with a shared full audio timeline**, FP32 overlap fusion, and absolute H3 RoPE preservation.
 4. **Pipe-delimited timeline prompting** with independently encoded, optionally unequal prompt spans and a reusable global anchor.
-5. **Reference-aware pipe prompting** that reuses ComfyUI's native Ref2VA encoder for every segment.
+5. **Image/video/voice reference prompting** that prepares shared native Ref2VA references once.
 6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
 ## Status
 
-The GPU integration gate has been passed on Blackwell hardware. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`), peaking **under 50 GB of VRAM**. That run predates the current fusion-parity change: its then-named `pyramid` mode was the edge ramp now exposed as `overlap-linear`, so it is not yet a GPU receipt for the full-window pyramid.
+Earlier releases passed a Blackwell integration run. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`), peaking **under 50 GB of VRAM**. That run predates the current fusion-parity change: its then-named `pyramid` mode was the edge ramp now exposed as `overlap-linear`, so it is not yet a GPU receipt for the full-window pyramid.
 
-Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. Peak denoising memory is governed mainly by the active window, while wall time and total work continue to grow with the number of windows. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
+Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. The active video window, complete audio timeline, and reference prefix govern denoiser memory. Wall time and work grow with window count. Decoded output still occupies a full CPU image buffer; 1,450 float32 RGB frames at 1344×768 are about 16.7 GiB. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
+
+The 0.3 repair details and current validation are recorded in [audit-repairs.md](docs/audit-repairs.md). The earlier 60-second clip predates these changes and is not a quality result for the current revision.
 
 Systematic numbers against `BLACKWELL_TEST_MATRIX.md` (sparse sweeps, seam/identity scoring, NAG acceptance) are still being collected. Treat the knob defaults in this README as working starting points, not tuned optima.
 
@@ -37,9 +39,9 @@ The sparse policy is modality aware:
 
 The H3 temporal mapping is **not** guessed from token indices. Video time uses MiniMax-H3's `1,4,4,4,4` latent-token cadence and audio uses its native one-step grid. Both use 40 Hz ticks; `temporal_window` limits video and cross-modal links, while audio self-attention is uncapped.
 
-Both FlexAttention and block-mask construction are compiled. The block mask is built once with `H=None` because the policy is head-independent, then broadcast across H3's 56 heads. This avoids the eager `B × H × S × S` boolean grid that otherwise OOMs before the sparse kernel can run. If FlexAttention declines and `strict=false`, H3Forge falls back to ComfyUI's configured dense attention backend and records the reason.
+Both FlexAttention and block-mask construction are compiled. The block mask builder uses a private compiled code object and `H=None` because the policy is head-independent, then broadcast across H3's 56 heads. This avoids the eager `B × H × S × S` boolean grid that otherwise OOMs before the sparse kernel can run. Unsupported sparse contracts abort in strict mode; deliberately dense initial layers/steps remain allowed. Non-strict attention can fall back to the configured dense backend and records the reason. Context-window execution failures always abort the generation.
 
-One compiled `flex_attention` runner is kept per concrete attention shape and mask specialization (segment table plus `temporal_window`, `spatial_radius`, `bridge_stride`), in a small LRU. Each runner wraps its own private copy of `flex_attention`'s code object, because Dynamo counts recompiles per code object rather than per `torch.compile` wrapper: with one shared code object, a session that met more distinct shapes than Dynamo's budget (and a prompt edit is a new shape, since text tokens are part of it) would silently fall back to eager `flex_attention` and its full `S × S` score matrix. With a code object per runner and the mask's guarded values in the runner key, a runner never meets a second mask specialization, so it never approaches its budget. Evicting a runner resets its code object's Dynamo state and returns the code object to a pool for the next runner, so the LRU bounds retained Dynamo entries and private code objects. It does not evict PyTorch's process-wide Inductor/PyCodeCache modules or unload CUDA kernels; total backend compilation memory is outside this cache's ownership and is not bounded by it.
+One compiled `flex_attention` runner is kept per concrete attention shape and mask specialization (segment table plus `temporal_window`, `spatial_radius`, `bridge_stride`), in an LRU between runs. Active sampling retains its working shapes to prevent recompilation on every denoising step; the caches are trimmed when the run ends. Each runner wraps its own private copy of `flex_attention`'s code object, because Dynamo counts recompiles per code object rather than per `torch.compile` wrapper: with one shared code object, a session that met more distinct shapes than Dynamo's budget (and a prompt edit is a new shape, since text tokens are part of it) would silently fall back to eager `flex_attention` and its full `S × S` score matrix. With a code object per runner and the mask's guarded values in the runner key, a runner never meets a second mask specialization, so it never approaches its budget. Evicting a runner resets its code object's Dynamo state and returns the code object to a pool for the next runner, so the LRU bounds retained Dynamo entries and private code objects. It does not evict PyTorch's process-wide Inductor/PyCodeCache modules or unload CUDA kernels; total backend compilation memory is outside this cache's ownership and is not bounded by it.
 
 ### H3 FETA
 
@@ -59,17 +61,18 @@ This is overlap-add context denoising rather than "generate clip A, then feed it
 
 For every denoising step it:
 
-1. distributes overlapping target-video latent windows evenly between fixed first and last anchors;
-2. maps each video interval to the physically overlapping H3 audio-latent interval;
-3. constructs a window-local `PackedLayout`;
-4. transplants the **original global audio/video position IDs** into that layout;
-5. evaluates H3 jointly on the synchronized A/V window;
-6. fuses video and audio predictions into their full latent canvases with a full-window pyramid by default;
-7. optionally shifts interior boundaries with ComfyUI's ordered-halving phase sequence, bounded to the requested overlap so adjacent windows always keep it; a segmented pipe prompt pins the boundaries at phase 0 instead, because a moving seam there would change which latents mix two prompts from step to step.
+1. chooses overlapping target-video windows;
+2. includes the complete shared stereo audio latent in each forward, so earlier utterances remain directly visible;
+3. constructs a local `PackedLayout` containing only the selected prompt's actual tokens;
+4. transplants global video/audio positions and shared reference/keyframe positions;
+5. evaluates H3 jointly and projects each prediction onto the video's local interval and its matching audio interval;
+6. accumulates and normalizes predictions in FP32 before returning the model dtype.
 
-The phase-0 plan snaps interior starts to H3's five-latent cadence wherever the fixed anchors, minimum overlap and unchanged window count permit it, unless that would leave the stagger fewer distinct layouts than the even spread has: a static run always snaps, and a staggering run keeps its off-cadence spread only where cadence and seam movement collide (80/10 at 427 latents has three latents of slack, so its only aligned plan is the wall every phase clamps onto). Every active phase is derived from that same phase-0 plan, so no seam moves further than the phase. The exact tail may be off cadence; tight strides can also make interior snapping impossible (for example 25/8 at 427 latents). The context-plan receipt reports `cadence=5` and `off_cadence_starts`. Global target position IDs are still transplanted exactly, including at unsnapped starts; cadence alignment alone is not evidence of better dialogue.
+A single prompt can stagger interior boundaries using ordered-halving phases. Multi-segment prompts have fixed, exclusive output intervals on the native video-token grid; their windows include neighboring video for context, but only write predictions into the assigned interval. This prevents one beat from disappearing merely because no old window midpoint selected it.
 
-That absolute-position transplant is important: a context window beginning at latent frame 26 must not pretend it begins at H3 frame zero and restart the `1,4,4,4,4` RoPE cadence.
+Native Fun ControlNet composes on either side of the context node: its complete control latent is prepared once and sliced by each global video interval. Forge preserves existing block-hook dependencies and keeps base-model NAG/FETA out of the control network's attention.
+
+Absolute positions matter: a window beginning at latent 26 must retain that global frame's native cadence. Full audio visibility does not make an unlimited-memory model; reference size, audio length, and decoded output continue to consume resources.
 
 ### H3 Forge — Pipe Timeline Prompt
 
@@ -82,11 +85,13 @@ Two optional inputs make the timeline less toy-like:
 
 Segments are separated by the node's `delimiter`, which defaults to `|` so existing workflows keep working. MiniMax spells its own special tokens `<|cutoff|>`, `<|lyrics_start|>` and so on, so text between `<|` and `|>` is never split whatever the delimiter is; without that rule a single `<|cutoff|>` silently turns one prompt into three segments. A literal delimiter is escaped with a backslash, and a delimiter containing a backslash, `<` or `>` is rejected. For prompts that carry MiniMax tokens, `|||` or `%%%` read more clearly than a bare pipe.
 
-All segment embeddings are padded to one token length before sampling, preserving one compiled H3 context shape. Each synchronized A/V context window uses the **complete encoding of the one segment covering its midpoint** — contextualized token slots from independently encoded prompts do not correspond to one another, so hidden states are never interpolated. Around a prompt boundary, adjacent windows generated under different prompts crossfade in **output space** through the context-window overlap-add blend, which is where blending is semantically sound.
+Each segment keeps its native token length and is refined independently. No zero-padding tokens enter the refiner or DiT. Reference and target positions use one common timeline origin, even when the text lengths differ. Native lengths may require additional compiled shapes after a prompt edit.
 
-Segments must share the same conditioning structure: differing multimodal inserts or presentation tags across segments are rejected at encode time rather than silently stamped with segment 1's metadata.
+Durations are projected to the nearest boundary of H3's `1,4,4,4,4` decoded-frame cadence. Every representable segment gets model evaluations and exclusive video/audio output ownership. The step-zero plan reports the actual `prompt_frame_cuts`; a sub-grid segment raises before the first denoiser forward. Windows can include neighboring video for context while contributing output only inside their assigned beat. Predictions from different prompts are not blended across the boundary.
 
-Segments must not outnumber the context windows that can select them: if a segment's requested span contains no window midpoint, H3Forge warns at the first step (or aborts in strict mode) instead of letting that prompt silently vanish. This can also happen when an unequal segment is shorter than the context window's reachable midpoint range. Use fewer segments, lengthen the affected duration, or use a smaller `window_frames`.
+This controls conditioning on the native latent grid. A frame-perfect editorial cut between independently generated shots belongs in the video edit; a diffusion model and temporal VAE do not guarantee a photographic hard cut just because the conditioning changes.
+
+Shared reference/keyframe payload **values** must match across segments. Per-segment text lengths and their text tags are retained; differing reference payloads fail visibly.
 
 Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 AV Latent`. A single segment is valid and behaves like ordinary global conditioning. Escape a literal pipe as `\|`.
 
@@ -96,25 +101,25 @@ At sampler step zero, the context node prints one compact plan containing the ac
 
 ### H3 Forge — Reference Pipe Timeline Prompt
 
-This is the image-reference counterpart to the text-only pipe node. It splits on `|`, invokes ComfyUI's native `MiniMaxH3ReferenceToVideo` encoder independently for every self-contained segment with the same one-to-four reference images, validates that their multimodal token-tag structure matches, and returns both the combined positive conditioning and native AV latent. It supports the same optional `global_prompt` and `segment_durations` inputs. The first segment's identical native reference payload supplies the global reference prefix; every local context window receives the complete reference-aware Qwen encoding selected for its midpoint.
+This node uses native Ref2VA preparation once and independently encodes every prompt against the same prepared presentation. It supports up to nine images, three reference videos, three paired video soundtracks, and three standalone audio references. Video soundtracks pair with the same-numbered video. Connect the video VAE for visual references and the audio VAE for voice/soundtrack references; image-only work does not require an audio VAE. A single segment is valid, and there is no arbitrary eight-segment ceiling.
 
-Use full Ref2VA prompt grammar inside **every** segment (`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`) and keep reference labels and subject definitions identical. This node intentionally does not expose reference video or reference audio inputs yet; use the native node directly when those modalities matter.
+Use full Ref2VA grammar inside each segment (`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`) with stable `<Picture i>`, `<Video i>`, and `<Audio i>` labels. All segments share one reference payload. Native `MiniMaxH3AddGuide` can add image, clip, or audio anchors at specific frames when that is the desired control.
 
 ### H3 Forge — Normalized Attention Guidance (experimental)
 
-H3's released checkpoints are guidance-distilled: a normal `BasicGuider` workflow already runs one forward per step and pays no CFG cost, but negative prompts do nothing at CFG 1. This node restores meaningful negative-prompt control **without a second complete H3 transformer pass**.
+H3's released checkpoints are guidance-distilled: a normal `BasicGuider` workflow already runs one forward per step and pays no CFG cost, but negative prompts do nothing at CFG 1. This node applies experimental negative-text guidance **without a second complete H3 transformer pass**. Its effect on a particular visual or audio defect needs a controlled comparison.
 
 H3 is structurally on the expensive side of the NAG divide: unlike Wan's external text cross-attention (where NAG costs roughly 12%), H3's text, references, audio, and video share one packed self-attention per block, like Flux (where faithful NAG costs closer to 87%). So this node implements **H3 NAG-Lite**, not faithful NAG:
 
-1. the negative prompt is encoded once and passed through H3's text preprocessing;
-2. at selected DiT blocks, the current positive target audio/video queries attend to the positive text K/V and to the negative sidecar text K/V;
+1. the negative prompt is encoded and refined once;
+2. each selected block applies its current native timestep modulation, Q/K normalization and rotary positions to the negative text; projected keys/values are cached within that sigma;
 3. the exact NAG formula (`guided = pos·scale − neg·(scale−1)`, L1-renormalized with cap `tau`, alpha-blended) is applied to those two text-conditioned contributions;
 4. only the **delta** is injected into target audio/video attention rows before the output projection;
 5. A/V↔A/V self-attention, the MLP, and the rest of the positive packed stream are untouched.
 
-The added attention cost is roughly `target rows × text length` per selected block instead of `packed length²`.
+In `lite` mode the added attention cost is roughly `target rows × text length` per selected block. `faithful_selective` evaluates an additional packed attention operation with the configured visibility rule at each selected block.
 
-**Documented approximations** (why this is named NAG-Lite): the sidecar text state is frozen at the refined embedding rather than re-evolved through earlier blocks; it skips per-step modulated norms and RoPE on sidecar keys; and in `lite` mode the standalone text attention does not share the packed softmax denominator with A/V keys. `mode=faithful_selective` removes the last approximation by rerunning full-key attention for the target rows with the text partition swapped — materially more expensive, useful as a quality ceiling for the selected blocks.
+**Remaining approximations:** the sidecar starts from the frozen refined embedding at every selected block rather than evolving through all earlier blocks. In `lite` mode its text attention has a separate softmax denominator. `faithful_selective` swaps the text in the full key stream and reuses the positive attention result; it preserves the configured backend and sparse visibility rule. This mode removes the denominator approximation, while retaining frozen sidecar states. It is a comparison mode, not an established quality ceiling.
 
 Knobs: start at `nag_scale 3.0` (not Wan's 11 — H3 is distilled, single-stream, and jointly generates speech and imagery, so aggressive attention extrapolation has more opportunities to damage identity, voice, or sync). Find stable `nag_tau`/`nag_alpha`, then leave them fixed and tune only the scale. `nag_sigma_end` stops NAG once sigma falls below it, saving compute in the late schedule. `first_block`/`last_block` select the DiT blocks; `video_strength`/`audio_strength` scale the injected delta per modality.
 
@@ -127,7 +132,9 @@ The node composes with `H3 Forge — Sliding Attention + FETA` in either wiring 
 - CUDA strongly recommended; sparse FlexAttention is not intended as a CPU execution path.
 - No extra Python package is required by H3Forge itself.
 
-The code was authored against the native ComfyUI MiniMax-H3 implementation and most recently rechecked live with ComfyUI `0.34.0`, Python `3.12.3`, and PyTorch `2.13.0+cu130` on 2026-09-03.
+Core-contract CI is pinned to ComfyUI `250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a`. Use a build containing the native H3 `rope_rotation_table` and Fun ControlNet wrapper contracts. GPU validation uses PyTorch `2.13.0+cu130`; CPU CI exercises the public Torch 2.8 API surface separately.
+
+With this core, launch ComfyUI with **`--disable-comfy-compiler`**. Its model allocation recorder caused fatal asynchronous CUDA allocator errors during the loaded-model NAG/sparse checks. Forge rejects an active recorder with a launch instruction before its custom forward; it does not change ComfyUI's global settings. This option leaves Forge's own compiled sparse FlexAttention enabled.
 
 ## Install
 
@@ -148,7 +155,7 @@ Five nodes should appear:
 - `H3 Forge — Reference Pipe Timeline Prompt`
 - `H3 Forge — Normalized Attention Guidance` (experimental)
 
-The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the video/audio VAEs and one-to-four images, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
+The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the appropriate VAEs and image, video, or audio references, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
 
 For the recommended feed-forward memory reduction, also install [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes):
 
@@ -290,7 +297,7 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 : Requested minimum video-latent overlap before staggering; the node default is `8` for a `25`-latent window. Audio overlap is derived from physical H3 time rather than copied index-for-index.
 
 `stagger`
-: Moves only interior window boundaries using ComfyUI's bit-reversed ordered-halving phases, bounded to `min(overlap_frames, stride - 1)`. The first and last starts remain anchored and every adjacent pair keeps at least `overlap_frames` latents in common. With a pipe prompt of two or more segments the stagger is pinned off and the plan says so: each window is denoised under one hard-selected segment, so a seam that moved would change which latents blend two prompts from step to step, and that per-latent prompt drift shows up as continuous morphing and repeated dialogue. A full-stride shift would additionally let windows abut with no blend.
+: Moves interior windows for single-prompt runs using bounded ordered-halving phases. The first and last windows remain anchored and the requested overlap remains covered. Multi-segment output ownership stays fixed; its context plan reports `stagger=off`.
 
 `blend`
 : `pyramid` applies weights `1,2,...,peak,...,2,1` across each complete window before normalized overlap-add. `overlap-linear` preserves H3Forge's former Kijai-style edge ramp, including first/last boundary handling. `flat` gives every covered prediction equal weight.
@@ -303,7 +310,7 @@ Existing saved workflows whose blend is `pyramid` intentionally acquire the new 
 : An optional shared anchor included in every segment before that segment is independently encoded. It saves repetition; it is not a separate globally attended token bank.
 
 `segment_durations`
-: Comma- or newline-delimited positive relative durations, with exactly one value per `|` segment. Empty means equal spans. Selection remains hard and midpoint-based per context window; the overlap-add blend performs the boundary crossfade in output space.
+: Comma- or newline-delimited positive relative durations, with exactly one value per `|` segment. Empty means equal spans. Each beat owns a contiguous interval at the nearest native token boundaries, reported as decoded `prompt_frame_cuts`. Only predictions for the same beat are fused; sub-grid beats are rejected.
 
 ### NAG
 
@@ -330,7 +337,7 @@ Existing saved workflows whose blend is `pyramid` intentionally acquire the new 
 - **Do not stack `SolAttnH3` and H3Forge attention/NAG nodes on the same model.** Both own `optimized_attention_override`; H3Forge prints a warning if it replaces an existing override. Choose SolAttn or H3Forge for a given run.
 - H3Forge Context Windows *can* be used without H3Forge Attention.
 - FETA can be tested with `mode=dense`.
-- `strict=true` is recommended for development / first GPU tests. Use `strict=false` only when you explicitly prefer dense fallback over an aborted generation.
+- `strict=true` is recommended for development / first GPU tests. Non-strict attention permits dense fallback. A context execution error always aborts instead of retrying a different whole-clip job.
 - This is inference experimentation, not a claim that MiniMax trained H3 with this exact sparse topology.
 - MiniMax describes native sparse-attention training, while the released ComfyUI inference path is dense. Start from the one-second default and treat shorter windows as an explicit quality/speed sweep.
 
@@ -357,19 +364,18 @@ selected H3 model
 
 ## Test locally
 
-The included CPU tests cover evenly spaced and staggered scheduler coverage, full-window pyramid and retained overlap-linear fusion, unequal prompt-span routing, global-anchor propagation, context-plan reporting, block-mask cache keying, bridge semantics, FETA gain routing, Ref2VA/I2VA/FL2VA window transplants (against a faithful fake `PackedLayout`), NAG math and gating, node composition, and sampler-step resolution:
+The tests cover scheduler coverage, exclusive beat ownership, FP32 fusion, shared audio visibility, reference payload equality, native-length conditioning, sparse-mask cache behavior, and both node/control wiring orders. The integration tests extract the specific contracts from a real Comfy checkout without loading weights; NAG projection tests execute its actual Attention and DiTBlock classes with toy weights and a CPU reference for the fused rotary kernel.
 
 ```bash
-PYTHONPATH=. python -m pytest -q tests
+H3FORGE_COMFY_SOURCE=/path/to/ComfyUI PYTHONPATH=. python -m pytest -q tests
+ruff check h3forge tests __init__.py .github/scripts
 ```
 
-Static syntax check:
+Without `H3FORGE_COMFY_SOURCE`, native-contract tests explicitly skip. CI supplies the pinned checkout and runs them. CPU assertions establish mechanics, not image quality; retained GPU results and their limits live in [audit-repairs.md](docs/audit-repairs.md).
 
-```bash
-python -m compileall -q .
-```
+## Review policy
 
-The CPU tests cannot validate GPU/model correctness on their own — that requires a loaded H3 checkpoint and a CUDA device, and has now been exercised in live GPU sessions (see [Status](#status)). They remain the fast pre-GPU gate for the scheduler, mask, and blend math.
+This hobby project uses one review round, fixes to that round, and green CI before merge. Repairs do not trigger an automatic new review round. The former seven-round review router and scheduled nudges have been removed; CI and merge announcements remain.
 
 ## Design lineage and nearby work
 

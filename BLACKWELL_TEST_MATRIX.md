@@ -2,7 +2,7 @@
 
 Use the same seed, prompt, input conditioning, resolution, frame count, sampler, steps, CFG/guidance, and model files for every row.
 
-For pipe-timeline tests, keep the exact segment count, delimiter placement, `global_prompt`, and `segment_durations` fixed. Each segment is an independent encoding and occupies its requested relative portion of the target video timeline (equal portions when durations are empty); each context window uses the one segment covering its midpoint, and prompt transitions crossfade only through the output-space overlap-add. Retain the step-zero context-plan line so the actual window count, stagger phase/state, stride, minimum adjacent overlap, blend mode, latent-visit ratio, and prompt assignment are part of the receipt.
+For pipe-timeline tests, keep the exact segment count, delimiter placement, `global_prompt`, and `segment_durations` fixed. Each segment is an independent encoding and occupies its requested relative portion of the target video timeline (equal portions when durations are empty); each beat gets exclusive output ownership at its reported native-grid frame cuts; neighboring video is available as context, and all windows see the complete shared audio timeline. Retain the step-zero context-plan line so the actual window count, stagger phase/state, stride, minimum adjacent overlap, blend mode, latent-visit ratio, and prompt assignment are part of the receipt.
 
 | ID | Sparse | FETA | Context | Purpose |
 |---|---|---|---|---|
@@ -79,7 +79,7 @@ Use the same fixed-seed workflow as the runs above. All NAG runs use `BasicGuide
 | N-A | BasicGuider CFG 1 | off | Native reference |
 | N-B | NAG-Lite | off | Isolate guidance |
 | N-C | NAG-Lite | on | Composition with H3Forge sparse |
-| N-D | Selective faithful NAG (`mode=faithful_selective`) | off | Quality ceiling for the selected blocks |
+| N-D | Shared-softmax NAG (`mode=faithful_selective`) | off/on | Compare denominator choice with the same attention topology |
 | N-E | Ordinary CFG | off | Cost/quality reference |
 
 Starting values: `nag_scale 3.0`, `nag_tau 2.5`, `nag_alpha 0.15`, `nag_sigma_end 0.70`, blocks `8–28`, `video_strength 1.0`, `audio_strength 0.5`, `strict true`. Find stable tau/alpha first, then tune only the scale.

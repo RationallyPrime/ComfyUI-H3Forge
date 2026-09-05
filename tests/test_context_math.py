@@ -15,16 +15,14 @@ from h3forge.context import (
     stagger_phase,
     window_starts,
 )
-from h3forge.layout import expand_audio_range, padded_spatial_shape
+from h3forge.layout import padded_spatial_shape
 from h3forge.prompt import (
     combine_conditioning_segments,
     encode_pipe_prompt,
     make_segmented_extra_conds,
-    pad_segment_contexts,
     parse_segment_durations,
-    select_segment_index,
     split_pipe_prompt,
-    unreachable_segments,
+    segment_ranges,
     validate_segment_delimiter,
 )
 
@@ -215,75 +213,19 @@ def test_stagger_phase_is_bounded_by_the_overlap_not_the_stride():
     assert stagger_phase(0, 80, 10) == 0
 
 
-def test_context_wrapper_pins_stagger_off_under_a_segmented_prompt(monkeypatch, capsys):
-    """A segmented prompt keeps fixed window coverage; a single prompt still staggers."""
-    from h3forge import context as context_module
-
-    seen_phases = []
-    real_starts = window_starts
-
-    def recording_starts(total, window, overlap, phase=0, max_phase=0):
-        seen_phases.append(phase)
-        return real_starts(total, window, overlap, phase, max_phase)
-
-    monkeypatch.setattr(context_module, "window_starts", recording_starts)
-
-    def stop_after_geometry(*args, **kwargs):
-        raise RuntimeError("geometry recorded")
-
-    monkeypatch.setattr(context_module, "audio_range_for_video_window", stop_after_geometry)
-
-    def executor(x, timestep, context, transformer_options, **kwargs):
-        return x
-
-    wrapper = make_context_wrapper(ContextPolicy(window_frames=80, overlap_frames=10, stagger=True))
-    video = torch.zeros(1, 1, 427, 1, 1)
-    audio = torch.zeros(1, 1, 1, 854)
-    segments = tuple(torch.full((1, 1, 1), float(i)) for i in range(6))
-
-    def run(prompt_segments, sigma):
-        return wrapper(
-            executor,
-            [video, audio],
-            timestep=None,
-            context=prompt_segments[0],
-            transformer_options={
-                "sample_sigmas": torch.tensor([1.0, 0.7, 0.3, 0.0]),
-                "sigmas": torch.tensor([sigma]),
-            },
-            minimax_payload={"layout": object(), "h3forge_prompt_segments": prompt_segments},
-        )
-
-    # Six segments at step 1: the seams would move by up to the overlap and
-    # hand the latents inside each seam a different prompt mixture per step,
-    # so the wrapper runs the phase-0 geometry instead.
-    assert run(segments, 0.69) == [video, audio]
-    assert seen_phases == [0]
-    assert "stagger pinned off" not in capsys.readouterr().out
-
-    # The pin is announced once, at step 0.
-    seen_phases.clear()
-    assert run(segments, 1.0) == [video, audio]
-    assert seen_phases == [0]
-    assert "stagger pinned off: 6 pipe prompt segments" in capsys.readouterr().out
-
-    # One segment: every window carries the same prompt, so step 1 staggers.
-    seen_phases.clear()
-    assert run(segments[:1], 0.69) == [video, audio]
-    assert seen_phases == [stagger_phase(1, 80, 10)] == [5]
-
-
-def test_frozen_assignment_matches_nominal_selection_for_six_windows_six_segments():
-    nominal = window_starts(427, 80, 10, 0)
-    assert len(nominal) == 6
-    assigned = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in nominal]
-    assert assigned == [0, 1, 2, 3, 4, 5]
-    # The former full-stride stagger produced these abutting starts on odd steps
-    # and re-routed the tail windows; a segmented prompt now pins the geometry
-    # at phase 0, so the seams and their segments never move.
-    abutting = [0, 80, 160, 240, 320, 347]
-    drifted = [select_segment_index(v0, v0 + 80, 427, 6) for v0 in abutting]
-    assert drifted == [0, 1, 2, 3, 5, 5] != assigned
+def test_segmented_windows_cover_every_beat_without_midpoint_selection(monkeypatch):
+    import fake_minimax
+    from h3forge.context import _segment_windows
+    fake_minimax.install(monkeypatch)
+    ranges, _ = segment_ranges(427, 6)
+    plan = _segment_windows(427, 80, 10, ranges)
+    assert {p[0] for p in plan} == set(range(6))
+    for index, (start, stop) in enumerate(ranges):
+        covered = set()
+        for segment, _, _, lo, hi in plan:
+            if segment == index:
+                covered.update(range(lo, hi))
+        assert covered == set(range(start, stop))
 
 
 @pytest.mark.parametrize("total,window,overlap", [(427, 112, 6), (427, 80, 28)])
@@ -319,14 +261,6 @@ def test_strict_coverage_assertion():
 
 def test_odd_latent_spatial_shape_uses_post_pad_dimensions():
     assert padded_spatial_shape(95, 167, (1, 2, 2)) == (96, 168)
-
-
-def test_audio_ranges_can_be_pinned_to_one_compiled_length():
-    ranges = [(0, 141), (139, 282), (284, 426)]
-    expanded = [expand_audio_range(r, total=426, target_length=143) for r in ranges]
-    assert {a1 - a0 for a0, a1 in expanded} == {143}
-    for old, new in zip(ranges, expanded):
-        assert new[0] <= old[0] < old[1] <= new[1]
 
 
 def test_pipe_prompt_split_and_escape():
@@ -386,87 +320,6 @@ def test_segment_durations_are_exact_and_fail_closed():
         parse_segment_durations("2,nan,40", 3)
 
 
-def test_segment_contexts_pad_to_one_compiled_shape():
-    contexts = [torch.ones(1, 2, 3), torch.full((1, 4, 3), 2.0)]
-    padded = pad_segment_contexts(contexts)
-    assert [tuple(context.shape) for context in padded] == [(1, 4, 3), (1, 4, 3)]
-    assert torch.equal(padded[0][:, :2], contexts[0])
-    assert torch.count_nonzero(padded[0][:, 2:]) == 0
-
-
-def test_segment_selection_is_hard_and_midpoint_based():
-    # Interior window fully inside segment 1.
-    assert select_segment_index(20, 40, total=60, count=3) == 1
-    # Boundary-crossing windows use the segment containing their midpoint;
-    # hidden states are never mixed.
-    assert select_segment_index(0, 25, total=60, count=3) == 0
-    assert select_segment_index(10, 28, total=60, count=3) == 0
-    assert select_segment_index(16, 30, total=60, count=3) == 1
-    assert select_segment_index(36, 60, total=60, count=3) == 2
-    assert select_segment_index(0, 60, total=60, count=1) == 0
-    with pytest.raises(ValueError, match="invalid window"):
-        select_segment_index(5, 5, 10, 2)
-    with pytest.raises(ValueError, match="positive"):
-        select_segment_index(0, 5, 10, 0)
-
-
-def test_segment_selection_respects_unequal_durations():
-    durations = (2.0, 18.0, 40.0)
-    # On a 60-latent timeline, the requested boundaries are exactly 2 and 20.
-    assert select_segment_index(0, 2, 60, 3, durations) == 0
-    assert select_segment_index(1, 3, 60, 3, durations) == 1
-    assert select_segment_index(10, 20, 60, 3, durations) == 1
-    assert select_segment_index(20, 40, 60, 3, durations) == 2
-    with pytest.raises(ValueError, match="expected 3"):
-        select_segment_index(0, 2, 60, 3, (1.0, 2.0))
-
-
-def test_segment_selection_is_scale_safe_for_huge_durations():
-    durations = (1e307, 1e307)
-    assert select_segment_index(0, 50, 100, 2, durations) == 0
-    assert select_segment_index(50, 100, 100, 2, durations) == 1
-
-
-def test_segment_selection_is_scale_invariant():
-    # Durations are unitless ratios, so a huge or tiny finite scale must route
-    # exactly like its reduced form, including when sum(weights) itself would
-    # overflow in float.
-    windows = [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (50, 60)]
-    for scaled in ((1e307, 1e307), (1e308, 1e308), (1e-307, 1e-307)):
-        assert [select_segment_index(v0, v1, 60, 2, scaled) for v0, v1 in windows] == [
-            select_segment_index(v0, v1, 60, 2, (1.0, 1.0)) for v0, v1 in windows
-        ]
-
-    # Preserve unequal user-entered ratios too, especially at exact cuts.
-    baseline = parse_segment_durations("1,3", 2)
-    scaled = parse_segment_durations("1e307,3e307", 2)
-    assert select_segment_index(0, 2, 4, 2, baseline) == 1
-    assert select_segment_index(0, 2, 4, 2, scaled) == 1
-
-
-def test_segment_selection_ties_are_exact():
-    # A midpoint sitting exactly on a duration boundary belongs to the later
-    # segment (strict less-than), independent of float rounding: with (1,1,10)
-    # on 60 latents the boundaries are exactly 5 and 10.
-    durations = (1.0, 1.0, 10.0)
-    assert select_segment_index(0, 10, 60, 3, durations) == 1
-    assert select_segment_index(1, 9, 60, 3, durations) == 1
-    assert select_segment_index(0, 20, 60, 3, durations) == 2
-    assert select_segment_index(4, 6, 60, 3, durations) == 1
-    assert select_segment_index(3, 6, 60, 3, durations) == 0
-
-
-def test_unreachable_segments_detected_when_segments_outnumber_windows():
-    # This explicit 25/5 policy gives windows [0,25) and [5,30);
-    # both midpoints land in segment 2 of 3, so segments 1 and 3 would vanish.
-    starts = window_starts(30, 25, 5, 0)
-    assert starts == [0, 5]
-    assert unreachable_segments(starts, 25, 30, 3) == [0, 2]
-    # With enough windows every segment is selected somewhere.
-    assert unreachable_segments(window_starts(60, 25, 5, 0), 25, 60, 3) == []
-    assert unreachable_segments(window_starts(30, 25, 5, 0), 25, 30, 1) == []
-
-
 def test_context_plan_reports_work_and_prompt_assignment():
     summary = context_plan_summary(
         total=60,
@@ -476,8 +329,8 @@ def test_context_plan_reports_work_and_prompt_assignment():
         phase=0,
         blend="overlap-linear",
         stagger=True,
-        prompt_count=3,
-        prompt_durations=(2.0, 18.0, 40.0),
+        assignments=[1, 2, 2],
+        frame_cuts=[0, 7, 68, 204],
     )
     assert "windows=3" in summary
     assert "video_latent_visits=1.25x" in summary
@@ -493,6 +346,8 @@ def test_context_plan_reports_work_and_prompt_assignment():
 
 def test_single_window_path_emits_step_zero_context_plan(capsys):
     class Executor:
+        class_obj = object()
+
         def __call__(self, x, timestep, context, transformer_options, **kwargs):
             return x
 
@@ -538,10 +393,10 @@ class _Clip:
 def test_pipe_segments_are_encoded_independently_and_annotated():
     conditioning = encode_pipe_prompt(_Clip(), "short text | a deliberately longer segment")
     context, metadata = conditioning[0]
-    assert tuple(context.shape) == (1, 4, 2)
+    assert tuple(context.shape) == (1, 2, 2)
     assert metadata["h3forge_prompt_segment_count"] == 2
-    assert [tuple(x.shape) for x in metadata["h3forge_prompt_segments"]] == [(1, 4, 2), (1, 4, 2)]
-    assert torch.equal(metadata["minimax_token_tags"], torch.ones(4, dtype=torch.long))
+    assert [tuple(x.shape) for x in metadata["h3forge_prompt_segments"]] == [(1, 2, 2), (1, 4, 2)]
+    assert torch.equal(metadata["minimax_token_tags"], torch.ones(2, dtype=torch.long))
 
 
 def test_pipe_prompt_repeats_global_anchor_and_carries_durations():
@@ -579,7 +434,7 @@ def test_reference_conditioning_segments_retain_shared_native_payload():
 
     combined = combine_conditioning_segments([first, second])
     context, metadata = combined[0]
-    assert tuple(context.shape) == (1, 4, 4)
+    assert tuple(context.shape) == (1, 2, 4)
     assert metadata["minimax_refs"] is first[0][1]["minimax_refs"]
     assert metadata["h3forge_prompt_segment_count"] == 2
     assert torch.equal(metadata["h3forge_prompt_segments"][1], second[0][0])
@@ -608,13 +463,17 @@ def test_segment_contexts_are_carried_through_minimax_payload():
         def get_dtype_inference():
             return torch.float32
 
+    refinements = []
+
     class Diffusion:
         @staticmethod
         def preprocess_text_embeds(context):
+            refinements.append(context)
             return context + 1
 
     def base_extra_conds(**kwargs):
-        return {"minimax_payload": Cond({"seed": kwargs.get("seed", 0)})}
+        return {"minimax_payload": Cond({"seed": kwargs.get("seed", 0)}),
+                "c_crossattn": Cond(torch.ones(1, 3, 2))}
 
     wrapper = make_segmented_extra_conds(base_extra_conds, BaseModel(), Diffusion())
     raw = (torch.zeros(1, 3, 2), torch.ones(1, 3, 2))
@@ -622,10 +481,23 @@ def test_segment_contexts_are_carried_through_minimax_payload():
         device="cpu",
         seed=7,
         h3forge_prompt_segments=raw,
+        h3forge_prompt_segment_tags=(torch.ones(3), torch.ones(3)),
         h3forge_prompt_segment_durations=(2.0, 8.0),
     )
     payload = result["minimax_payload"].cond
     assert payload["seed"] == 7
+    assert len(refinements) == 1 and refinements[0] is raw[1]
+    assert payload["h3forge_prompt_segments"][0] is result["c_crossattn"].cond
     assert torch.equal(payload["h3forge_prompt_segments"][0], torch.ones_like(raw[0]))
     assert torch.equal(payload["h3forge_prompt_segments"][1], torch.full_like(raw[1], 2))
     assert payload["h3forge_prompt_segment_durations"] == (2.0, 8.0)
+
+
+def test_duration_projection_is_scale_invariant(monkeypatch):
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+    expected = segment_ranges(427, 2, (1, 3))
+    for scaled in ((1e307, 3e307), (1e-307, 3e-307)):
+        assert segment_ranges(427, 2, scaled) == expected
+    with pytest.raises(ValueError, match="shorter than"):
+        segment_ranges(10, 3, (0.00001, 1, 1))

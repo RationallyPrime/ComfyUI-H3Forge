@@ -5,9 +5,10 @@ from itertools import pairwise
 
 import torch
 
-from .layout import audio_range_for_video_window, clone_window_layout, expand_audio_range, padded_spatial_shape
-from .prompt import select_segment_index, unreachable_segments
-from .state import resolve_step
+from .control import control_window
+from .layout import audio_range_for_video_window, clone_window_layout, padded_spatial_shape
+from .prompt import segment_ranges
+from .state import require_eager_allocations, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -176,8 +177,9 @@ def context_plan_summary(
     phase: int,
     blend: str = "pyramid",
     stagger: bool = False,
-    prompt_count: int = 0,
-    prompt_durations=None,
+    assignments: list[int] | None = None,
+    frame_cuts: list[int] | None = None,
+    audio_t: int | None = None,
     max_phase: int | None = None,
 ) -> str:
     """Return one compact, truthful account of a context-window pass."""
@@ -198,21 +200,18 @@ def context_plan_summary(
     ]
     if max_phase is not None:
         bits.append(f"max_phase={max_phase}")
-    if prompt_count:
-        assigned = [
-            select_segment_index(start, end, total, prompt_count, prompt_durations) + 1
-            for start, end in ranges
-        ]
+    if assignments:
         runs = []
-        for index in assigned:
-            if runs and runs[-1][0] == index:
+        for index in assignments:
+            if runs and runs[-1][0] == index + 1:
                 runs[-1][1] += 1
             else:
-                runs.append([index, 1])
-        bits.append(
-            "prompt_windows="
-            + ",".join(f"{index}x{count}" for index, count in runs)
-        )
+                runs.append([index + 1, 1])
+        bits.append("prompt_windows=" + ",".join(f"{index}x{count}" for index, count in runs))
+    if frame_cuts is not None:
+        bits.append("prompt_frame_cuts=" + ",".join(map(str, frame_cuts)))
+    if audio_t is not None:
+        bits.append(f"audio_context=full:{audio_t}")
     return " ".join(bits)
 
 
@@ -222,199 +221,124 @@ def _slice_optional_video(mask, v0, v1):
     return mask[:, :, v0:v1]
 
 
-def _slice_optional_audio(mask, a0, a1):
-    if mask is None:
-        return None
-    return mask[..., a0:a1]
+def _segment_windows(total, window, overlap, ranges):
+    """Give every beat forwards and exclusive output ownership on the native grid.
+
+    Windows see neighboring video for continuity, but a beat only contributes
+    predictions inside its own interval. There is no cross-prompt interpolation.
+    """
+    plan = []
+    for index, (lo, hi) in enumerate(ranges):
+        start, stop = max(0, lo - overlap), min(total, hi + overlap)
+        if stop - start < window:
+            start = max(0, min((lo + hi - window) // 2, total - window))
+            stop = start + window
+        for offset in window_starts(stop - start, window, overlap):
+            v0, v1 = start + offset, start + offset + window
+            if max(v0, lo) < min(v1, hi):
+                plan.append((index, v0, v1, max(v0, lo), min(v1, hi)))
+    return plan
 
 
 def make_context_wrapper(policy: ContextPolicy):
-    """Build a ComfyUI DIFFUSION_MODEL wrapper for synchronized overlap-add."""
+    """Window video while every forward sees the complete shared audio timeline."""
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
-        video_x, audio_x = x[0], x[1]
-        total_t = int(video_x.shape[2])
-        payload = dict(kwargs.get("minimax_payload") or {})
-        prompt_segments = payload.get("h3forge_prompt_segments")
-        prompt_durations = payload.get("h3forge_prompt_segment_durations")
+        require_eager_allocations(executor.class_obj)
+        video_x, audio_x = x
+        total_t, audio_t = int(video_x.shape[2]), int(audio_x.shape[-1])
+        payload = kwargs.get("minimax_payload") or {}
+        prompts = payload.get("h3forge_prompt_segments") or (context,)
+        tags = payload.get("h3forge_prompt_segment_tags")
+        segmented = len(prompts) > 1
         step, _ = resolve_step(transformer_options)
-
-        if total_t <= policy.window_frames:
-            if prompt_segments and len(prompt_segments) > 1:
-                message = (
-                    f"{LOG} pipe prompt has {len(prompt_segments)} segments but the whole video fits "
-                    f"one context window ({total_t} <= {policy.window_frames} latents); only segment 1 "
-                    "is used — lengthen the video or shrink window_frames"
-                )
-                if policy.strict:
-                    raise RuntimeError(message)
-                if step in (None, 0):
-                    print(message, flush=True)
+        window = min(total_t, policy.window_frames)
+        overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
+        if total_t <= window and not segmented:
             if step == 0:
-                summary = context_plan_summary(
-                    total_t,
-                    [0],
-                    total_t,
-                    0,
-                    phase=0,
-                    blend=policy.blend,
-                    stagger=False,
-                )
-                if prompt_segments:
-                    # The fast path runs the primary conditioning context
-                    # directly; it does not use midpoint selection.
-                    summary += " prompt_windows=1x1"
-                print(f"{LOG} context plan " + summary, flush=True)
+                print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
+                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
+        model = executor.class_obj
+        padded_h, padded_w = padded_spatial_shape(video_x.shape[3], video_x.shape[4], model.patch_size)
         full_layout = payload.get("layout")
-        try:
-            if full_layout is None:
-                from comfy.ldm.minimax.model import PackedLayout
-                model = executor.class_obj
-                full_layout = PackedLayout(context.shape[1], video_x.shape[2], video_x.shape[3], video_x.shape[4],
-                                           audio_x.shape[-1], keyframes=payload.get("keyframes"),
-                                           refs=payload.get("refs"))
-
-            # Each window is denoised under one hard-selected prompt, so with a
-            # segmented prompt every seam is a prompt boundary: moving it moves
-            # which latents blend segments N and N+1 from step to step, and that
-            # per-latent prompt drift is the morphing this wrapper exists to
-            # prevent. Staggering therefore runs only when every window carries
-            # the same prompt; segmented prompts keep fixed window coverage.
-            segmented = bool(prompt_segments) and len(prompt_segments) > 1
-            stagger = policy.stagger and not segmented
-            if policy.stagger and segmented and step in (None, 0):
-                print(
-                    f"{LOG} stagger pinned off: {len(prompt_segments)} pipe prompt segments need "
-                    "fixed window coverage so no latent changes prompt between steps",
-                    flush=True,
-                )
-            phase = 0
-            max_phase = 0
+        if full_layout is None:
+            from comfy.ldm.minimax.model import PackedLayout
+            full_layout = PackedLayout(max(c.shape[1] for c in prompts), total_t, padded_h, padded_w,
+                                       audio_t, keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+        frame_cuts = None
+        audio_cuts = [0, audio_t]
+        phase = max_phase = 0
+        stagger = policy.stagger and not segmented
+        if segmented:
+            ranges, frame_cuts = segment_ranges(total_t, len(prompts), payload.get("h3forge_prompt_segment_durations"))
+            # H3 audio has 40 ticks per 24 decoded frames. Shared cuts give each
+            # audio tick exactly one prompt owner, including a seam-crossing line.
+            audio_cuts = [round(frame * 5 / 3) for frame in frame_cuts]
+            audio_cuts[-1] = audio_t
+            plan = _segment_windows(total_t, window, overlap, ranges)
+        else:
             if stagger:
-                max_phase = max_stagger_phase(policy.window_frames, policy.overlap_frames)
-                if step is not None:
-                    phase = stagger_phase(step, policy.window_frames, policy.overlap_frames)
-            starts = window_starts(total_t, policy.window_frames, policy.overlap_frames, phase, max_phase)
-            segment_indices: list[int] = []
-            if prompt_segments:
-                segment_indices = [
-                    select_segment_index(v0, min(v0 + policy.window_frames, total_t), total_t,
-                                         len(prompt_segments), prompt_durations)
-                    for v0 in starts
-                ]
-                missing = unreachable_segments(
-                    starts, policy.window_frames, total_t, len(prompt_segments), prompt_durations)
-                if missing:
-                    message = (
-                        f"{LOG} pipe prompt segments {[m + 1 for m in missing]} are never selected by any "
-                        f"context window ({len(prompt_segments)} segments across {len(starts)} windows); "
-                        "use fewer segments or a smaller window_frames"
-                    )
-                    if policy.strict:
-                        raise RuntimeError(message)
-                    if step in (None, 0):
-                        print(message, flush=True)
-            raw_audio_ranges = [audio_range_for_video_window(full_layout, v0, min(v0 + policy.window_frames, total_t))
-                                for v0 in starts]
-            # H3's 40 Hz grid makes 80-video-latent windows carry about 454--455
-            # audio latents. Expand all of them to the longest interval so the
-            # compiled attention shape stays constant within the forward.
-            target_audio_t = max(a1 - a0 for a0, a1 in raw_audio_ranges)
-            audio_ranges = [expand_audio_range(r, audio_x.shape[-1], target_audio_t)
-                            for r in raw_audio_ranges]
-            model = executor.class_obj
-            padded_h, padded_w = padded_spatial_shape(video_x.shape[3], video_x.shape[4], model.patch_size)
+                max_phase = max_stagger_phase(window, overlap)
+                phase = stagger_phase(step, window, overlap) if step is not None else 0
+            starts = window_starts(total_t, window, overlap, phase, max_phase)
+            plan = [(0, v0, v0 + window, v0, v0 + window) for v0 in starts]
+        if step == 0:
+            print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
+                  phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
+                  assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t),
+                  flush=True)
 
-            if step == 0:
-                print(
-                    f"{LOG} context plan " + context_plan_summary(
-                        total_t,
-                        starts,
-                        policy.window_frames,
-                        policy.overlap_frames,
-                        phase=phase,
-                        blend=policy.blend,
-                        stagger=stagger,
-                        prompt_count=len(prompt_segments) if prompt_segments else 0,
-                        prompt_durations=prompt_durations,
-                        max_phase=max_phase,
-                    ),
-                    flush=True,
-                )
-
-            video_acc = torch.zeros_like(video_x)
-            video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
-            audio_acc = torch.zeros_like(audio_x)
-            audio_den = torch.zeros((1, 1, 1, audio_x.shape[-1]), device=audio_x.device, dtype=torch.float32)
-
-            for index, (v0, (a0, a1)) in enumerate(zip(starts, audio_ranges)):
-                v1 = min(v0 + policy.window_frames, total_t)
-                local_context = context
-                if prompt_segments:
-                    # Hard per-window selection: contextualized token slots from
-                    # different prompts do not correspond, so windows never mix
-                    # hidden states — boundary crossfade happens in output space
-                    # through the overlap-add, at seams that never move.
-                    local_context = prompt_segments[segment_indices[index]]
-                local_layout = clone_window_layout(
-                    full_layout=full_layout,
-                    text_len=local_context.shape[1],
-                    # MiniMax pads before validating payload["layout"]. Build the
-                    # transplanted layout from those post-pad H/W dimensions so
-                    # upstream cannot silently discard it on odd latent shapes.
-                    video_shape=(v1 - v0, padded_h, padded_w),
-                    audio_t=audio_x.shape[-1],
-                    video_range=(v0, v1),
-                    audio_range=(a0, a1),
-                    keyframes=payload.get("keyframes"), refs=payload.get("refs"),
-                )
-                local_payload = dict(payload)
-                local_payload["layout"] = local_layout
-                local_kwargs = dict(kwargs)
-                local_kwargs["minimax_payload"] = local_payload
-                local_kwargs["denoise_mask"] = _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)
-                local_kwargs["audio_denoise_mask"] = _slice_optional_audio(kwargs.get("audio_denoise_mask"), a0, a1)
-
-                local_x = [video_x[:, :, v0:v1], audio_x[..., a0:a1]]
-                sentinel = object()
-                previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
-                transformer_options["h3forge_active_layout"] = local_layout
-                try:
+        video_acc = torch.zeros_like(video_x, dtype=torch.float32)
+        audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
+        video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
+        audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
+        for index, v0, v1, write_v0, write_v1 in plan:
+            local_context = prompts[index]
+            local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
+                video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
+                video_range=(v0, v1), audio_range=(0, audio_t),
+                keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+            local_payload = {**payload, "layout": local_layout}
+            if tags is not None:
+                local_payload["text_token_tags"] = tags[index]
+            local_kwargs = {**kwargs, "minimax_payload": local_payload,
+                            "denoise_mask": _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)}
+            # The global audio input and denoise mask travel intact. Only the
+            # output projection is local, so all windows can see prior utterances.
+            local_x = [video_x[:, :, v0:v1], audio_x]
+            sentinel = object()
+            previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
+            transformer_options["h3forge_active_layout"] = local_layout
+            try:
+                with control_window(executor, video_x.shape, (v0, v1), timestep, transformer_options):
                     v_out, a_out = executor(local_x, timestep, local_context, transformer_options, **local_kwargs)
-                finally:
-                    if previous_layout is sentinel:
-                        transformer_options.pop("h3forge_active_layout", None)
-                    else:
-                        transformer_options["h3forge_active_layout"] = previous_layout
+            except Exception as exc:
+                raise RuntimeError(f"{LOG} window [{v0},{v1}) prompt {index + 1} failed: {exc}") from exc
+            finally:
+                if previous_layout is sentinel:
+                    transformer_options.pop("h3forge_active_layout", None)
+                else:
+                    transformer_options["h3forge_active_layout"] = previous_layout
 
-                vw = blend_weights(v1 - v0, policy.overlap_frames, device=v_out.device,
-                                   dtype=torch.float32, mode=policy.blend,
-                                   ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-                # Audio overlap is induced by the physical-time mapping, so use a
-                # proportionate ramp rather than blindly copying video indices.
-                audio_overlap = audio_overlap_frames(policy.overlap_frames, v1 - v0, a1 - a0)
-                aw = blend_weights(a1 - a0, audio_overlap, device=a_out.device,
-                                   dtype=torch.float32, mode=policy.blend,
-                                   ramp_start=a0 > 0, ramp_end=a1 < audio_x.shape[-1]).view(1, 1, 1, -1)
+            vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
+                               ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
+            keep = slice(write_v0 - v0, write_v1 - v0)
+            video_acc[:, :, write_v0:write_v1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
+            video_den[:, :, write_v0:write_v1].add_(vw[:, :, keep])
 
-                video_acc[:, :, v0:v1].add_(v_out * vw.to(v_out.dtype))
-                video_den[:, :, v0:v1].add_(vw)
-                audio_acc[..., a0:a1].add_(a_out * aw.to(a_out.dtype))
-                audio_den[..., a0:a1].add_(aw)
+            a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
+            write_a0, write_a1 = max(a0, audio_cuts[index]), min(a1, audio_cuts[index + 1])
+            aw = blend_weights(a1 - a0, audio_overlap_frames(overlap, v1 - v0, a1 - a0),
+                               device=a_out.device, dtype=torch.float32, mode=policy.blend,
+                               ramp_start=a0 > 0, ramp_end=a1 < audio_t).view(1, 1, 1, -1)
+            aw = aw[..., write_a0 - a0:write_a1 - a0]
+            audio_acc[..., write_a0:write_a1].add_(a_out[..., write_a0:write_a1].float() * aw)
+            audio_den[..., write_a0:write_a1].add_(aw)
 
-            if policy.strict:
-                assert_full_coverage(video_den, audio_den)
-            video_out = video_acc / video_den.clamp_min(1e-6).to(video_acc.dtype)
-            audio_out = audio_acc / audio_den.clamp_min(1e-6).to(audio_acc.dtype)
-            return [video_out, audio_out]
-        except Exception as exc:
-            if policy.strict:
-                raise RuntimeError(f"{LOG} context windowing failed: {type(exc).__name__}: {exc}") from exc
-            print(
-                f"{LOG} context windowing declined ({type(exc).__name__}: {exc}); dense full-context forward",
-                flush=True,
-            )
-            return executor(x, timestep, context, transformer_options, **kwargs)
+        if policy.strict:
+            assert_full_coverage(video_den, audio_den)
+        return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
+                (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
     return wrapper

@@ -9,10 +9,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: 250b2e9551a7bc7a8ebb5beb07e0fecd2983e04a
+          path: .comfy-core
+          sparse-checkout: |
+            comfy
+            comfy_extras
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - run: pip install "torch>=2.8,<2.9" "pytest>=8,<9" "ruff>=0.12,<0.13"
-      - run: ruff check .
+      - run: ruff check h3forge tests __init__.py .github/scripts
       - run: PYTHONPATH=. pytest -q
-      - run: python -m compileall -q .
+        env:
+          H3FORGE_COMFY_SOURCE: ${{ github.workspace }}/.comfy-core
+      - run: python -m compileall -q h3forge tests __init__.py

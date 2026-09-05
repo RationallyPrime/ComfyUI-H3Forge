@@ -11,9 +11,8 @@ from .nag import apply_nag
 LOG = "[H3Forge]"
 _COMPILED_FLEX_CACHE: dict = {}
 _COMPILED_FLEX_CACHE_LIMIT = 8
-# Private flex_attention copies whose runners were evicted, Dynamo state already
-# reset. A cache miss takes one of these before minting another, so this module
-# never holds more than _COMPILED_FLEX_CACHE_LIMIT + 1 code objects.
+# Keep one reset kernel ready for reuse. Active runs retain their working
+# shapes; between runs the module retains at most cache limit + 1 kernels.
 _RELEASED_KERNELS: list = []
 
 
@@ -72,7 +71,17 @@ def _release_runner(runner):
     from torch._dynamo import reset_code
 
     reset_code(runner.kernel.__code__)
-    _RELEASED_KERNELS.append(runner.kernel)
+    if not _RELEASED_KERNELS:
+        _RELEASED_KERNELS.append(runner.kernel)
+
+
+def prune_run_caches(state):
+    """Keep an active run's working shapes; trim retained caches between runs."""
+    while len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
+        _release_runner(_COMPILED_FLEX_CACHE.pop(next(iter(_COMPILED_FLEX_CACHE))))
+    while len(state.mask_cache) > state.mask_cache_limit:
+        state.mask_cache.popitem(last=False)
+        state.mask_evictions += 1
 
 
 def _unwrap(x):
@@ -90,6 +99,8 @@ def _can_sparse(state, q, kwargs):
     p = state.policy
     if p.mode != "flex_sliding":
         return "mode=dense"
+    if state.block_index is None:
+        return "not-dit-block"
     if state.layout is None:
         return "no-layout"
     if q.ndim != 4 or q.shape[0] != 1:
@@ -100,8 +111,6 @@ def _can_sparse(state, q, kwargs):
         return "preexisting-mask"
     if not kwargs.get("skip_reshape", False):
         return "not-bhsd"
-    if state.block_index is None:
-        return "not-dit-block"
     if state.block_index < p.first_dense_layers:
         return "first-dense-layers"
     if state.step_index is not None and state.total_steps:
@@ -156,7 +165,7 @@ def _mask_specialization(state):
     )
 
 
-def _make_block_mask(state, q, *, device):
+def _make_block_mask(state, q, *, device, negative_text_len=None):
     from torch.nn.attention.flex_attention import create_block_mask
 
     layout = state.layout
@@ -168,7 +177,7 @@ def _make_block_mask(state, q, *, device):
     video_offset = int(getattr(layout, "_h3forge_video_offset", 0))
     audio_offset = int(getattr(layout, "_h3forge_audio_offset", 0))
     # Each concrete BlockMask is one specialization plus one pair of offsets.
-    key = (str(device), _mask_specialization(state), video_offset, audio_offset)
+    key = (str(device), _mask_specialization(state), video_offset, audio_offset, negative_text_len)
     cached = state.mask_cache.get(key)
     if cached is not None:
         state.mask_cache.move_to_end(key)
@@ -231,20 +240,43 @@ def _make_block_mask(state, q, *, device):
             allow = allow | bridge
         return allow
 
+    kv_len = layout.seq_len
+    if negative_text_len is not None:
+        from .nag import text_segment
+
+        text_start, text_stop = text_segment(layout)
+        if text_start != 0:
+            raise ValueError("native H3 text must lead the packed stream")
+        base_mask = mask_mod
+        kv_len += negative_text_len - text_stop
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            mapped = torch.where(kv_idx < negative_text_len, 0, kv_idx + text_stop - negative_text_len)
+            return base_mask(b, h, q_idx, mapped)
+
     # mask_mod is head-independent. H=None builds one broadcastable block mask
     # rather than duplicating eager work across all 56 H3 heads. Compiling mask
     # construction avoids materializing the eager [B,H,Q,K] boolean grid.
-    block_mask = create_block_mask(mask_mod, B=1, H=None,
-                                   Q_LEN=layout.seq_len, KV_LEN=layout.seq_len,
-                                   device=device, _compile=True)
+    # Native-length prompts also vary the builder's shape. Torch's _compile=True
+    # path compiles one shared create_block_mask code object and spends its
+    # recompile budget across those lengths. A private, single-use code object
+    # cannot fall through that budget into an eager SxS allocation.
+    from torch._dynamo import reset_code
+
+    builder = _with_private_code(create_block_mask)
+    try:
+        block_mask = torch.compile(builder, dynamic=False, fullgraph=True)(
+            mask_mod, B=1, H=None, Q_LEN=layout.seq_len, KV_LEN=kv_len, device=device)
+    finally:
+        reset_code(builder.__code__)
     state.mask_cache[key] = block_mask
     state.mask_cache.move_to_end(key)
-    while len(state.mask_cache) > state.mask_cache_limit:
+    while not state.in_run and len(state.mask_cache) > state.mask_cache_limit:
         state.mask_cache.popitem(last=False)
         state.mask_evictions += 1
     return block_mask
 
-def _run_flex(state, q, k, v):
+def _run_flex(state, q, k, v, negative_text_len=None):
     from torch.nn.attention.flex_attention import flex_attention
 
     # H3 arrives BHSD; flex_attention consumes BHSD directly. Fixed-shape
@@ -259,7 +291,7 @@ def _run_flex(state, q, k, v):
     # specialization and never approaches that budget.
     shape = (str(q.device), q.dtype, int(q.shape[0]), int(q.shape[1]), int(q.shape[2]), int(q.shape[3]))
     spec = _mask_specialization(state)
-    key = (shape, spec)
+    key = (shape, spec, negative_text_len)
     runner = _COMPILED_FLEX_CACHE.pop(key, None)
     if runner is None:
         print(f"{LOG} compiling flex_attention runner for (device, dtype, B, H, S, D)={shape} "
@@ -270,9 +302,9 @@ def _run_flex(state, q, k, v):
     # sweeping durations/resolutions must not accumulate runners forever, and
     # an evicted runner gives its Dynamo state back (see _release_runner).
     _COMPILED_FLEX_CACHE[key] = runner
-    while len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
+    while not state.in_run and len(_COMPILED_FLEX_CACHE) > _COMPILED_FLEX_CACHE_LIMIT:
         _release_runner(_COMPILED_FLEX_CACHE.pop(next(iter(_COMPILED_FLEX_CACHE))))
-    mask = _make_block_mask(state, q, device=q.device)
+    mask = _make_block_mask(state, q, device=q.device, negative_text_len=negative_text_len)
     return runner.run(q, k, v, block_mask=mask)
 
 
@@ -345,10 +377,12 @@ def make_attention_override(state):
             state.layout = active_layout
         reason = _can_sparse(state, q, kwargs)
         skip_output_reshape = bool(kwargs.get("skip_output_reshape", False))
+        sparse_active = False
 
         if reason is None:
             try:
                 raw = _run_flex(state, q, k, v)
+                sparse_active = True
                 state.sparse_calls += 1
                 if skip_output_reshape:
                     out = raw
@@ -361,15 +395,25 @@ def make_attention_override(state):
                 state.dense_calls += 1
                 out = _dense(func, q, k, v, heads, args, kwargs)
         else:
+            if state.policy.strict and reason not in {
+                "mode=dense", "not-dit-block", "first-dense-layers", "first-dense-steps",
+            }:
+                raise RuntimeError(f"{LOG} sparse attention contract declined: {reason}")
             state.note_decline(reason)
             state.dense_calls += 1
             out = _dense(func, q, k, v, heads, args, kwargs)
 
         nag_input = out
         if state.nag is not None:
+            def packed_attention(qn, kn, vn, negative_text_len):
+                if sparse_active:
+                    return _run_flex(state, qn, kn, vn, negative_text_len=negative_text_len)
+                return _dense(func, qn, kn, vn, heads, args, {**kwargs, "skip_output_reshape": True})
+
             try:
                 out = apply_nag(state, q, k, v, out, skip_output_reshape=skip_output_reshape,
-                                transformer_options=options, attn_mask=kwargs.get("mask"))
+                                transformer_options=options, attn_mask=kwargs.get("mask"),
+                                packed_attention=packed_attention)
             except Exception as exc:
                 if state.nag.strict or state.policy.strict:
                     raise RuntimeError(f"{LOG} NAG failed: {type(exc).__name__}: {exc}") from exc

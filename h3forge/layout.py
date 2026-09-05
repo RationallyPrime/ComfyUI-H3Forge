@@ -25,21 +25,6 @@ def padded_spatial_shape(height: int, width: int, patch_size: tuple[int, int, in
             (int(width) + pw - 1) // pw * pw)
 
 
-def expand_audio_range(audio_range: tuple[int, int], total: int, target_length: int) -> tuple[int, int]:
-    """Expand a valid audio interval to a constant length while preserving it."""
-    a0, a1 = map(int, audio_range)
-    total, target_length = int(total), int(target_length)
-    if not (0 <= a0 < a1 <= total):
-        raise ValueError(f"invalid audio range {audio_range} for total={total}")
-    if not (a1 - a0 <= target_length <= total):
-        raise ValueError(f"cannot expand {audio_range} to {target_length} within total={total}")
-    spare = target_length - (a1 - a0)
-    left = min(a0, spare // 2)
-    right = min(total - a1, spare - left)
-    left += spare - left - right
-    return a0 - left, a1 + right
-
-
 def target_segments(layout) -> TargetSegments:
     audio = [s for s in layout.segments if s[2] == "audio"]
     video = [s for s in layout.segments if s[2] == "video"]
@@ -93,6 +78,16 @@ def clone_window_layout(
         raise ValueError(f"local PackedLayout signature {local.signature} != expected {expected_signature}")
     src = target_segments(full_layout)
     dst = target_segments(local)
+    # Independently refined text has native per-segment lengths. Preserve the
+    # shared refs/keyframes at the template's origin without inserting fake
+    # text rows in the local stream.
+    for (fa, fb, fk), (la, lb, lk) in zip(full_layout.segments, local.segments):
+        if fk != lk:
+            raise ValueError("window reference structure differs from the full layout")
+        if fk not in ("text", "audio", "video"):
+            if fb - fa != lb - la:
+                raise ValueError("window reference row count differs from the full layout")
+            local.position_ids[la:lb] = full_layout.position_ids[fa:fb]
 
     full_t, frame_rows = video_shape_from_layout(full_layout)
     if v1 > full_t:
