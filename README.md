@@ -68,7 +68,9 @@ For every denoising step it:
 5. evaluates H3 jointly and projects each prediction onto the video's local interval and its matching audio interval;
 6. accumulates and normalizes predictions in FP32 before returning the model dtype.
 
-A single prompt can stagger interior boundaries using ordered-halving phases. Multi-segment prompts have fixed, exclusive output intervals on the native video-token grid; their windows include neighboring video for context, but only write predictions into the assigned interval. This prevents one beat from disappearing merely because no old window midpoint selected it.
+Interior boundaries stagger using bounded ordered-halving phases. Multi-segment prompts follow `segment_seams`. The default, `blend`, is the WanVideoWrapper and ComfyUI-core arrangement: the same uniform staggered windows, each carrying the prompt of the beat it mostly covers, with neighbouring windows overlap-blending across the beat boundary like any other overlap. A prompt change is therefore a ramp about one overlap wide that moves from step to step. A beat shorter than the stride, which no window mostly covers, still gets one window centred on it that writes only inside the beat, so every prompt reaches the model on every step. `exclusive` keeps the earlier behaviour: every beat owns a fixed output interval on the native video-token grid, windows include neighbouring video for context but write only inside their beat, and nothing is blended across the boundary. That is a hard cut at the same latent on every denoising step, which is exactly what a visible seam at a prompt change looks like; keep it for A/B comparison.
+
+`freenoise` applies FreeNoise to the video noise before sampling: every latent frame past the first window is a seeded permutation of the frames one window earlier, so all windows draw from one noise pool and agree more in their overlaps. Audio noise is not shuffled; audio is generated with its complete timeline visible to every window, and periodic audio noise would invite periodic audio.
 
 Native Fun ControlNet composes on either side of the context node: its complete control latent is prepared once and sliced by each global video interval. Forge preserves existing block-hook dependencies and keeps base-model NAG/FETA out of the control network's attention.
 
@@ -87,7 +89,7 @@ Segments are separated by the node's `delimiter`, which defaults to `|` so exist
 
 Each segment keeps its native token length and is refined independently. No zero-padding tokens enter the refiner or DiT. Reference and target positions use one common timeline origin, even when the text lengths differ. Native lengths may require additional compiled shapes after a prompt edit.
 
-Durations are projected to the nearest boundary of H3's `1,4,4,4,4` decoded-frame cadence. Every representable segment gets model evaluations and exclusive video/audio output ownership. The step-zero plan reports the actual `prompt_frame_cuts`; a sub-grid segment raises before the first denoiser forward. Windows can include neighboring video for context while contributing output only inside their assigned beat. Predictions from different prompts are not blended across the boundary.
+Durations are projected to the nearest boundary of H3's `1,4,4,4,4` decoded-frame cadence. Every representable segment gets model evaluations under its own prompt on every step. The step-zero plan reports the actual `prompt_frame_cuts` and `seams` mode; a sub-grid segment raises before the first denoiser forward. With the default `segment_seams=blend`, neighbouring windows blend across a beat boundary, so the prompt change is a ramp rather than a cut; with `exclusive`, windows write only inside their assigned beat and predictions from different prompts are never blended.
 
 This controls conditioning on the native latent grid. A frame-perfect editorial cut between independently generated shots belongs in the video edit; a diffusion model and temporal VAE do not guarantee a photographic hard cut just because the conditioning changes.
 
@@ -237,8 +239,12 @@ window_frames   25
 overlap_frames  8
 stagger         true
 blend           pyramid
+segment_seams   blend
+freenoise       true
 strict          true
 ```
+
+For a pipe prompt, A/B `segment_seams=exclusive` and `freenoise=false` against the defaults with a fixed seed; the seam at each prompt change is the thing to compare.
 
 Look specifically for:
 
@@ -297,12 +303,18 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 : Requested minimum video-latent overlap before staggering; the node default is `8` for a `25`-latent window. Audio overlap is derived from physical H3 time rather than copied index-for-index.
 
 `stagger`
-: Moves interior windows for single-prompt runs using bounded ordered-halving phases. The first and last windows remain anchored and the requested overlap remains covered. Multi-segment output ownership stays fixed; its context plan reports `stagger=off`.
+: Moves interior windows using bounded ordered-halving phases. The first and last windows remain anchored and the requested overlap remains covered. Applies to single prompts and to `segment_seams=blend`; `exclusive` output ownership stays fixed and its context plan reports `stagger=off`.
 
 `blend`
 : `pyramid` applies weights `1,2,...,peak,...,2,1` across each complete window before normalized overlap-add. `overlap-linear` preserves H3Forge's former Kijai-style edge ramp, including first/last boundary handling. `flat` gives every covered prediction equal weight.
 
 Existing saved workflows whose blend is `pyramid` intentionally acquire the new full-window triangle. Select `overlap-linear` to retain the former H3Forge weighting.
+
+`segment_seams`
+: How pipe-prompt boundaries are handled. `blend` (default): uniform staggered windows each carry the prompt of the beat they mostly cover and overlap-blend across the boundary; a beat shorter than the stride gets one window of its own that writes only inside the beat. `exclusive`: every beat writes only its own interval, a hard cut at the same latent on every step. Existing saved workflows acquire `blend`; select `exclusive` to retain the former behaviour.
+
+`freenoise`
+: FreeNoise shuffle of the video noise on the window grid before sampling, seeded from the sampler seed. Off leaves the sampler's noise untouched. Audio noise is never shuffled.
 
 ### Timeline prompt
 
