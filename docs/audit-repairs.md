@@ -73,6 +73,7 @@ lifetime changes; their separate source archive hash is recorded explicitly.
 | Continuous seam-crossing sentence | Completed; the full sentence was transcribed once from 1.92–6.58 s, spanning the full 3.542–5.875 s overlap region. |
 | 481-frame / 20.042 s continuous take | Completed with two 80/10 windows and all 802 audio ticks visible to both. “This one is finished.” appears once at 7.28–8.70 s; no further speech was recognized through the end. The second video window begins at 8.708 s. |
 | One segment with an image and verified spoken-audio reference | Completed: 124 frames / 5.167 s, two 25/8 windows. Generated the new line “The edge is ready.” once at 3.30–4.62 s. |
+| Seam A/B, three equal beats, 396 frames / 16.5 s, three 50/10 windows, dense attention, seed 12345 (2026-09-15) | Frame-to-frame mean absolute difference (0–255, 168×96 grayscale) at the two beat cuts, frames 132 and 264. `segment_seams=exclusive`, `freenoise=off`: peaks 73.2 and 40.2, 51× and 479× the local median, the clip's two largest spikes by far. `blend`, `freenoise=off`: 1.7 and 0.8 at the cuts, 1.3× and 1.1× local median, clip max 3.9. `blend`, `freenoise=on`: 1.5 and 0.4, 1.3× and 0.9×, clip max 1.8 and p95 1.24 against 2.29 without FreeNoise. The one spike common to all three, frame 321 at about 0.7, is content. |
 
 All nine retained acceptance files contain the expected 672×384 video-frame count
 and a 32 kHz audio stream. ASR uses Faster Whisper `base.en`, CPU int8, beam size
