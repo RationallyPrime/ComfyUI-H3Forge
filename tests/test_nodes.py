@@ -14,6 +14,7 @@ def _import_nodes(monkeypatch):
     class WrappersMP:
         OUTER_SAMPLE = "outer"
         DIFFUSION_MODEL = "diffusion"
+        SAMPLER_SAMPLE = "sampler_sample"
 
     patcher_extension.WrappersMP = WrappersMP
     comfy.patcher_extension = patcher_extension
@@ -89,6 +90,38 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
     assert required["overlap_frames"][1]["default"] == 8
     assert required["blend"][0] == ["pyramid", "overlap-linear", "flat"]
     assert required["blend"][1]["default"] == "pyramid"
+    assert required["segment_seams"][0] == ["blend", "exclusive"]
+    assert required["segment_seams"][1]["default"] == "blend"
+    assert required["freenoise"][1]["default"] is True
+
+
+def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(monkeypatch):
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+
+    class MinimalPatcher:
+        model = object()
+
+        def __init__(self):
+            self.wrappers = []
+
+        def clone(self):
+            return self
+
+        def get_model_object(self, name):
+            return lambda **kwargs: {}
+
+        def add_object_patch(self, name, value):
+            pass
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            self.wrappers.append((kind, key))
+
+    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", False)
+    assert ("sampler_sample", nodes.CTX_KEY) in patched.wrappers
+    assert ("diffusion", nodes.CTX_KEY) in patched.wrappers
+    with pytest.raises(ValueError, match="segment_seams"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", False, segment_seams="soft")
 
 
 @pytest.mark.parametrize("stride", [1, 2])
@@ -122,7 +155,7 @@ def test_context_node_allows_small_stride_when_stagger_is_off(monkeypatch):
 
         @staticmethod
         def add_wrapper_with_key(kind, key, wrapper):
-            assert kind == "diffusion"
+            assert kind in ("diffusion", "sampler_sample")
             assert key == nodes.CTX_KEY
             assert callable(wrapper)
 

@@ -125,7 +125,7 @@ def test_every_beat_owns_its_video_and_audio_output(total, window, durations, ca
         calls.append((int(text[0, 0, 0]), text.shape[1]))
         return [torch.full_like(t, float(text[0, 0, 0])) for t in local_x]
 
-    result = make_context_wrapper(ContextPolicy(window, 10, True, "pyramid", True))(
+    result = make_context_wrapper(ContextPolicy(window, 10, True, "pyramid", True, segment_seams="exclusive"))(
         _executor(run), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
     ranges, cuts = segment_ranges(total, 3, durations)
@@ -136,7 +136,63 @@ def test_every_beat_owns_its_video_and_audio_output(total, window, durations, ca
         assert torch.all(result[1][..., audio_cuts[index]:audio_cuts[index + 1]] == index + 1)
     assert set(calls) == {(1, 3), (2, 19), (3, 5)}
     log = capsys.readouterr().out
-    assert "stagger=off" in log and "prompt_frame_cuts=" in log and "audio_context=full:" in log
+    assert "stagger=off" in log and "seams=exclusive" in log
+    assert "prompt_frame_cuts=" in log and "audio_context=full:" in log
+
+
+def _prompt_valued_run(x, calls):
+    def run(local_x, timestep, text, options, **kwargs):
+        assert local_x[1] is x[1]
+        calls.append(int(text[0, 0, 0]))
+        return [torch.full_like(t, float(text[0, 0, 0])) for t in local_x]
+    return run
+
+
+def test_blended_seams_ramp_between_prompts_and_stagger(capsys):
+    from h3forge.layout import audio_range_for_video_window
+    total, window, overlap = 67, 25, 8
+    x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
+    calls = []
+    options = {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}
+    result = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", True))(
+        _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context, options, minimax_payload=payload)
+    # Phase-0 windows start at 0, 14, 28, 42 and mostly cover beats 1, 2, 2, 3 of [0,23) [23,44) [44,67).
+    assert calls == [1, 2, 2, 3]
+    video = result[0][0, 0, :, 0, 0]
+    assert torch.all(video[:14] == 1) and torch.all(video[25:42] == 2) and torch.all(video[53:] == 3)
+    assert torch.all((video[14:25] > 1) & (video[14:25] < 2))  # prompt 1 -> 2 is a ramp, not a cut
+    assert torch.all((video[42:53] > 2) & (video[42:53] < 3))
+    layout = payload["layout"]
+    audio = result[1][0, 0, 0]
+    assert torch.all(audio[:audio_range_for_video_window(layout, 14, 39)[0]] == 1)
+    assert torch.all(audio[audio_range_for_video_window(layout, 28, 53)[1]:] == 3)
+    assert not torch.all(audio == audio.round())  # the audio seam is blended too
+    log = capsys.readouterr().out
+    assert "stagger=on" in log and "seams=blend" in log and "prompt_windows=1x1,2x2,3x1" in log
+
+    # A later step moves the seams: the same graph, one sampler step further on.
+    calls.clear()
+    options = {"sigmas": torch.tensor([0.5]), "sample_sigmas": torch.tensor([1., 0.5, 0.])}
+    shifted = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", True))(
+        _executor(_prompt_valued_run(x, calls)), x, torch.tensor([500]), context, options, minimax_payload=payload)
+    assert not torch.equal(shifted[0], result[0])
+
+
+def test_blended_seams_rescue_beats_inside_a_single_window():
+    total = 17
+    x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
+    calls = []
+    result = make_context_wrapper(ContextPolicy(25, 10, True, "pyramid", True))(
+        _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context,
+        {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
+    ranges, _ = segment_ranges(total, 3)
+    # One clip-wide window carries the majority beat (beat 1 on a tie); beats 2 and 3
+    # each get a rescue window that writes only inside its own interval.
+    assert calls == [1, 2, 3]
+    video = result[0][0, 0, :, 0, 0]
+    assert torch.all(video[ranges[0][0]:ranges[0][1]] == 1)
+    assert torch.all((video[ranges[1][0]:ranges[1][1]] > 1) & (video[ranges[1][0]:ranges[1][1]] < 2))
+    assert torch.all((video[ranges[2][0]:ranges[2][1]] > 1) & (video[ranges[2][0]:ranges[2][1]] < 3))
 
 
 def test_window_failure_never_retries_full_clip():

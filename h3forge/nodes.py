@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
-from .context import ContextPolicy, make_context_wrapper
+from .context import SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
 from .prompt import (
@@ -296,6 +296,20 @@ class H3ForgeContextWindows:
             "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
             "stagger": ("BOOLEAN", {"default": True}),
             "blend": (["pyramid", "overlap-linear", "flat"], {"default": "pyramid"}),
+            "segment_seams": (list(SEGMENT_SEAMS), {
+                "default": "blend",
+                "tooltip": (
+                    "Pipe-prompt boundaries. blend: uniform staggered windows each carry the prompt of the "
+                    "beat they mostly cover and overlap-blend across the boundary (WanVideoWrapper style); "
+                    "a beat shorter than the stride still gets one window of its own. exclusive: every beat "
+                    "writes only its own interval, a hard cut at the same latent on every step."
+                ),
+            }),
+            "freenoise": ("BOOLEAN", {
+                "default": True,
+                "tooltip": "FreeNoise: later video windows start from a seeded shuffle of the first window's "
+                           "noise so windows agree in their overlaps. Audio noise is left untouched.",
+            }),
             "strict": ("BOOLEAN", {"default": False}),
         }}
 
@@ -304,14 +318,19 @@ class H3ForgeContextWindows:
     CATEGORY = "model_patches/context"
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
-    def patch(self, model, window_frames, overlap_frames, stagger, blend, strict):
+    def patch(self, model, window_frames, overlap_frames, stagger, blend, strict,
+              segment_seams="blend", freenoise=True):
         diffusion = _require_h3(model)
         if overlap_frames >= window_frames:
             raise ValueError("overlap_frames must be smaller than window_frames")
         if stagger and window_frames - overlap_frames < 3:
             raise ValueError("stagger requires a window stride of at least 3")
-        policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
-                               stagger=stagger, blend=blend, strict=strict)
+        try:
+            policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
+                                   stagger=stagger, blend=blend, strict=strict,
+                                   segment_seams=segment_seams, freenoise=freenoise)
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
         patched = model.clone()
         base_model = patched.model
         base_extra_conds = patched.get_model_object("extra_conds")
@@ -320,6 +339,7 @@ class H3ForgeContextWindows:
             make_segmented_extra_conds(base_extra_conds, base_model, diffusion),
         )
         patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
+        patched.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, CTX_KEY, make_freenoise_wrapper(policy))
         return (patched,)
 
 
