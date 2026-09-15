@@ -253,12 +253,15 @@ def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=
     shorter than the stride) still gets one window centred on it, writing only
     inside the beat, so every prompt reaches the model on every step.
     """
-    plan = []
-    for v0 in window_starts(total, window, overlap, phase, max_phase):
-        plan.append((_beat_for_window(v0, v0 + window, ranges), v0, v0 + window, v0, v0 + window))
-    assigned = {entry[0] for entry in plan}
+    # Prompt assignment and rescue membership come from the phase-0 plan and are
+    # reused by window ordinal: a phase moves a seam, it must not flip a window
+    # to another prompt or make a rescue window appear on some steps only.
+    anchors = window_starts(total, window, overlap, 0, max_phase)
+    assignments = [_beat_for_window(v0, v0 + window, ranges) for v0 in anchors]
+    plan = [(index, v0, v0 + window, v0, v0 + window)
+            for index, v0 in zip(assignments, window_starts(total, window, overlap, phase, max_phase))]
     for index, (lo, hi) in enumerate(ranges):
-        if index in assigned:
+        if index in assignments:
             continue
         v0 = min(max((lo + hi - window) // 2, 0), total - window)
         plan.append((index, v0, v0 + window, max(v0, lo), min(v0 + window, hi)))
@@ -287,24 +290,27 @@ def _segment_windows(total, window, overlap, ranges):
     return plan
 
 
-def apply_freenoise(noise: torch.Tensor, dim: int, window: int, overlap: int, seed: int) -> torch.Tensor:
-    """FreeNoise shuffle in place: later windows draw from the first window's noise pool.
+def apply_freenoise(noise: torch.Tensor, dim: int, starts: list[int], window: int, seed: int) -> torch.Tensor:
+    """FreeNoise shuffle in place on the actual window plan.
 
-    Every frame past the first window is a seeded permutation of the frames one
-    window earlier (FreeNoise, as carried by AnimateDiff-Evolved, WanVideoWrapper
-    and ComfyUI core). Windows that start from correlated noise agree more in
-    their overlaps, and a seam is exactly where two windows disagree.
+    For each adjacent pair of windows, the frames the later window adds beyond
+    the earlier one are a seeded permutation of the frames the earlier window
+    holds ahead of the later one (FreeNoise, as carried by AnimateDiff-Evolved,
+    WanVideoWrapper and ComfyUI core, which all walk a nominal stride). Walking
+    the real starts instead keeps the shared noise pool on the seams the
+    denoiser uses when the clip is not a multiple of the stride. Windows that
+    start from correlated noise agree more in their overlaps, and a seam is
+    exactly where two windows disagree.
     """
-    if window < 2 or not 0 <= overlap < window:
-        raise ValueError(f"freenoise needs 2 <= window and 0 <= overlap < window, got {window}/{overlap}")
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
     length = int(noise.shape[dim])
-    stride = window - overlap
-    for start in range(0, length - window, stride):
+    if window < 1 or any(b <= a for a, b in pairwise(starts)) or starts[0] < 0 or starts[-1] + window > length:
+        raise ValueError(f"freenoise needs increasing starts inside [0, {length - window}], got {starts}")
+    generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    for start, following in pairwise(starts):
         place = start + window
-        count = min(stride, length - place)
+        count = min(following - start, length - place)
         if count <= 0:
-            break
+            continue
         order = torch.randperm(count, generator=generator) + start
         source = noise.index_select(dim, order.to(noise.device))
         noise.narrow(dim, place, count).copy_(source)
@@ -335,11 +341,14 @@ def make_freenoise_wrapper(policy: ContextPolicy):
             window = min(policy.window_frames, video_t)
             if video_t > window:
                 overlap = min(policy.overlap_frames, window - 1)
+                max_phase = max_stagger_phase(window, overlap) if policy.stagger else 0
+                # The phase-0 anchor plan the context wrapper derives every phase from.
+                starts = window_starts(video_t, window, overlap, 0, max_phase)
                 seed = int(extra_args.get("seed", 0)) if isinstance(extra_args, dict) else 0
                 parts = _split_packed_latent(noise, shapes)
-                parts[0] = apply_freenoise(parts[0].clone(), 2, window, overlap, seed)
+                parts[0] = apply_freenoise(parts[0].clone(), 2, starts, window, seed)
                 noise = torch.cat([part.reshape(part.shape[0], 1, -1) for part in parts], dim=-1)
-                print(f"{LOG} freenoise video_latents={video_t} window/overlap={window}/{overlap} seed={seed}",
+                print(f"{LOG} freenoise video_latents={video_t} window={window} starts={starts} seed={seed}",
                       flush=True)
         return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
 

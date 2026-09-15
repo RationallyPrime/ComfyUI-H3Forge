@@ -529,7 +529,27 @@ def test_blended_segment_windows_assign_by_majority_and_rescue_short_beats(monke
     assert {p[0] for p in shifted} == {0, 1, 2}
 
 
-def test_freenoise_later_frames_are_permutations_of_earlier_frames():
+def test_blended_assignments_are_frozen_across_stagger_phases():
+    from h3forge.context import _blended_segment_windows, max_stagger_phase
+    total, window, overlap = 427, 80, 10
+    # A beat boundary near a window midpoint: at phase 0 the window at 69 covers
+    # beat 2 by a hair; a phase would tip it to beat 3 if assignment followed it.
+    ranges = [(0, 40), (40, 109), (109, 427)]
+    max_phase = max_stagger_phase(window, overlap)
+    base = _blended_segment_windows(total, window, overlap, ranges, 0, max_phase)
+    base_regular = [p for p in base if (p[3], p[4]) == (p[1], p[2])]
+    base_rescue = [p for p in base if (p[3], p[4]) != (p[1], p[2])]
+    assert [p[0] for p in base_regular][:2] == [0, 1]
+    for phase in range(max_phase + 1):
+        plan = _blended_segment_windows(total, window, overlap, ranges, phase, max_phase)
+        regular = [p for p in plan if (p[3], p[4]) == (p[1], p[2])]
+        rescue = [p for p in plan if (p[3], p[4]) != (p[1], p[2])]
+        assert [p[0] for p in regular] == [p[0] for p in base_regular]
+        assert rescue == base_rescue
+        assert len(plan) == len(base)
+
+
+def test_freenoise_follows_the_actual_window_starts():
     from h3forge.context import apply_freenoise
     original = torch.randn(1, 4, 30, 2, 2)
     noise = original.clone()
@@ -537,15 +557,20 @@ def test_freenoise_later_frames_are_permutations_of_earlier_frames():
     def rows(t):
         return {tuple(t[:, :, i].flatten().tolist()) for i in range(t.shape[2])}
 
-    assert apply_freenoise(noise, 2, 12, 2, seed=7) is noise
+    # 30 latents, window 12, overlap 2: the real plan is 0, 10, 18, not a nominal 0, 10, 20.
+    starts = window_starts(30, 12, 2)
+    assert starts == [0, 10, 18]
+    assert apply_freenoise(noise, 2, starts, 12, seed=7) is noise
     assert torch.equal(noise[:, :, :12], original[:, :, :12])
-    # stride 10: frames 12..22 come from 0..10, frames 22..30 from the (already shuffled) 10..18
+    # window 2 adds frames 12..22 beyond window 1: a permutation of window 1's lead 0..10;
+    # window 3 adds 22..30: a permutation of window 2's (already shuffled) lead 10..18.
     assert rows(noise[:, :, 12:22]) == rows(original[:, :, 0:10])
     assert rows(noise[:, :, 22:30]) == rows(noise[:, :, 10:18])
-    assert torch.equal(apply_freenoise(original.clone(), 2, 12, 2, seed=7), noise)
-    assert not torch.equal(apply_freenoise(original.clone(), 2, 12, 2, seed=8), noise)
-    with pytest.raises(ValueError):
-        apply_freenoise(original.clone(), 2, 12, 12, seed=0)
+    assert torch.equal(apply_freenoise(original.clone(), 2, starts, 12, seed=7), noise)
+    assert not torch.equal(apply_freenoise(original.clone(), 2, starts, 12, seed=8), noise)
+    for bad in ([0, 0, 18], [0, 19], [-1, 9, 18]):
+        with pytest.raises(ValueError):
+            apply_freenoise(original.clone(), 2, bad, 12, seed=0)
 
 
 def test_freenoise_wrapper_shuffles_video_only_and_only_when_windowed():
