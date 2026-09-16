@@ -117,11 +117,11 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
         def add_wrapper_with_key(self, kind, key, wrapper):
             self.wrappers.append((kind, key))
 
-    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", False)
+    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid")
     assert ("sampler_sample", nodes.CTX_KEY) in patched.wrappers
     assert ("diffusion", nodes.CTX_KEY) in patched.wrappers
     with pytest.raises(ValueError, match="segment_seams"):
-        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", False, segment_seams="soft")
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
 
 
 @pytest.mark.parametrize("stride", [1, 2])
@@ -130,7 +130,7 @@ def test_context_node_rejects_too_small_a_stride_for_stagger(monkeypatch, stride
     monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
     with pytest.raises(ValueError, match="stride of at least 3"):
         nodes.H3ForgeContextWindows().patch(
-            object(), 25, 25 - stride, True, "pyramid", False,
+            object(), 25, 25 - stride, True, "pyramid",
         )
 
 
@@ -162,10 +162,10 @@ def test_context_node_allows_small_stride_when_stagger_is_off(monkeypatch):
     monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
     model = MinimalPatcher()
     assert nodes.H3ForgeContextWindows().patch(
-        model, 25, 23, False, "pyramid", False,
+        model, 25, 23, False, "pyramid",
     ) == (model,)
     assert nodes.H3ForgeContextWindows().patch(
-        model, 25, 22, True, "pyramid", False,
+        model, 25, 22, True, "pyramid",
     ) == (model,)
 
 

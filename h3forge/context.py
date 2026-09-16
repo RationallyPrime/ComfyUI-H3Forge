@@ -22,7 +22,6 @@ class ContextPolicy:
     overlap_frames: int = 8
     stagger: bool = True
     blend: str = "pyramid"
-    strict: bool = False
     segment_seams: str = "blend"
     freenoise: bool = True
 
@@ -169,7 +168,7 @@ def audio_overlap_frames(overlap_frames: int, video_len: int, audio_len: int) ->
 
 
 def assert_full_coverage(video_den: torch.Tensor, audio_den: torch.Tensor) -> None:
-    """Strict-mode gate: every target element must carry positive blend weight."""
+    """Every target element must carry positive blend weight after the overlap-add."""
     if not bool((video_den > 0).all()):
         raise RuntimeError("context windows left video latents with zero accumulated blend weight")
     if not bool((audio_den > 0).all()):
@@ -462,8 +461,9 @@ def make_context_wrapper(policy: ContextPolicy):
             audio_acc[..., write_a0:write_a1].add_(a_out[..., write_a0:write_a1].float() * aw)
             audio_den[..., write_a0:write_a1].add_(aw)
 
-        if policy.strict:
-            assert_full_coverage(video_den, audio_den)
+        # Unconditional: a zero-weight latent would otherwise divide by the clamp
+        # floor and decode as a silent black smear. The check is one comparison.
+        assert_full_coverage(video_den, audio_den)
         return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
                 (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 

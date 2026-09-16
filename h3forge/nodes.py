@@ -310,7 +310,6 @@ class H3ForgeContextWindows:
                 "tooltip": "FreeNoise: later video windows start from a seeded shuffle of the first window's "
                            "noise so windows agree in their overlaps. Audio noise is left untouched.",
             }),
-            "strict": ("BOOLEAN", {"default": False}),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -318,7 +317,7 @@ class H3ForgeContextWindows:
     CATEGORY = "model_patches/context"
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
-    def patch(self, model, window_frames, overlap_frames, stagger, blend, strict,
+    def patch(self, model, window_frames, overlap_frames, stagger, blend,
               segment_seams="blend", freenoise=True):
         diffusion = _require_h3(model)
         if overlap_frames >= window_frames:
@@ -327,7 +326,7 @@ class H3ForgeContextWindows:
             raise ValueError("stagger requires a window stride of at least 3")
         try:
             policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
-                                   stagger=stagger, blend=blend, strict=strict,
+                                   stagger=stagger, blend=blend,
                                    segment_seams=segment_seams, freenoise=freenoise)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc

@@ -241,7 +241,6 @@ stagger         true
 blend           pyramid
 segment_seams   blend
 freenoise       true
-strict          true
 ```
 
 For a pipe prompt, A/B `segment_seams=exclusive` and `freenoise=false` against the defaults with a fixed seed; the seam at each prompt change is the thing to compare.
@@ -349,7 +348,7 @@ Existing saved workflows whose blend is `pyramid` intentionally acquire the new 
 - **Do not stack `SolAttnH3` and H3Forge attention/NAG nodes on the same model.** Both own `optimized_attention_override`; H3Forge prints a warning if it replaces an existing override. Choose SolAttn or H3Forge for a given run.
 - H3Forge Context Windows *can* be used without H3Forge Attention.
 - FETA can be tested with `mode=dense`.
-- `strict=true` is recommended for development / first GPU tests. Non-strict attention permits dense fallback. A context execution error always aborts instead of retrying a different whole-clip job.
+- `strict=true` on the attention and NAG nodes is recommended for development / first GPU tests. Non-strict attention permits dense fallback. The context node has no strict switch: a window failure or a latent left without blend weight always aborts.
 - This is inference experimentation, not a claim that MiniMax trained H3 with this exact sparse topology.
 - MiniMax describes native sparse-attention training, while the released ComfyUI inference path is dense. Start from the one-second default and treat shorter windows as an explicit quality/speed sweep.
 

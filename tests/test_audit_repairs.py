@@ -125,7 +125,7 @@ def test_every_beat_owns_its_video_and_audio_output(total, window, durations, ca
         calls.append((int(text[0, 0, 0]), text.shape[1]))
         return [torch.full_like(t, float(text[0, 0, 0])) for t in local_x]
 
-    result = make_context_wrapper(ContextPolicy(window, 10, True, "pyramid", True, segment_seams="exclusive"))(
+    result = make_context_wrapper(ContextPolicy(window, 10, True, "pyramid", segment_seams="exclusive"))(
         _executor(run), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
     ranges, cuts = segment_ranges(total, 3, durations)
@@ -154,7 +154,7 @@ def test_blended_seams_ramp_between_prompts_and_stagger(capsys):
     x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
     calls = []
     options = {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}
-    result = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", True))(
+    result = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
         _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context, options, minimax_payload=payload)
     # Phase-0 windows start at 0, 14, 28, 42 and mostly cover beats 1, 2, 2, 3 of [0,23) [23,44) [44,67).
     assert calls == [1, 2, 2, 3]
@@ -173,7 +173,7 @@ def test_blended_seams_ramp_between_prompts_and_stagger(capsys):
     # A later step moves the seams: the same graph, one sampler step further on.
     calls.clear()
     options = {"sigmas": torch.tensor([0.5]), "sample_sigmas": torch.tensor([1., 0.5, 0.])}
-    shifted = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", True))(
+    shifted = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
         _executor(_prompt_valued_run(x, calls)), x, torch.tensor([500]), context, options, minimax_payload=payload)
     assert not torch.equal(shifted[0], result[0])
 
@@ -182,7 +182,7 @@ def test_blended_seams_rescue_beats_inside_a_single_window():
     total = 17
     x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
     calls = []
-    result = make_context_wrapper(ContextPolicy(25, 10, True, "pyramid", True))(
+    result = make_context_wrapper(ContextPolicy(25, 10, True, "pyramid"))(
         _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
     ranges, _ = segment_ranges(total, 3)
@@ -202,7 +202,7 @@ def test_window_failure_never_retries_full_clip():
         calls.append(local_x[0].shape[2])
         raise RuntimeError("model failure")
     with pytest.raises(RuntimeError, match="window .*model failure"):
-        make_context_wrapper(ContextPolicy(25, 8, False, "pyramid", False))(
+        make_context_wrapper(ContextPolicy(25, 8, False, "pyramid"))(
             _executor(fail), x, None, context, {}, minimax_payload=payload)
     assert calls == [25]
 
@@ -214,7 +214,7 @@ def test_fusion_preserves_identical_predictions(dtype, total, window, overlap, v
     x, context, payload = _context_inputs(total, dtype)
     def predict(local_x, *args, **kwargs):
         return [torch.full_like(t, value) for t in local_x]
-    out = make_context_wrapper(ContextPolicy(window, overlap, False, "pyramid", True))(
+    out = make_context_wrapper(ContextPolicy(window, overlap, False, "pyramid"))(
         _executor(predict), x, None, context, {}, minimax_payload=payload)
     for stream in out:
         assert stream.dtype == dtype and torch.all(stream == value)
@@ -267,7 +267,7 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
         seen.append(start)
         return local_x
 
-    window = make_context_wrapper(ContextPolicy(25, 8, False, "pyramid", True))
+    window = make_context_wrapper(ContextPolicy(25, 8, False, "pyramid"))
     wrappers = [patch.diffusion_model_wrapper, window] if control_first else [window, patch.diffusion_model_wrapper]
     executor.new_class_executor(forward, SimpleNamespace(patch_size=(1, 2, 2)), wrappers).execute(
         x, torch.tensor([700.]), context, {"sigmas": torch.tensor([.7])}, minimax_payload=payload)
