@@ -249,23 +249,45 @@ def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=
     the beat boundary exactly like any other overlap, so a prompt change is a
     ramp about one overlap wide that staggering moves from step to step rather
     than a cut fixed at one latent. A beat that no window mostly covers (one
-    shorter than the stride) still gets one window centred on it, writing only
-    inside the beat, so every prompt reaches the model on every step.
+    shorter than the stride) still gets one window centred on it that owns the
+    beat outright: it writes only inside the beat, and the regular windows do
+    not write there, so the beat is that prompt's alone rather than a mixture
+    with whichever prompt the covering window carries. Every prompt therefore
+    reaches the model on every step. With a single regular window this reduces
+    to exclusive ownership for every beat, since there is no overlap to blend.
+
+    Returns ``(index, v0, v1, w0, w1, excluded)`` entries: ``excluded`` names
+    the rescued beats carved out of a regular window's write range.
     """
     # Prompt assignment and rescue membership come from the phase-0 plan and are
     # reused by window ordinal: a phase moves a seam, it must not flip a window
     # to another prompt or make a rescue window appear on some steps only.
     anchors = window_starts(total, window, overlap, 0, max_phase)
     assignments = [_beat_for_window(v0, v0 + window, ranges) for v0 in anchors]
-    plan = [(index, v0, v0 + window, v0, v0 + window)
+    rescued = tuple(index for index in range(len(ranges)) if index not in assignments)
+    plan = [(index, v0, v0 + window, v0, v0 + window, rescued)
             for index, v0 in zip(assignments, window_starts(total, window, overlap, phase, max_phase))]
-    for index, (lo, hi) in enumerate(ranges):
-        if index in assignments:
-            continue
+    for index in rescued:
+        lo, hi = ranges[index]
         v0 = min(max((lo + hi - window) // 2, 0), total - window)
-        plan.append((index, v0, v0 + window, max(v0, lo), min(v0 + window, hi)))
+        plan.append((index, v0, v0 + window, max(v0, lo), min(v0 + window, hi), ()))
     plan.sort(key=lambda entry: (entry[1], entry[0]))
     return plan
+
+
+def _subtract_intervals(start, stop, holes):
+    """Half-open ``[start, stop)`` minus every ``(a, b)`` in ``holes``, in order."""
+    pieces = []
+    cursor = start
+    for a, b in sorted(holes):
+        if b <= cursor or a >= stop:
+            continue
+        if a > cursor:
+            pieces.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < stop:
+        pieces.append((cursor, stop))
+    return pieces
 
 
 def _segment_windows(total, window, overlap, ranges):
@@ -285,7 +307,7 @@ def _segment_windows(total, window, overlap, ranges):
         for offset in window_starts(stop - start, window, overlap):
             v0, v1 = start + offset, start + offset + window
             if max(v0, lo) < min(v1, hi):
-                plan.append((index, v0, v1, max(v0, lo), min(v1, hi)))
+                plan.append((index, v0, v1, max(v0, lo), min(v1, hi), ()))
     return plan
 
 
@@ -381,6 +403,7 @@ def make_context_wrapper(policy: ContextPolicy):
             full_layout = PackedLayout(max(c.shape[1] for c in prompts), total_t, padded_h, padded_w,
                                        audio_t, keyframes=payload.get("keyframes"), refs=payload.get("refs"))
         frame_cuts = None
+        ranges = []
         audio_cuts = [0, audio_t]
         phase = max_phase = 0
         blended = policy.segment_seams == "blend"
@@ -400,11 +423,13 @@ def make_context_wrapper(policy: ContextPolicy):
                 plan = _segment_windows(total_t, window, overlap, ranges)
         else:
             starts = window_starts(total_t, window, overlap, phase, max_phase)
-            plan = [(0, v0, v0 + window, v0, v0 + window) for v0 in starts]
+            plan = [(0, v0, v0 + window, v0, v0 + window, ()) for v0 in starts]
         # A window whose write interval is narrower than its extent owns that
         # interval: its audio is clipped to the beat's ticks as well. Windows that
-        # write their whole extent blend audio over the window's own ticks.
-        plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended) for index, v0, v1, w0, w1 in plan]
+        # write their whole extent blend audio over the window's own ticks, minus
+        # any rescued beat, which its own window owns in both streams.
+        plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended, excluded)
+                for index, v0, v1, w0, w1, excluded in plan]
         if step == 0:
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
@@ -416,7 +441,7 @@ def make_context_wrapper(policy: ContextPolicy):
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned in plan:
+        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
             local_context = prompts[index]
             local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
                 video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
@@ -446,9 +471,10 @@ def make_context_wrapper(policy: ContextPolicy):
 
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            keep = slice(write_v0 - v0, write_v1 - v0)
-            video_acc[:, :, write_v0:write_v1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
-            video_den[:, :, write_v0:write_v1].add_(vw[:, :, keep])
+            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+                keep = slice(w0 - v0, w1 - v0)
+                video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
+                video_den[:, :, w0:w1].add_(vw[:, :, keep])
 
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             write_a0, write_a1 = a0, a1
@@ -457,9 +483,10 @@ def make_context_wrapper(policy: ContextPolicy):
             aw = blend_weights(a1 - a0, audio_overlap_frames(overlap, v1 - v0, a1 - a0),
                                device=a_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=a0 > 0, ramp_end=a1 < audio_t).view(1, 1, 1, -1)
-            aw = aw[..., write_a0 - a0:write_a1 - a0]
-            audio_acc[..., write_a0:write_a1].add_(a_out[..., write_a0:write_a1].float() * aw)
-            audio_den[..., write_a0:write_a1].add_(aw)
+            holes = [(audio_cuts[b], audio_cuts[b + 1]) for b in excluded]
+            for w0, w1 in _subtract_intervals(write_a0, write_a1, holes):
+                audio_acc[..., w0:w1].add_(a_out[..., w0:w1].float() * aw[..., w0 - a0:w1 - a0])
+                audio_den[..., w0:w1].add_(aw[..., w0 - a0:w1 - a0])
 
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.

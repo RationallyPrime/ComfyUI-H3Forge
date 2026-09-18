@@ -222,7 +222,7 @@ def test_segmented_windows_cover_every_beat_without_midpoint_selection(monkeypat
     assert {p[0] for p in plan} == set(range(6))
     for index, (start, stop) in enumerate(ranges):
         covered = set()
-        for segment, _, _, lo, hi in plan:
+        for segment, _, _, lo, hi, _ in plan:
             if segment == index:
                 covered.update(range(lo, hi))
         assert covered == set(range(start, stop))
@@ -518,9 +518,11 @@ def test_blended_segment_windows_assign_by_majority_and_rescue_short_beats(monke
     # The short first beat is mostly covered by no window, so it gets exactly one
     # window of its own that writes only inside the beat.
     assert [(p[0], p[3], p[4]) for p in rescue] == [(0, ranges[0][0], ranges[0][1])]
-    for index, v0, v1, _, _ in regular:
+    for index, v0, v1, _, _, excluded in regular:
         shared = [min(v1, hi) - max(v0, lo) for lo, hi in ranges]
         assert shared[index] == max(shared)
+        assert excluded == (0,)  # every regular window carves out the rescued first beat
+    assert all(p[5] == () for p in rescue)
     assert plan == sorted(plan, key=lambda p: (p[1], p[0]))
     max_phase = max_stagger_phase(window, overlap)
     shifted = _blended_segment_windows(total, window, overlap, ranges, max_phase, max_phase)
@@ -540,6 +542,7 @@ def test_blended_assignments_are_frozen_across_stagger_phases():
     base_regular = [p for p in base if (p[3], p[4]) == (p[1], p[2])]
     base_rescue = [p for p in base if (p[3], p[4]) != (p[1], p[2])]
     assert [p[0] for p in base_regular][:2] == [0, 1]
+    assert all(p[5] == () for p in base)  # every beat is mostly covered: nothing rescued
     for phase in range(max_phase + 1):
         plan = _blended_segment_windows(total, window, overlap, ranges, phase, max_phase)
         regular = [p for p in plan if (p[3], p[4]) == (p[1], p[2])]
@@ -600,3 +603,61 @@ def test_freenoise_wrapper_shuffles_video_only_and_only_when_windowed():
                    ContextPolicy(window_frames=12, overlap_frames=2, freenoise=False)):
         make_freenoise_wrapper(policy)(executor, guider, None, {"seed": 3}, None, packed)
         assert seen["noise"] is packed
+
+
+@pytest.mark.parametrize("seconds,latents,count,window,overlap", [
+    (5, 37, 1, 37, 0), (15, 107, 1, 107, 0), (16, 117, 2, 65, 13), (20, 142, 2, 80, 13),
+    (30, 217, 3, 85, 13), (60, 427, 5, 100, 13), (120, 852, 10, 100, 13),
+])
+def test_timeline_plan_prefers_few_even_cadence_aligned_windows(seconds, latents, count, window, overlap):
+    from h3forge.timeline import plan_for_seconds
+    plan = plan_for_seconds(seconds)
+    assert (plan.latent_t, plan.count, plan.window, plan.overlap) == (latents, count, window, overlap)
+    assert plan.windowed == (count > 1)
+    if plan.windowed:
+        assert plan.window % 5 == 0 and plan.window <= 107
+        assert len(window_starts(plan.latent_t, plan.window, plan.overlap)) == plan.count
+
+
+@pytest.mark.parametrize("cap", [15, 23, 40, 61, 107, 129])
+@pytest.mark.parametrize("latent_t", [2, 7, 37, 112, 427, 1062])
+def test_timeline_plan_matches_the_real_planner_for_any_cap(cap, latent_t):
+    from h3forge.timeline import plan_windows
+    plan = plan_windows(latent_t, cap)
+    if latent_t <= cap:
+        assert plan == plan.__class__(latent_t, latent_t, 0, 1)
+        return
+    assert plan.window <= cap and plan.window - plan.overlap >= 3 and 8 <= plan.overlap <= 16
+    assert len(window_starts(latent_t, plan.window, plan.overlap)) == plan.count
+
+
+def test_timeline_rejects_unplannable_inputs():
+    from h3forge.timeline import frames_for_seconds, plan_for_seconds, plan_windows
+    assert frames_for_seconds(5.0) == 124 and frames_for_seconds(0.01) == 5
+    assert frames_for_seconds(5.17) == 141  # 124.08 frames snaps up, never down to a shorter clip
+    assert frames_for_seconds(124 / 24) == 124  # an exact grid duration stays put
+    with pytest.raises(ValueError):
+        plan_windows(100, 14)
+    with pytest.raises(ValueError):
+        plan_for_seconds(0)
+    with pytest.raises(ValueError):
+        plan_for_seconds(10, float("inf"))
+
+
+def test_cap_seconds_never_admits_a_longer_window_than_requested():
+    from h3forge.timeline import MIN_CAP, MIN_CAP_SECONDS, cap_latents_for_seconds, plan_for_seconds
+    assert cap_latents_for_seconds(15.5) == 107
+    assert cap_latents_for_seconds(15.07) == 102  # 361.68 frames floors below the 362 grid point
+    assert cap_latents_for_seconds(MIN_CAP_SECONDS) >= MIN_CAP
+    plan = plan_for_seconds(8.5, 4.5)
+    assert (plan.window, plan.count) == (30, 3) and plan.window * 17 / 5 / 24 <= 4.5
+    assert plan_for_seconds(1.0, MIN_CAP_SECONDS).windowed is False
+
+
+def test_subtract_intervals_carves_holes_in_order():
+    from h3forge.context import _subtract_intervals
+    assert _subtract_intervals(0, 10, []) == [(0, 10)]
+    assert _subtract_intervals(0, 10, [(3, 5)]) == [(0, 3), (5, 10)]
+    assert _subtract_intervals(0, 10, [(7, 12), (0, 2)]) == [(2, 7)]
+    assert _subtract_intervals(4, 6, [(0, 10)]) == []
+    assert _subtract_intervals(0, 10, [(2, 4), (3, 6)]) == [(0, 2), (6, 10)]

@@ -325,3 +325,66 @@ def test_reference_pipe_node_prepares_native_refs_once(monkeypatch):
     assert conditioning[0][1]["minimax_refs"] is shared
     assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2, 8)
     assert latent == {"samples": "native-latent"}
+
+
+@pytest.mark.parametrize("seconds,windows,window,overlap,latents", [(20.0, 2, 80, 13, 142), (5.0, 1, 37, 0, 37)])
+def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, capsys, seconds, windows, window,
+                                                                  overlap, latents):
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    core = types.ModuleType("comfy_extras.nodes_minimax_h3")
+    allocations = []
+
+    def _empty_av_latent(width, height, length):
+        frames = length
+        while frames % 17 != 5:
+            frames += 1
+        allocations.append((width, height, length, frames))
+        return {"samples": f"latent-{frames}"}, frames
+
+    core._empty_av_latent = _empty_av_latent
+    monkeypatch.setitem(sys.modules, "comfy_extras", types.ModuleType("comfy_extras"))
+    monkeypatch.setitem(sys.modules, "comfy_extras.nodes_minimax_h3", core)
+    policies = []
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy) or "ctx")
+    monkeypatch.setattr(nodes, "make_freenoise_wrapper", lambda policy: "noise")
+
+    class MinimalPatcher:
+        model = object()
+
+        def __init__(self):
+            self.wrappers = []
+
+        def clone(self):
+            return self
+
+        def get_model_object(self, name):
+            return lambda **kwargs: {}
+
+        def add_object_patch(self, name, value):
+            pass
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            self.wrappers.append((kind, key, wrapper))
+
+    patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
+        MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
+    assert nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["required"]["max_window_seconds"][1]["min"] == 2.5
+    frames = allocations[0][3]
+    assert allocations == [(1344, 768, frames, frames)]
+    assert latent == {"samples": f"latent-{frames}"}
+    assert (frames - 5) // 17 * 5 + 2 == latents
+    policy, = policies
+    assert (policy.window_frames, policy.overlap_frames) == (window, overlap)
+    assert policy.stagger == (windows > 1)
+    assert ("sampler_sample", nodes.CTX_KEY, "noise") in patched.wrappers
+    log = capsys.readouterr().out
+    assert f"-> {latents} latents" in log
+    assert (f"{windows} windows of {window}/{overlap}" in log) if windows > 1 else ("unwindowed" in log)
+
+    # A wrong model is rejected before any latent is allocated.
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: (_ for _ in ()).throw(ValueError("not H3")))
+    allocations.clear()
+    with pytest.raises(ValueError, match="not H3"):
+        nodes.H3ForgeTimelineContextWindows().patch(MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
+    assert allocations == []

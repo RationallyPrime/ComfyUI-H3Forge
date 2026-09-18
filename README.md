@@ -68,13 +68,29 @@ For every denoising step it:
 5. evaluates H3 jointly and projects each prediction onto the video's local interval and its matching audio interval;
 6. accumulates and normalizes predictions in FP32 before returning the model dtype.
 
-Interior boundaries stagger using bounded ordered-halving phases. Multi-segment prompts follow `segment_seams`. The default, `blend`, is the WanVideoWrapper and ComfyUI-core arrangement: the same uniform staggered windows, each carrying the prompt of the beat it mostly covers, with neighbouring windows overlap-blending across the beat boundary like any other overlap. A prompt change is therefore a ramp about one overlap wide that moves from step to step. A beat shorter than the stride, which no window mostly covers, still gets one window centred on it that writes only inside the beat, so every prompt reaches the model on every step. `exclusive` keeps the earlier behaviour: every beat owns a fixed output interval on the native video-token grid, windows include neighbouring video for context but write only inside their beat, and nothing is blended across the boundary. That is a hard cut at the same latent on every denoising step, which is exactly what a visible seam at a prompt change looks like; keep it for A/B comparison.
+Interior boundaries stagger using bounded ordered-halving phases. Multi-segment prompts follow `segment_seams`. The default, `blend`, is the WanVideoWrapper and ComfyUI-core arrangement: the same uniform staggered windows, each carrying the prompt of the beat it mostly covers, with neighbouring windows overlap-blending across the beat boundary like any other overlap. A prompt change is therefore a ramp about one overlap wide that moves from step to step. A beat shorter than the stride, which no window mostly covers, still gets one window centred on it that owns the beat outright: it writes only inside the beat and the regular windows do not write there, in video or audio, so every prompt reaches the model on every step and a short beat is its own prompt rather than a mixture. With a single regular window, as on a short clip, that reduces to exclusive ownership of every beat. `exclusive` keeps the earlier behaviour: every beat owns a fixed output interval on the native video-token grid, windows include neighbouring video for context but write only inside their beat, and nothing is blended across the boundary. That is a hard cut at the same latent on every denoising step, which is exactly what a visible seam at a prompt change looks like; keep it for A/B comparison.
 
 `freenoise` applies FreeNoise to the video noise before sampling: every latent frame past the first window is a seeded permutation of the frames one window earlier, so all windows draw from one noise pool and agree more in their overlaps. Audio noise is not shuffled; audio is generated with its complete timeline visible to every window, and periodic audio noise would invite periodic audio.
 
 Native Fun ControlNet composes on either side of the context node: its complete control latent is prepared once and sliced by each global video interval. Forge preserves existing block-hook dependencies and keeps base-model NAG/FETA out of the control network's attention.
 
 Absolute positions matter: a window beginning at latent 26 must retain that global frame's native cadence. Full audio visibility does not make an unlimited-memory model; reference size, audio length, and decoded output continue to consume resources.
+
+### H3 Forge — Timeline Context Windows
+
+The chained node asks for a window and an overlap in latents, and the default `25` is a leftover from the first sub-50 GB Blackwell receipt: a 3.5-second window, well short of the 5 to 15 seconds H3 was trained on, and 25 windows for a 60-second clip. This node takes width, height and a duration in seconds instead. It allocates the empty AV latent exactly as `Empty MiniMax H3 AV Latent` does, snapping to the `17k + 5` frame grid, and derives the window plan from the resulting latent length before installing the same context and FreeNoise wrappers. It returns `MODEL` and `LATENT`, so it replaces the native empty-latent node in a text-to-video graph. Stagger, blend, seams and FreeNoise are the same inputs with the same defaults.
+
+The plan: the fewest windows whose size stays under `max_window_seconds`, rounded down to the frame grid so a ceiling is a ceiling; the default `15.5` admits exactly 362 frames, the top of H3's trained range; overlap at 12 % of the cap clamped to 8–16 latents; the clip spread evenly across that count and rounded up to the 5-latent cadence, so every window is the same size and none is larger than the count requires. That, not the cap, is what bounds peak VRAM. A clip that fits in one window runs unwindowed; a pipe prompt on such a clip still gives every beat its own window and exclusive output. Lower `max_window_seconds` on a card that runs out of memory; the node prints the plan it chose.
+
+| Duration | Latents | Windows | Window / overlap |
+| --- | --- | --- | --- |
+| 10 s | 72 | 1 | unwindowed |
+| 20 s | 142 | 2 | 80 / 13 |
+| 30 s | 217 | 3 | 85 / 13 |
+| 60 s | 427 | 5 | 100 / 13 |
+| 120 s | 852 | 10 | 100 / 13 |
+
+The policy is fixed at node time from the latent the node made. If a different latent reaches the sampler, the wrapper clamps the window to whatever length arrives, the same as the manual node.
 
 ### H3 Forge — Pipe Timeline Prompt
 
@@ -149,15 +165,16 @@ git clone https://github.com/RationallyPrime/ComfyUI-H3Forge.git
 
 or place the extracted `ComfyUI-H3Forge/` directory there, then restart ComfyUI.
 
-Five nodes should appear:
+Six nodes should appear:
 
 - `H3 Forge — Sliding Attention + FETA`
 - `H3 Forge — Chained A/V Context Windows`
+- `H3 Forge — Timeline Context Windows`
 - `H3 Forge — Pipe Timeline Prompt`
 - `H3 Forge — Reference Pipe Timeline Prompt`
 - `H3 Forge — Normalized Attention Guidance` (experimental)
 
-The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the appropriate VAEs and image, video, or audio references, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
+The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. The timeline context node also returns the empty AV `LATENT`, replacing `Empty MiniMax H3 AV Latent` in a text-to-video graph. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the appropriate VAEs and image, video, or audio references, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
 
 For the recommended feed-forward memory reduction, also install [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes):
 
@@ -359,7 +376,7 @@ Kijai's KJNodes ships several native-H3 utilities. Only the feed-forward chunker
 ```text
 selected H3 model
   → MiniMax H3 Chunk FeedForward
-  → H3 Forge — Chained A/V Context Windows
+  → H3 Forge — Chained A/V Context Windows   (or Timeline Context Windows, which also emits the latent)
   → H3 Forge — Sliding Attention + FETA
   → scheduler and guider
 ```

@@ -185,14 +185,36 @@ def test_blended_seams_rescue_beats_inside_a_single_window():
     result = make_context_wrapper(ContextPolicy(25, 10, True, "pyramid"))(
         _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
-    ranges, _ = segment_ranges(total, 3)
+    ranges, cuts = segment_ranges(total, 3)
     # One clip-wide window carries the majority beat (beat 1 on a tie); beats 2 and 3
-    # each get a rescue window that writes only inside its own interval.
+    # each get a rescue window that owns its interval outright, in video and audio,
+    # so a short clip with a pipe prompt is not a mixture with the majority prompt.
     assert calls == [1, 2, 3]
     video = result[0][0, 0, :, 0, 0]
-    assert torch.all(video[ranges[0][0]:ranges[0][1]] == 1)
-    assert torch.all((video[ranges[1][0]:ranges[1][1]] > 1) & (video[ranges[1][0]:ranges[1][1]] < 2))
-    assert torch.all((video[ranges[2][0]:ranges[2][1]] > 1) & (video[ranges[2][0]:ranges[2][1]] < 3))
+    audio_cuts = [round(f * 5 / 3) for f in cuts]
+    audio_cuts[-1] = x[1].shape[-1]
+    for index, (lo, hi) in enumerate(ranges):
+        assert torch.all(video[lo:hi] == index + 1)
+        assert torch.all(result[1][..., audio_cuts[index]:audio_cuts[index + 1]] == index + 1)
+
+
+def test_blended_rescue_beat_is_owned_inside_a_multi_window_plan():
+    total, window, overlap = 427, 80, 10
+    x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
+    payload["h3forge_prompt_segment_durations"] = (2, 18, 40)
+    calls = []
+    result = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
+        _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context,
+        {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
+    ranges, cuts = segment_ranges(total, 3, (2, 18, 40))
+    assert ranges[0][1] - ranges[0][0] < window - overlap  # beat 1 is shorter than the stride: rescued
+    video = result[0][0, 0, :, 0, 0]
+    lo, hi = ranges[0]
+    assert torch.all(video[lo:hi] == 1)  # owned by its rescue window, no prompt-2 bleed
+    assert torch.all(video[hi:hi + 5] > 1)  # the regular windows resume right after the beat
+    audio_cut = round(cuts[1] * 5 / 3)
+    assert torch.all(result[1][..., :audio_cut] == 1)
+    assert calls.count(1) == 1
 
 
 def test_window_failure_never_retries_full_clip():
