@@ -634,6 +634,8 @@ def test_timeline_plan_matches_the_real_planner_for_any_cap(cap, latent_t):
 def test_timeline_rejects_unplannable_inputs():
     from h3forge.timeline import frames_for_seconds, plan_for_seconds, plan_windows
     assert frames_for_seconds(5.0) == 124 and frames_for_seconds(0.01) == 5
+    assert frames_for_seconds(5.17) == 141  # 124.08 frames snaps up, never down to a shorter clip
+    assert frames_for_seconds(124 / 24) == 124  # an exact grid duration stays put
     with pytest.raises(ValueError):
         plan_windows(100, 14)
     with pytest.raises(ValueError):

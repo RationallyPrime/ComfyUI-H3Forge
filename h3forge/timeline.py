@@ -43,10 +43,14 @@ def video_latent_t(frame_count: int) -> int:
 
 
 def frames_for_seconds(seconds: float) -> int:
-    """Frame count for a duration, snapped up to the grid."""
+    """Frame count for a duration, snapped up to the grid.
+
+    ceil, not round: 5.17 s is 124.08 frames and must become the 141-frame
+    clip above, not the 124-frame clip that is shorter than asked.
+    """
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"duration must be a positive number of seconds, got {seconds!r}")
-    return align_frame_count(round(seconds * FPS))
+    return align_frame_count(math.ceil(seconds * FPS - 1e-9))
 
 
 def latents_for_seconds(seconds: float) -> int:
