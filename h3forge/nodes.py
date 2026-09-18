@@ -20,9 +20,12 @@ from .state import AttentionPolicy, RuntimeState, require_eager_allocations, res
 from .timeline import (
     MIN_CAP_SECONDS,
     TRAINED_MAX_SECONDS,
+    av_latent_length,
     cap_latents_for_seconds,
+    frames_for_latents,
     frames_for_seconds,
     plan_for_seconds,
+    plan_windows,
 )
 
 ATTN_KEY = "h3forge_attention"
@@ -381,6 +384,15 @@ class H3ForgeTimelineContextWindows:
                 ),
             }),
             **_context_behaviour_inputs(),
+        }, "optional": {
+            "latent": ("LATENT", {
+                "tooltip": (
+                    "An existing MiniMax H3 AV latent: from MiniMax H3 Image to Video (I2VA/FL2VA), "
+                    "Reference Pipe Timeline Prompt (Ref2VA), or Empty MiniMax H3 AV Latent. When connected, "
+                    "the windows are planned from its length and it passes through unchanged; width, height "
+                    "and duration_seconds are ignored. Leave unconnected for text-to-video."
+                ),
+            }),
         }}
 
     RETURN_TYPES = ("MODEL", "LATENT")
@@ -388,24 +400,34 @@ class H3ForgeTimelineContextWindows:
     FUNCTION = "patch"
     CATEGORY = "model_patches/context"
     DESCRIPTION = (
-        "Empty MiniMax-H3 AV latent plus context windows sized from the duration: the fewest windows "
-        "under max_window_seconds, spread evenly and snapped to the latent cadence, overlap 12% of the "
-        "cap within 8-16 latents. A clip that fits one window runs unwindowed."
+        "Context windows sized from the clip length: the fewest windows under max_window_seconds, spread "
+        "evenly and snapped to the latent cadence, overlap 12% of the cap within 8-16 latents. Allocates the "
+        "empty AV latent for text-to-video, or plans from a connected latent (Image to Video, Reference Pipe) "
+        "and passes it through. A clip that fits one window runs unwindowed."
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True):
-        from comfy_extras.nodes_minimax_h3 import _empty_av_latent
-
+              segment_seams="blend", freenoise=True, latent=None):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
-            plan = plan_for_seconds(duration_seconds, max_window_seconds)
+            if latent is not None:
+                # I2VA / FL2VA / Ref2VA: the prompt node already made the latent and
+                # anchored its keyframes or references to this length. Plan from it.
+                latent_t = av_latent_length(latent)
+                frame_count = frames_for_latents(latent_t)
+                plan = plan_windows(latent_t, cap_latents_for_seconds(max_window_seconds))
+                source = "connected latent"
+            else:
+                from comfy_extras.nodes_minimax_h3 import _empty_av_latent
+
+                plan = plan_for_seconds(duration_seconds, max_window_seconds)
+                frames = frames_for_seconds(duration_seconds)
+                latent, frame_count = _empty_av_latent(width, height, frames)
+                if frame_count != frames:
+                    raise RuntimeError(f"native latent snapped {frames} frames to {frame_count}; plan is stale")
+                source = f"{width}x{height} text-to-video latent"
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
-        frames = frames_for_seconds(duration_seconds)
-        latent, frame_count = _empty_av_latent(width, height, frames)
-        if frame_count != frames:
-            raise RuntimeError(f"{LOG} native latent snapped {frames} frames to {frame_count}; plan is stale")
         if plan.windowed:
             window, overlap = plan.window, plan.overlap
             summary = f"{plan.count} windows of {window}/{overlap}"
@@ -413,7 +435,7 @@ class H3ForgeTimelineContextWindows:
             # One window covers the clip: nothing to overlap or stagger.
             window, overlap, stagger = plan.latent_t, 0, False
             summary = "unwindowed"
-        print(f"{LOG} timeline {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
+        print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
         patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise)
         return (patched, latent)

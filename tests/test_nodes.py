@@ -388,3 +388,45 @@ def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, c
     with pytest.raises(ValueError, match="not H3"):
         nodes.H3ForgeTimelineContextWindows().patch(MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
     assert allocations == []
+
+
+def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monkeypatch, capsys):
+    from types import SimpleNamespace as NS
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    # No comfy_extras stub: a connected latent must not touch the native allocator at all.
+    monkeypatch.delitem(sys.modules, "comfy_extras.nodes_minimax_h3", raising=False)
+    policies = []
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy) or "ctx")
+    monkeypatch.setattr(nodes, "make_freenoise_wrapper", lambda policy: "noise")
+
+    class MinimalPatcher:
+        model = object()
+        wrappers = []
+
+        def clone(self):
+            return self
+
+        def get_model_object(self, name):
+            return lambda **kwargs: {}
+
+        def add_object_patch(self, name, value):
+            pass
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            pass
+
+    # 142 video latents (481 frames, 20.04 s) as an Image to Video node would allocate them.
+    video, audio = torch.zeros(1, 24, 142, 48, 84), torch.zeros(1, 32, 2, 802)
+    supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
+    patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied)
+    assert latent is supplied  # passed through untouched, keyframe anchors stay valid
+    policy, = policies
+    assert (policy.window_frames, policy.overlap_frames, policy.stagger) == (80, 13, True)
+    log = capsys.readouterr().out
+    assert "connected latent: 481 frames" in log and "2 windows of 80/13" in log
+
+    with pytest.raises(ValueError, match="AV latent"):
+        nodes.H3ForgeTimelineContextWindows().patch(
+            MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})

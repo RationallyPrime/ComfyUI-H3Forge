@@ -661,3 +661,17 @@ def test_subtract_intervals_carves_holes_in_order():
     assert _subtract_intervals(0, 10, [(7, 12), (0, 2)]) == [(2, 7)]
     assert _subtract_intervals(4, 6, [(0, 10)]) == []
     assert _subtract_intervals(0, 10, [(2, 4), (3, 6)]) == [(0, 2), (6, 10)]
+
+
+def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
+    from h3forge.timeline import av_latent_length, frames_for_latents, latents_for_seconds, video_latent_t
+    for seconds in (1, 5, 20, 60):
+        latents = latents_for_seconds(seconds)
+        assert video_latent_t(frames_for_latents(latents)) == latents
+    assert frames_for_latents(2) == 5 and frames_for_latents(427) == 1450
+    with pytest.raises(ValueError):
+        frames_for_latents(30)
+    from types import SimpleNamespace as NS
+    assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
+    with pytest.raises(ValueError):
+        av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
