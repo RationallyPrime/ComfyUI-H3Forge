@@ -368,7 +368,7 @@ def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, c
             self.wrappers.append((kind, key, wrapper))
 
     patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
-        MinimalPatcher(), 1344, 768, seconds, 15.0, True, "pyramid")
+        MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
     frames = allocations[0][3]
     assert allocations == [(1344, 768, frames, frames)]
     assert latent == {"samples": f"latent-{frames}"}

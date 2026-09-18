@@ -17,7 +17,7 @@ from .prompt import (
     split_pipe_prompt,
 )
 from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
-from .timeline import TRAINED_MAX_SECONDS, frames_for_seconds, latents_for_seconds, plan_for_seconds
+from .timeline import TRAINED_MAX_SECONDS, cap_latents_for_seconds, frames_for_seconds, plan_for_seconds
 
 ATTN_KEY = "h3forge_attention"
 CTX_KEY = "h3forge_context"
@@ -369,8 +369,9 @@ class H3ForgeTimelineContextWindows:
             "max_window_seconds": ("FLOAT", {
                 "default": TRAINED_MAX_SECONDS, "min": 2.0, "max": 30.0, "step": 0.5,
                 "tooltip": (
-                    "Longest context window the plan may use. 15 s is the top of H3's trained range. "
-                    "Lower it on a card that runs out of memory; the step-zero plan log shows what was chosen."
+                    "Longest context window the plan may use, rounded down to the frame grid. The default "
+                    "admits 362 frames, the top of H3's trained range. Lower it on a card that runs out of "
+                    "memory; the node prints the plan it chose."
                 ),
             }),
             **_context_behaviour_inputs(),
@@ -406,7 +407,7 @@ class H3ForgeTimelineContextWindows:
             window, overlap, stagger = plan.latent_t, 0, False
             summary = "unwindowed"
         print(f"{LOG} timeline {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
-              f"cap {latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
+              f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
         patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise)
         return (patched, latent)
 

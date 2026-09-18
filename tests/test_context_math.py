@@ -222,7 +222,7 @@ def test_segmented_windows_cover_every_beat_without_midpoint_selection(monkeypat
     assert {p[0] for p in plan} == set(range(6))
     for index, (start, stop) in enumerate(ranges):
         covered = set()
-        for segment, _, _, lo, hi in plan:
+        for segment, _, _, lo, hi, _ in plan:
             if segment == index:
                 covered.update(range(lo, hi))
         assert covered == set(range(start, stop))
@@ -518,9 +518,11 @@ def test_blended_segment_windows_assign_by_majority_and_rescue_short_beats(monke
     # The short first beat is mostly covered by no window, so it gets exactly one
     # window of its own that writes only inside the beat.
     assert [(p[0], p[3], p[4]) for p in rescue] == [(0, ranges[0][0], ranges[0][1])]
-    for index, v0, v1, _, _ in regular:
+    for index, v0, v1, _, _, excluded in regular:
         shared = [min(v1, hi) - max(v0, lo) for lo, hi in ranges]
         assert shared[index] == max(shared)
+        assert excluded == (0,)  # every regular window carves out the rescued first beat
+    assert all(p[5] == () for p in rescue)
     assert plan == sorted(plan, key=lambda p: (p[1], p[0]))
     max_phase = max_stagger_phase(window, overlap)
     shifted = _blended_segment_windows(total, window, overlap, ranges, max_phase, max_phase)
@@ -540,6 +542,7 @@ def test_blended_assignments_are_frozen_across_stagger_phases():
     base_regular = [p for p in base if (p[3], p[4]) == (p[1], p[2])]
     base_rescue = [p for p in base if (p[3], p[4]) != (p[1], p[2])]
     assert [p[0] for p in base_regular][:2] == [0, 1]
+    assert all(p[5] == () for p in base)  # every beat is mostly covered: nothing rescued
     for phase in range(max_phase + 1):
         plan = _blended_segment_windows(total, window, overlap, ranges, phase, max_phase)
         regular = [p for p in plan if (p[3], p[4]) == (p[1], p[2])]
@@ -637,3 +640,12 @@ def test_timeline_rejects_unplannable_inputs():
         plan_for_seconds(0)
     with pytest.raises(ValueError):
         plan_for_seconds(10, float("inf"))
+
+
+def test_subtract_intervals_carves_holes_in_order():
+    from h3forge.context import _subtract_intervals
+    assert _subtract_intervals(0, 10, []) == [(0, 10)]
+    assert _subtract_intervals(0, 10, [(3, 5)]) == [(0, 3), (5, 10)]
+    assert _subtract_intervals(0, 10, [(7, 12), (0, 2)]) == [(2, 7)]
+    assert _subtract_intervals(4, 6, [(0, 10)]) == []
+    assert _subtract_intervals(0, 10, [(2, 4), (3, 6)]) == [(0, 2), (6, 10)]

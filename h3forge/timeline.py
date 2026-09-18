@@ -16,7 +16,9 @@ from .context import window_starts
 FPS = 24
 FRAMES_PER_CYCLE = 17
 LATENTS_PER_CYCLE = 5
-TRAINED_MAX_SECONDS = 15.0  # 362 frames, 107 latents: the top of H3's trained range
+# 362 frames / 107 latents is the top of H3's trained range; it is 15.08 s, so a
+# 15.5 s cap floor-snaps to exactly that clip and a 15 s clip stays unwindowed.
+TRAINED_MAX_SECONDS = 15.5
 OVERLAP_FRACTION = 0.12
 MIN_OVERLAP = 8
 MAX_OVERLAP = 16
@@ -47,6 +49,22 @@ def frames_for_seconds(seconds: float) -> int:
 
 def latents_for_seconds(seconds: float) -> int:
     return video_latent_t(frames_for_seconds(seconds))
+
+
+def cap_latents_for_seconds(seconds: float) -> int:
+    """Largest grid-aligned clip that fits inside ``seconds``: a ceiling rounds down.
+
+    The output clip snaps up so the user gets at least what they asked for; a
+    window cap snaps down so no window is longer than they allowed. A W-latent
+    window (W a cadence multiple) spans 17W/5 frames, so W <= this cap keeps it
+    under the requested seconds.
+    """
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"max_window_seconds must be a positive number, got {seconds!r}")
+    frames = max(5, round(seconds * FPS))
+    while frames % FRAMES_PER_CYCLE != LATENTS_PER_CYCLE:
+        frames -= 1
+    return video_latent_t(max(5, frames))
 
 
 @dataclass(frozen=True)
@@ -97,6 +115,4 @@ def plan_windows(latent_t: int, max_window: int) -> WindowPlan:
 
 def plan_for_seconds(seconds: float, max_window_seconds: float = TRAINED_MAX_SECONDS) -> WindowPlan:
     """Plan from a clip duration and a window cap, both in seconds."""
-    if not math.isfinite(max_window_seconds) or max_window_seconds <= 0:
-        raise ValueError(f"max_window_seconds must be a positive number, got {max_window_seconds!r}")
-    return plan_windows(latents_for_seconds(seconds), latents_for_seconds(max_window_seconds))
+    return plan_windows(latents_for_seconds(seconds), cap_latents_for_seconds(max_window_seconds))
