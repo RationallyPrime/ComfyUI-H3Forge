@@ -369,6 +369,7 @@ def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, c
 
     patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
         MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
+    assert nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["required"]["max_window_seconds"][1]["min"] == 2.5
     frames = allocations[0][3]
     assert allocations == [(1344, 768, frames, frames)]
     assert latent == {"samples": f"latent-{frames}"}
@@ -380,3 +381,10 @@ def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, c
     log = capsys.readouterr().out
     assert f"-> {latents} latents" in log
     assert (f"{windows} windows of {window}/{overlap}" in log) if windows > 1 else ("unwindowed" in log)
+
+    # A wrong model is rejected before any latent is allocated.
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: (_ for _ in ()).throw(ValueError("not H3")))
+    allocations.clear()
+    with pytest.raises(ValueError, match="not H3"):
+        nodes.H3ForgeTimelineContextWindows().patch(MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
+    assert allocations == []

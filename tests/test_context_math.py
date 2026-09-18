@@ -642,6 +642,16 @@ def test_timeline_rejects_unplannable_inputs():
         plan_for_seconds(10, float("inf"))
 
 
+def test_cap_seconds_never_admits_a_longer_window_than_requested():
+    from h3forge.timeline import MIN_CAP, MIN_CAP_SECONDS, cap_latents_for_seconds, plan_for_seconds
+    assert cap_latents_for_seconds(15.5) == 107
+    assert cap_latents_for_seconds(15.07) == 102  # 361.68 frames floors below the 362 grid point
+    assert cap_latents_for_seconds(MIN_CAP_SECONDS) >= MIN_CAP
+    plan = plan_for_seconds(8.5, 4.5)
+    assert (plan.window, plan.count) == (30, 3) and plan.window * 17 / 5 / 24 <= 4.5
+    assert plan_for_seconds(1.0, MIN_CAP_SECONDS).windowed is False
+
+
 def test_subtract_intervals_carves_holes_in_order():
     from h3forge.context import _subtract_intervals
     assert _subtract_intervals(0, 10, []) == [(0, 10)]

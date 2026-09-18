@@ -25,6 +25,8 @@ MAX_OVERLAP = 16
 MIN_STRIDE = 3  # the context node's stagger floor
 # Smallest cap with a cadence-aligned window that still leaves MIN_STRIDE past the overlap.
 MIN_CAP = math.ceil((MIN_OVERLAP + MIN_STRIDE) / LATENTS_PER_CYCLE) * LATENTS_PER_CYCLE
+# Smallest cap in seconds whose floor-snapped grid clip reaches MIN_CAP latents (56 frames -> 17 latents).
+MIN_CAP_SECONDS = 2.5
 
 
 def align_frame_count(n: int) -> int:
@@ -61,7 +63,8 @@ def cap_latents_for_seconds(seconds: float) -> int:
     """
     if not math.isfinite(seconds) or seconds <= 0:
         raise ValueError(f"max_window_seconds must be a positive number, got {seconds!r}")
-    frames = max(5, round(seconds * FPS))
+    # floor, not round: a cap of 15.07 s must not be promoted to the 362-frame clip above it
+    frames = max(5, math.floor(seconds * FPS))
     while frames % FRAMES_PER_CYCLE != LATENTS_PER_CYCLE:
         frames -= 1
     return video_latent_t(max(5, frames))

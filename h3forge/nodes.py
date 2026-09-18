@@ -17,7 +17,13 @@ from .prompt import (
     split_pipe_prompt,
 )
 from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
-from .timeline import TRAINED_MAX_SECONDS, cap_latents_for_seconds, frames_for_seconds, plan_for_seconds
+from .timeline import (
+    MIN_CAP_SECONDS,
+    TRAINED_MAX_SECONDS,
+    cap_latents_for_seconds,
+    frames_for_seconds,
+    plan_for_seconds,
+)
 
 ATTN_KEY = "h3forge_attention"
 CTX_KEY = "h3forge_context"
@@ -367,7 +373,7 @@ class H3ForgeTimelineContextWindows:
                 "tooltip": "Clip length at 24 fps, snapped up to H3's 17k+5 frame grid.",
             }),
             "max_window_seconds": ("FLOAT", {
-                "default": TRAINED_MAX_SECONDS, "min": 2.0, "max": 30.0, "step": 0.5,
+                "default": TRAINED_MAX_SECONDS, "min": MIN_CAP_SECONDS, "max": 30.0, "step": 0.5,
                 "tooltip": (
                     "Longest context window the plan may use, rounded down to the frame grid. The default "
                     "admits 362 frames, the top of H3's trained range. Lower it on a card that runs out of "
@@ -391,6 +397,7 @@ class H3ForgeTimelineContextWindows:
               segment_seams="blend", freenoise=True):
         from comfy_extras.nodes_minimax_h3 import _empty_av_latent
 
+        _require_h3(model)  # before allocating anything on a wrong model
         try:
             plan = plan_for_seconds(duration_seconds, max_window_seconds)
         except ValueError as exc:
