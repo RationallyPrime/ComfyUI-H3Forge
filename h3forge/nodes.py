@@ -17,6 +17,7 @@ from .prompt import (
     split_pipe_prompt,
 )
 from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
+from .timeline import TRAINED_MAX_SECONDS, frames_for_seconds, latents_for_seconds, plan_for_seconds
 
 ATTN_KEY = "h3forge_attention"
 CTX_KEY = "h3forge_context"
@@ -287,13 +288,9 @@ def _forward_wrapper(state, configured_options=None):
     return wrapper
 
 
-class H3ForgeContextWindows:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {"required": {
-            "model": ("MODEL",),
-            "window_frames": ("INT", {"default": 25, "min": 2, "max": 512}),
-            "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
+def _context_behaviour_inputs():
+    """The context inputs shared by the manual and the timeline node."""
+    return {
             "stagger": ("BOOLEAN", {"default": True}),
             "blend": (["pyramid", "overlap-linear", "flat"], {"default": "pyramid"}),
             "segment_seams": (list(SEGMENT_SEAMS), {
@@ -310,6 +307,42 @@ class H3ForgeContextWindows:
                 "tooltip": "FreeNoise: later video windows start from a seeded shuffle of the first window's "
                            "noise so windows agree in their overlaps. Audio noise is left untouched.",
             }),
+    }
+
+
+def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise):
+    """Validate a context policy and return the model clone carrying its wrappers."""
+    diffusion = _require_h3(model)
+    if overlap_frames >= window_frames:
+        raise ValueError("overlap_frames must be smaller than window_frames")
+    if stagger and window_frames - overlap_frames < 3:
+        raise ValueError("stagger requires a window stride of at least 3")
+    try:
+        policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
+                               stagger=stagger, blend=blend,
+                               segment_seams=segment_seams, freenoise=freenoise)
+    except ValueError as exc:
+        raise ValueError(f"{LOG} {exc}") from exc
+    patched = model.clone()
+    base_model = patched.model
+    base_extra_conds = patched.get_model_object("extra_conds")
+    patched.add_object_patch(
+        "extra_conds",
+        make_segmented_extra_conds(base_extra_conds, base_model, diffusion),
+    )
+    patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
+    patched.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, CTX_KEY, make_freenoise_wrapper(policy))
+    return patched
+
+
+class H3ForgeContextWindows:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "window_frames": ("INT", {"default": 25, "min": 2, "max": 512}),
+            "overlap_frames": ("INT", {"default": 8, "min": 0, "max": 256}),
+            **_context_behaviour_inputs(),
         }}
 
     RETURN_TYPES = ("MODEL",)
@@ -319,27 +352,63 @@ class H3ForgeContextWindows:
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
               segment_seams="blend", freenoise=True):
-        diffusion = _require_h3(model)
-        if overlap_frames >= window_frames:
-            raise ValueError("overlap_frames must be smaller than window_frames")
-        if stagger and window_frames - overlap_frames < 3:
-            raise ValueError("stagger requires a window stride of at least 3")
+        return (_install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise),)
+
+
+class H3ForgeTimelineContextWindows:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "width": ("INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}),
+            "height": ("INT", {"default": 768, "min": 32, "max": 16384, "step": 32}),
+            "duration_seconds": ("FLOAT", {
+                "default": 20.0, "min": 0.25, "max": 150.0, "step": 0.25,
+                "tooltip": "Clip length at 24 fps, snapped up to H3's 17k+5 frame grid.",
+            }),
+            "max_window_seconds": ("FLOAT", {
+                "default": TRAINED_MAX_SECONDS, "min": 2.0, "max": 30.0, "step": 0.5,
+                "tooltip": (
+                    "Longest context window the plan may use. 15 s is the top of H3's trained range. "
+                    "Lower it on a card that runs out of memory; the step-zero plan log shows what was chosen."
+                ),
+            }),
+            **_context_behaviour_inputs(),
+        }}
+
+    RETURN_TYPES = ("MODEL", "LATENT")
+    RETURN_NAMES = ("model", "latent")
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/context"
+    DESCRIPTION = (
+        "Empty MiniMax-H3 AV latent plus context windows sized from the duration: the fewest windows "
+        "under max_window_seconds, spread evenly and snapped to the latent cadence, overlap 12% of the "
+        "cap within 8-16 latents. A clip that fits one window runs unwindowed."
+    )
+
+    def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
+              segment_seams="blend", freenoise=True):
+        from comfy_extras.nodes_minimax_h3 import _empty_av_latent
+
         try:
-            policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
-                                   stagger=stagger, blend=blend,
-                                   segment_seams=segment_seams, freenoise=freenoise)
+            plan = plan_for_seconds(duration_seconds, max_window_seconds)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
-        patched = model.clone()
-        base_model = patched.model
-        base_extra_conds = patched.get_model_object("extra_conds")
-        patched.add_object_patch(
-            "extra_conds",
-            make_segmented_extra_conds(base_extra_conds, base_model, diffusion),
-        )
-        patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
-        patched.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, CTX_KEY, make_freenoise_wrapper(policy))
-        return (patched,)
+        frames = frames_for_seconds(duration_seconds)
+        latent, frame_count = _empty_av_latent(width, height, frames)
+        if frame_count != frames:
+            raise RuntimeError(f"{LOG} native latent snapped {frames} frames to {frame_count}; plan is stale")
+        if plan.windowed:
+            window, overlap = plan.window, plan.overlap
+            summary = f"{plan.count} windows of {window}/{overlap}"
+        else:
+            # One window covers the clip: nothing to overlap or stagger.
+            window, overlap, stagger = plan.latent_t, 0, False
+            summary = "unwindowed"
+        print(f"{LOG} timeline {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
+              f"cap {latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise)
+        return (patched, latent)
 
 
 class H3ForgePipePrompt:
@@ -466,6 +535,7 @@ class H3ForgeReferencePipePrompt:
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
+    "H3ForgeTimelineContextWindows": H3ForgeTimelineContextWindows,
     "H3ForgePipePrompt": H3ForgePipePrompt,
     "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
@@ -473,6 +543,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
+    "H3ForgeTimelineContextWindows": "H3 Forge — Timeline Context Windows",
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
     "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",

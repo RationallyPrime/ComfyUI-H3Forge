@@ -76,6 +76,22 @@ Native Fun ControlNet composes on either side of the context node: its complete 
 
 Absolute positions matter: a window beginning at latent 26 must retain that global frame's native cadence. Full audio visibility does not make an unlimited-memory model; reference size, audio length, and decoded output continue to consume resources.
 
+### H3 Forge — Timeline Context Windows
+
+The chained node asks for a window and an overlap in latents, and the default `25` is a leftover from the first sub-50 GB Blackwell receipt: a 3.5-second window, well short of the 5 to 15 seconds H3 was trained on, and 25 windows for a 60-second clip. This node takes width, height and a duration in seconds instead. It allocates the empty AV latent exactly as `Empty MiniMax H3 AV Latent` does, snapping to the `17k + 5` frame grid, and derives the window plan from the resulting latent length before installing the same context and FreeNoise wrappers. It returns `MODEL` and `LATENT`, so it replaces the native empty-latent node in a text-to-video graph. Stagger, blend, seams and FreeNoise are the same inputs with the same defaults.
+
+The plan: the fewest windows whose size stays under `max_window_seconds`, which defaults to 15 s, the top of H3's trained range; overlap at 12 % of the cap clamped to 8–16 latents; the clip spread evenly across that count and rounded up to the 5-latent cadence, so every window is the same size and none is larger than the count requires. That, not the cap, is what bounds peak VRAM. A clip that fits in one window runs unwindowed. Lower `max_window_seconds` on a card that runs out of memory; the node prints the plan it chose.
+
+| Duration | Latents | Windows | Window / overlap |
+| --- | --- | --- | --- |
+| 10 s | 72 | 1 | unwindowed |
+| 20 s | 142 | 2 | 80 / 13 |
+| 30 s | 217 | 3 | 85 / 13 |
+| 60 s | 427 | 5 | 100 / 13 |
+| 120 s | 852 | 10 | 100 / 13 |
+
+The policy is fixed at node time from the latent the node made. If a different latent reaches the sampler, the wrapper clamps the window to whatever length arrives, the same as the manual node.
+
 ### H3 Forge — Pipe Timeline Prompt
 
 This node splits a prompt on `|`, encodes every segment independently with MiniMax's Qwen3-VL text encoder, and maps the segments in order across the target timeline. It is not a decorative delimiter passed to one global text encoding.
@@ -149,15 +165,16 @@ git clone https://github.com/RationallyPrime/ComfyUI-H3Forge.git
 
 or place the extracted `ComfyUI-H3Forge/` directory there, then restart ComfyUI.
 
-Five nodes should appear:
+Six nodes should appear:
 
 - `H3 Forge — Sliding Attention + FETA`
 - `H3 Forge — Chained A/V Context Windows`
+- `H3 Forge — Timeline Context Windows`
 - `H3 Forge — Pipe Timeline Prompt`
 - `H3 Forge — Reference Pipe Timeline Prompt`
 - `H3 Forge — Normalized Attention Guidance` (experimental)
 
-The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the appropriate VAEs and image, video, or audio references, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
+The attention, context, and NAG nodes accept and return `MODEL`; insert them after the H3 model loader and before sampling. The timeline context node also returns the empty AV `LATENT`, replacing `Empty MiniMax H3 AV Latent` in a text-to-video graph. They can be wired in any order — the attention and NAG nodes configure one shared H3Forge runtime. The text-only pipe node accepts MiniMax's `CLIP` and returns positive `CONDITIONING`. The reference pipe node additionally accepts the appropriate VAEs and image, video, or audio references, returning both positive `CONDITIONING` and the native AV `LATENT`. The NAG node additionally takes negative `CONDITIONING`.
 
 For the recommended feed-forward memory reduction, also install [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes):
 
@@ -359,7 +376,7 @@ Kijai's KJNodes ships several native-H3 utilities. Only the feed-forward chunker
 ```text
 selected H3 model
   → MiniMax H3 Chunk FeedForward
-  → H3 Forge — Chained A/V Context Windows
+  → H3 Forge — Chained A/V Context Windows   (or Timeline Context Windows, which also emits the latent)
   → H3 Forge — Sliding Attention + FETA
   → scheduler and guider
 ```

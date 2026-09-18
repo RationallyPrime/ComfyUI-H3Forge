@@ -600,3 +600,40 @@ def test_freenoise_wrapper_shuffles_video_only_and_only_when_windowed():
                    ContextPolicy(window_frames=12, overlap_frames=2, freenoise=False)):
         make_freenoise_wrapper(policy)(executor, guider, None, {"seed": 3}, None, packed)
         assert seen["noise"] is packed
+
+
+@pytest.mark.parametrize("seconds,latents,count,window,overlap", [
+    (5, 37, 1, 37, 0), (15, 107, 1, 107, 0), (16, 117, 2, 65, 13), (20, 142, 2, 80, 13),
+    (30, 217, 3, 85, 13), (60, 427, 5, 100, 13), (120, 852, 10, 100, 13),
+])
+def test_timeline_plan_prefers_few_even_cadence_aligned_windows(seconds, latents, count, window, overlap):
+    from h3forge.timeline import plan_for_seconds
+    plan = plan_for_seconds(seconds)
+    assert (plan.latent_t, plan.count, plan.window, plan.overlap) == (latents, count, window, overlap)
+    assert plan.windowed == (count > 1)
+    if plan.windowed:
+        assert plan.window % 5 == 0 and plan.window <= 107
+        assert len(window_starts(plan.latent_t, plan.window, plan.overlap)) == plan.count
+
+
+@pytest.mark.parametrize("cap", [15, 23, 40, 61, 107, 129])
+@pytest.mark.parametrize("latent_t", [2, 7, 37, 112, 427, 1062])
+def test_timeline_plan_matches_the_real_planner_for_any_cap(cap, latent_t):
+    from h3forge.timeline import plan_windows
+    plan = plan_windows(latent_t, cap)
+    if latent_t <= cap:
+        assert plan == plan.__class__(latent_t, latent_t, 0, 1)
+        return
+    assert plan.window <= cap and plan.window - plan.overlap >= 3 and 8 <= plan.overlap <= 16
+    assert len(window_starts(latent_t, plan.window, plan.overlap)) == plan.count
+
+
+def test_timeline_rejects_unplannable_inputs():
+    from h3forge.timeline import frames_for_seconds, plan_for_seconds, plan_windows
+    assert frames_for_seconds(5.0) == 124 and frames_for_seconds(0.01) == 5
+    with pytest.raises(ValueError):
+        plan_windows(100, 14)
+    with pytest.raises(ValueError):
+        plan_for_seconds(0)
+    with pytest.raises(ValueError):
+        plan_for_seconds(10, float("inf"))
