@@ -42,6 +42,25 @@ def video_latent_t(frame_count: int) -> int:
     return 2 if frame_count <= 5 else ((frame_count - 5) // FRAMES_PER_CYCLE) * LATENTS_PER_CYCLE + 2
 
 
+def frames_for_latents(latent_t: int) -> int:
+    """Decoded frame count of a grid-aligned video latent: the inverse of ``video_latent_t``."""
+    latent_t = int(latent_t)
+    if latent_t < 2 or (latent_t - 2) % LATENTS_PER_CYCLE:
+        raise ValueError(f"{latent_t} video latents is not on H3's 5k+2 grid")
+    return LATENTS_PER_CYCLE + (latent_t - 2) // LATENTS_PER_CYCLE * FRAMES_PER_CYCLE
+
+
+def av_latent_length(latent) -> int:
+    """Video-latent length of a ComfyUI MiniMax H3 AV latent dict."""
+    samples = latent["samples"] if isinstance(latent, dict) else latent
+    tensors = getattr(samples, "tensors", None)
+    if tensors is None and getattr(samples, "is_nested", False):
+        tensors = list(samples.unbind())
+    if not tensors or len(tensors) < 2 or tensors[0].ndim != 5:
+        raise ValueError("expected a MiniMax H3 AV latent (nested video [B,24,T,H,W] + audio)")
+    return int(tensors[0].shape[2])
+
+
 def frames_for_seconds(seconds: float) -> int:
     """Frame count for a duration, snapped up to the grid.
 
