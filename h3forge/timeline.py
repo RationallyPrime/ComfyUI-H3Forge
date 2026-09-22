@@ -27,6 +27,13 @@ MIN_STRIDE = 3  # the context node's stagger floor
 MIN_CAP = math.ceil((MIN_OVERLAP + MIN_STRIDE) / LATENTS_PER_CYCLE) * LATENTS_PER_CYCLE
 # Smallest cap in seconds whose floor-snapped grid clip reaches MIN_CAP latents (56 frames -> 17 latents).
 MIN_CAP_SECONDS = 2.5
+# The clip lengths the timeline node offers: every multiple of five up to a minute.
+# They are choices, not presets; each one is planned from scratch like any other
+# duration, and the node still accepts an arbitrary number wired into the widget.
+DURATION_STEP_SECONDS = 5
+MAX_DURATION_SECONDS = 60
+DURATION_CHOICES = tuple(range(DURATION_STEP_SECONDS, MAX_DURATION_SECONDS + 1, DURATION_STEP_SECONDS))
+DEFAULT_DURATION_SECONDS = 20
 
 
 def align_frame_count(n: int) -> int:

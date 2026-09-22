@@ -631,6 +631,28 @@ def test_timeline_plan_matches_the_real_planner_for_any_cap(cap, latent_t):
     assert len(window_starts(latent_t, plan.window, plan.overlap)) == plan.count
 
 
+def test_every_offered_duration_plans_and_reaches_the_length_asked_for():
+    from h3forge.timeline import (
+        DEFAULT_DURATION_SECONDS,
+        DURATION_CHOICES,
+        FPS,
+        TRAINED_MAX_SECONDS,
+        frames_for_seconds,
+        plan_for_seconds,
+    )
+    assert DURATION_CHOICES == tuple(range(5, 61, 5)) and DEFAULT_DURATION_SECONDS in DURATION_CHOICES
+    for seconds in DURATION_CHOICES:
+        frames = frames_for_seconds(seconds)
+        assert frames / FPS >= seconds  # snapping up the grid never returns a clip shorter than asked
+        plan = plan_for_seconds(seconds, TRAINED_MAX_SECONDS)
+        assert plan.count == len(window_starts(plan.latent_t, plan.window, plan.overlap))
+        if plan.windowed:
+            # Every window is a clip length H3 was trained on, and the stagger floor is clear.
+            assert plan.window % 5 == 0 and plan.window <= 107 and plan.window - plan.overlap >= 3
+        else:
+            assert seconds <= TRAINED_MAX_SECONDS
+
+
 def test_timeline_rejects_unplannable_inputs():
     from h3forge.timeline import frames_for_seconds, plan_for_seconds, plan_windows
     assert frames_for_seconds(5.0) == 124 and frames_for_seconds(0.01) == 5
