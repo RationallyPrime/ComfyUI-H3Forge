@@ -327,7 +327,9 @@ def test_reference_pipe_node_prepares_native_refs_once(monkeypatch):
     assert latent == {"samples": "native-latent"}
 
 
-@pytest.mark.parametrize("seconds,windows,window,overlap,latents", [(20.0, 2, 80, 13, 142), (5.0, 1, 37, 0, 37)])
+@pytest.mark.parametrize("seconds,windows,window,overlap,latents", [
+    (20, 2, 80, 13, 142), (5, 1, 37, 0, 37), (35, 3, 95, 13, 252), (45, 4, 95, 13, 322), (20.0, 2, 80, 13, 142),
+])
 def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, capsys, seconds, windows, window,
                                                                   overlap, latents):
     nodes = _import_nodes(monkeypatch)
@@ -369,7 +371,11 @@ def test_timeline_node_allocates_the_latent_and_sizes_the_windows(monkeypatch, c
 
     patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
         MinimalPatcher(), 1344, 768, seconds, 15.5, True, "pyramid")
-    assert nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["required"]["max_window_seconds"][1]["min"] == 2.5
+    required = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["required"]
+    assert required["max_window_seconds"][1]["min"] == 2.5
+    # The duration is picked from every multiple of five up to a minute, not typed.
+    assert required["duration_seconds"][0] == list(range(5, 61, 5))
+    assert required["duration_seconds"][1]["default"] in required["duration_seconds"][0]
     frames = allocations[0][3]
     assert allocations == [(1344, 768, frames, frames)]
     assert latent == {"samples": f"latent-{frames}"}

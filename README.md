@@ -78,17 +78,28 @@ Absolute positions matter: a window beginning at latent 26 must retain that glob
 
 ### H3 Forge — Timeline Context Windows
 
-The chained node asks for a window and an overlap in latents, and the default `25` is a leftover from the first sub-50 GB Blackwell receipt: a 3.5-second window, well short of the 5 to 15 seconds H3 was trained on, and 25 windows for a 60-second clip. This node takes width, height and a duration in seconds instead. It allocates the empty AV latent exactly as `Empty MiniMax H3 AV Latent` does, snapping to the `17k + 5` frame grid, and derives the window plan from the resulting latent length before installing the same context and FreeNoise wrappers. It returns `MODEL` and `LATENT`, so it replaces the native empty-latent node in a text-to-video graph. For I2VA, FL2VA and Ref2VA, connect the latent that `MiniMax H3 Image to Video` or `H3 Forge — Reference Pipe Timeline Prompt` produced to the optional `latent` input: the node then plans from that latent's length and passes it through unchanged, so the keyframes and references those nodes anchored to it stay valid, and width, height and duration are ignored. Stagger, blend, seams and FreeNoise are the same inputs with the same defaults.
+The chained node asks for a window and an overlap in latents, and the default `25` is a leftover from the first sub-50 GB Blackwell receipt: a 3.5-second window, well short of the 5 to 15 seconds H3 was trained on, and 25 windows for a 60-second clip. This node takes width, height and a duration in seconds instead, picked from every multiple of five up to a minute. It allocates the empty AV latent exactly as `Empty MiniMax H3 AV Latent` does, snapping to the `17k + 5` frame grid, and derives the window plan from the resulting latent length before installing the same context and FreeNoise wrappers. It returns `MODEL` and `LATENT`, so it replaces the native empty-latent node in a text-to-video graph. For I2VA, FL2VA and Ref2VA, connect the latent that `MiniMax H3 Image to Video` or `H3 Forge — Reference Pipe Timeline Prompt` produced to the optional `latent` input: the node then plans from that latent's length and passes it through unchanged, so the keyframes and references those nodes anchored to it stay valid, and width, height and duration are ignored. Stagger, blend, seams and FreeNoise are the same inputs with the same defaults.
 
 The plan: the fewest windows whose size stays under `max_window_seconds`, rounded down to the frame grid so a ceiling is a ceiling; the default `15.5` admits exactly 362 frames, the top of H3's trained range; overlap at 12 % of the cap clamped to 8–16 latents; the clip spread evenly across that count and rounded up to the 5-latent cadence, so every window is the same size and none is larger than the count requires. That, not the cap, is what bounds peak VRAM. A clip that fits in one window runs unwindowed; a pipe prompt on such a clip still gives every beat its own window and exclusive output. Lower `max_window_seconds` on a card that runs out of memory; the node prints the plan it chose.
 
-| Duration | Latents | Windows | Window / overlap |
-| --- | --- | --- | --- |
-| 10 s | 72 | 1 | unwindowed |
-| 20 s | 142 | 2 | 80 / 13 |
-| 30 s | 217 | 3 | 85 / 13 |
-| 60 s | 427 | 5 | 100 / 13 |
-| 120 s | 852 | 10 | 100 / 13 |
+Every offered duration under the default cap, with the frame count the grid snaps it to:
+
+| Duration | Frames | Latents | Windows | Window / overlap | Window span |
+| --- | --- | --- | --- | --- | --- |
+| 5 s | 124 (5.17 s) | 37 | 1 | unwindowed | 5.2 s |
+| 10 s | 243 (10.12 s) | 72 | 1 | unwindowed | 10.2 s |
+| 15 s | 362 (15.08 s) | 107 | 1 | unwindowed | 15.2 s |
+| 20 s | 481 (20.04 s) | 142 | 2 | 80 / 13 | 11.3 s |
+| 25 s | 600 (25.00 s) | 177 | 2 | 95 / 13 | 13.5 s |
+| 30 s | 736 (30.67 s) | 217 | 3 | 85 / 13 | 12.0 s |
+| 35 s | 855 (35.62 s) | 252 | 3 | 95 / 13 | 13.5 s |
+| 40 s | 974 (40.58 s) | 287 | 3 | 105 / 13 | 14.9 s |
+| 45 s | 1093 (45.54 s) | 322 | 4 | 95 / 13 | 13.5 s |
+| 50 s | 1212 (50.50 s) | 357 | 4 | 100 / 13 | 14.2 s |
+| 55 s | 1331 (55.46 s) | 392 | 5 | 90 / 13 | 12.8 s |
+| 60 s | 1450 (60.42 s) | 427 | 5 | 100 / 13 | 14.2 s |
+
+The list is a convenience, not a limit: a connected latent plans from its own length, whatever that is, and a number wired into `duration_seconds` is planned like any other. A duration snaps up to the frame grid, so a clip runs a little past the length picked and never short of it.
 
 The policy is fixed at node time from the latent the node made. If a different latent reaches the sampler, the wrapper clamps the window to whatever length arrives, the same as the manual node.
 

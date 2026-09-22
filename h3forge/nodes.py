@@ -18,6 +18,8 @@ from .prompt import (
 )
 from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
 from .timeline import (
+    DEFAULT_DURATION_SECONDS,
+    DURATION_CHOICES,
     MIN_CAP_SECONDS,
     TRAINED_MAX_SECONDS,
     av_latent_length,
@@ -371,9 +373,13 @@ class H3ForgeTimelineContextWindows:
             "model": ("MODEL",),
             "width": ("INT", {"default": 1344, "min": 32, "max": 16384, "step": 32}),
             "height": ("INT", {"default": 768, "min": 32, "max": 16384, "step": 32}),
-            "duration_seconds": ("FLOAT", {
-                "default": 20.0, "min": 0.25, "max": 150.0, "step": 0.25,
-                "tooltip": "Clip length at 24 fps, snapped up to H3's 17k+5 frame grid.",
+            "duration_seconds": (list(DURATION_CHOICES), {
+                "default": DEFAULT_DURATION_SECONDS,
+                "tooltip": (
+                    "Clip length at 24 fps, snapped up to H3's 17k+5 frame grid, so the clip runs a little "
+                    "past the length picked. Every length is planned the same way, so the windows and their "
+                    "overlap follow from this and max_window_seconds. Ignored when a latent is connected."
+                ),
             }),
             "max_window_seconds": ("FLOAT", {
                 "default": TRAINED_MAX_SECONDS, "min": MIN_CAP_SECONDS, "max": 30.0, "step": 0.5,
@@ -420,8 +426,9 @@ class H3ForgeTimelineContextWindows:
             else:
                 from comfy_extras.nodes_minimax_h3 import _empty_av_latent
 
-                plan = plan_for_seconds(duration_seconds, max_window_seconds)
-                frames = frames_for_seconds(duration_seconds)
+                seconds = float(duration_seconds)  # a picked choice, or a number wired into the widget
+                plan = plan_for_seconds(seconds, max_window_seconds)
+                frames = frames_for_seconds(seconds)
                 latent, frame_count = _empty_av_latent(width, height, frames)
                 if frame_count != frames:
                     raise RuntimeError(f"native latent snapped {frames} frames to {frame_count}; plan is stale")
