@@ -99,7 +99,7 @@ Every offered duration under the default cap, with the frame count the grid snap
 | 55 s | 1331 (55.46 s) | 392 | 5 | 90 / 13 | 12.8 s |
 | 60 s | 1450 (60.42 s) | 427 | 5 | 100 / 13 | 14.2 s |
 
-The list is a convenience, not a limit: a connected latent plans from its own length, whatever that is, and a number wired into `duration_seconds` is planned like any other. A duration snaps up to the frame grid, so a clip runs a little past the length picked and never short of it.
+A duration snaps up to the frame grid, so a clip runs a little past the length picked and never short of it. The list bounds only this widget: the `latent` input plans from whatever length reaches it, so a text-to-video clip of any other length is `Empty MiniMax H3 AV Latent` at that frame count connected there, exactly as I2VA, FL2VA and Ref2VA connect theirs. A combo input is not a numeric socket, so a `FLOAT` cannot be wired into `duration_seconds` and a saved workflow holding a length off the list is rejected before the node runs.
 
 The policy is fixed at node time from the latent the node made. If a different latent reaches the sampler, the wrapper clamps the window to whatever length arrives, the same as the manual node.
 

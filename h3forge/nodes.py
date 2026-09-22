@@ -378,7 +378,9 @@ class H3ForgeTimelineContextWindows:
                 "tooltip": (
                     "Clip length at 24 fps, snapped up to H3's 17k+5 frame grid, so the clip runs a little "
                     "past the length picked. Every length is planned the same way, so the windows and their "
-                    "overlap follow from this and max_window_seconds. Ignored when a latent is connected."
+                    "overlap follow from this and max_window_seconds. For a length that is not on this list, "
+                    "allocate it with Empty MiniMax H3 AV Latent and connect that to the latent input, which "
+                    "makes this choice moot."
                 ),
             }),
             "max_window_seconds": ("FLOAT", {
@@ -426,7 +428,7 @@ class H3ForgeTimelineContextWindows:
             else:
                 from comfy_extras.nodes_minimax_h3 import _empty_av_latent
 
-                seconds = float(duration_seconds)  # a picked choice, or a number wired into the widget
+                seconds = float(duration_seconds)  # the choices are whole seconds; the plan is not
                 plan = plan_for_seconds(seconds, max_window_seconds)
                 frames = frames_for_seconds(seconds)
                 latent, frame_count = _empty_av_latent(width, height, frames)
