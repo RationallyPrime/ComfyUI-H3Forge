@@ -46,6 +46,16 @@ def test_window_is_cycle_aligned_on_grid_and_covers_ramp_and_context():
         renoise.plan_window(311, 200, 100, 4, 4, crop=True)
 
 
+def test_window_keeps_trailing_context_and_covers_guides():
+    # Off-grid clip: sliding back must not drop the clean context after the interval.
+    w = renoise.plan_window(100, 80, 80, 0, 17, crop=True)
+    assert w.start + w.valid - 1 >= 97
+    w = renoise.plan_window(311, 150, 160, 4, 4, crop=True, cover=(150, 150 + 22 - 1))
+    assert w.start <= 150 and w.start + w.valid - 1 >= 171
+    assert renoise.guide_frame_count(1) == 1 and renoise.guide_frame_count(4) == 1
+    assert renoise.guide_frame_count(30) == 22
+
+
 def test_masks_track_the_region_and_pin_everything_else():
     window = renoise.plan_window(124, 40, 60, 6, 17, crop=True)
     mask = torch.zeros(1, 64, 96)
@@ -182,8 +192,11 @@ def test_window_node_builds_a_masked_av_latent_and_the_stitch_restores_the_clip(
     assert video.shape[2] == video_mask.shape[2] and video_mask.shape[-2:] == (4, 6)
     assert audio.shape[-1] == audio_mask.shape[-1] == round(length / 24 * 40)
     assert audio_mask.abs().sum() == 0
-    assert torch.all(plan["source"][150, :32, :48] == 0) and torch.equal(plan["source"][150, 40:], images[150, 40:])
+    assert plan["source"] is images  # the splice feeds only the encoder
     assert "renoise frames 150-180" in capsys.readouterr().out
+
+    with pytest.raises(ValueError, match="multiples of 32"):
+        nodes.H3ForgeRenoiseWindow().plan(torch.rand(124, 48, 96, 3), FakeVAE(), 10, 20, 1.0, 4, 4, True, 0, 0)
 
     out, blend = nodes.H3ForgeRenoiseStitch().stitch(plan, torch.ones(length, 64, 96, 3))
     assert blend.shape == (311, 64, 96)

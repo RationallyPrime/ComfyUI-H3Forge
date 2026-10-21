@@ -41,7 +41,7 @@
     "class_type": "VHS_LoadVideoPath",
     "inputs": {
       "video": "input/clip.mp4",
-      "force_rate": 0,
+      "force_rate": 24,
       "custom_width": 0,
       "custom_height": 0,
       "frame_load_cap": 0,

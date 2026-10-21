@@ -68,8 +68,12 @@ class Window:
     ramp: int
 
 
-def plan_window(source_frames: int, start: int, end: int, ramp: int, context: int, crop: bool) -> Window:
-    """Smallest cycle-aligned window covering the ramped interval plus ``context`` clean frames each side."""
+def plan_window(source_frames: int, start: int, end: int, ramp: int, context: int, crop: bool,
+                cover: tuple[int, int] | None = None) -> Window:
+    """Smallest cycle-aligned window covering the ramped interval plus ``context`` clean frames each side.
+
+    ``cover`` is an extra inclusive frame range the window must hold, such as a guide clip.
+    """
     if source_frames < 1:
         raise ValueError("the source clip has no frames")
     start = start if start >= 0 else source_frames + start
@@ -82,12 +86,15 @@ def plan_window(source_frames: int, start: int, end: int, ramp: int, context: in
         return Window(0, length, source_frames, (start, end), ramp)
     lo = max(0, start - ramp - context)
     hi = min(source_frames - 1, end + ramp + context)
+    if cover is not None:
+        lo, hi = min(lo, max(0, cover[0])), max(hi, min(source_frames - 1, cover[1]))
     first = lo // FRAMES_PER_CYCLE * FRAMES_PER_CYCLE
     length = align_frame_count(hi - first + 1)
     # Prefer a window made of real frames: slide it back a cycle at a time
-    # when it runs past the end, as long as it still covers the interval.
+    # when it runs past the end, as long as it still covers the interval, its
+    # trailing context and anything it must cover.
     while first + length > source_frames and first >= FRAMES_PER_CYCLE \
-            and first - FRAMES_PER_CYCLE + length > end + ramp:
+            and first - FRAMES_PER_CYCLE + length > hi:
         first -= FRAMES_PER_CYCLE
     return Window(first, length, min(length, source_frames - first), (start, end), ramp)
 
@@ -143,6 +150,15 @@ def spatial_masks(mask, frames: torch.Tensor, source_frames: int, interval: tupl
                          f"or one per renoised frame ({b - a + 1})")
     picked = _resize_masks(mask[index], height, width).clamp(0.0, 1.0)
     return _feather(_grow(picked, grow), feather)
+
+
+def guide_frame_count(frames: int) -> int:
+    """Frames native Add Guide anchors from a batch: one image, or the batch cut down to 17k+5."""
+    if frames < 5:
+        return 1
+    while frames % FRAMES_PER_CYCLE != LATENTS_PER_CYCLE:
+        frames -= 1
+    return frames
 
 
 def window_indices(window: Window) -> torch.Tensor:

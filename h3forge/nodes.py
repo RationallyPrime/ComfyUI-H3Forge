@@ -575,6 +575,7 @@ class H3ForgeReferencePipePrompt:
 
 
 RENOISE_PLAN = "H3FORGE_RENOISE"
+CANVAS_MULTIPLE = 32
 
 
 class H3ForgeRenoiseWindow:
@@ -637,29 +638,37 @@ class H3ForgeRenoiseWindow:
         from comfy_extras.nodes_minimax_h3 import _encode_ref_audio, temporal_shape
 
         source_frames, height, width = images.shape[0], images.shape[1], images.shape[2]
-        if height % renoise.SPATIAL_RATIO or width % renoise.SPATIAL_RATIO:
-            raise ValueError(f"{LOG} frames are {width}x{height}; H3 needs sides that are multiples of 16")
+        if height % CANVAS_MULTIPLE or width % CANVAS_MULTIPLE:
+            raise ValueError(f"{LOG} frames are {width}x{height}; H3 needs sides that are multiples of 32 "
+                             "(its 2x2 latent patches), so scale or crop the clip first")
         if audio is not None and audio_vae is None:
             raise ValueError(f"{LOG} the audio input needs the audio_vae input")
         try:
-            window = renoise.plan_window(source_frames, frame_start, frame_end, ramp_frames, context_frames,
-                                         crop_to_window)
-            source = images
-            guide = window.interval[0]
+            cover = first = None
             if inpainted_frames is not None:
                 first = inpainted_frame_idx if inpainted_frame_idx >= 0 else source_frames + inpainted_frame_idx
-                if window.start <= first < window.start + window.valid:
-                    guide = first
+                # The window holds the whole guide clip Add Guide will anchor, so its offset is usable.
+                cover = (first, first + renoise.guide_frame_count(inpainted_frames.shape[0]) - 1)
+                if cover[0] < 0 or cover[1] >= source_frames:
+                    raise ValueError(f"inpainted frames {cover[0]}-{cover[1]} do not fit in the clip's "
+                                     f"{source_frames} frames")
+            window = renoise.plan_window(source_frames, frame_start, frame_end, ramp_frames, context_frames,
+                                         crop_to_window, cover)
+            # The splice only feeds the encoder; the stitch pastes onto the untouched clip.
+            encoded = images
+            guide = window.interval[0]
+            if inpainted_frames is not None:
+                guide = first
                 frames = torch.arange(first, first + inpainted_frames.shape[0])
                 region = None if mask is None else renoise.spatial_masks(
                     mask, frames, source_frames, window.interval, height, width, mask_grow, mask_feather)
-                source = renoise.splice(images, inpainted_frames, first, region)
+                encoded = renoise.splice(images, inpainted_frames, first, region)
             spatial = renoise.spatial_masks(mask, renoise.window_indices(window), source_frames, window.interval,
                                             height, width, mask_grow, mask_feather)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
         blend = renoise.blend_masks(spatial, window)
-        video = vae.encode(renoise.window_frames(source, window)[..., :3])
+        video = vae.encode(renoise.window_frames(encoded, window)[..., :3])
         frame_count, latent_t, audio_t = temporal_shape(window.length)
         if frame_count != window.length or video.shape[2] != latent_t:
             raise RuntimeError(f"{LOG} {window.length} frames encoded to {video.shape[2]} latents, expected {latent_t}")
@@ -683,7 +692,7 @@ class H3ForgeRenoiseWindow:
               f"{touched} renoised); denoise x{denoise:.2f}; audio "
               f"{'renoised' if audio is not None and renoise_audio else 'kept' if audio is not None else 'free'}",
               flush=True)
-        plan = {"window": window, "source": source, "blend": blend}
+        plan = {"window": window, "source": images, "blend": blend}
         return (latent, plan, width, height, window.length, guide - window.start)
 
 
