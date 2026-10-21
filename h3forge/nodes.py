@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import torch
+
 from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
 from .context import SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
+from . import renoise
 from .prompt import (
     combine_conditioning_segments,
     compose_segment_prompts,
@@ -571,6 +574,164 @@ class H3ForgeReferencePipePrompt:
         return combine_conditioning_segments(conditionings, durations), latent
 
 
+RENOISE_PLAN = "H3FORGE_RENOISE"
+CANVAS_MULTIPLE = 32
+
+
+class H3ForgeRenoiseWindow:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE", {"tooltip": "The existing clip's frames at 24 fps, e.g. from Load Video."}),
+            "vae": ("VAE", {"tooltip": "MiniMax H3 video VAE."}),
+            "frame_start": ("INT", {"default": 0, "min": -9999, "max": 9999,
+                                    "tooltip": "First frame to renoise at full strength. Negative counts from the end."}),
+            "frame_end": ("INT", {"default": 48, "min": -9999, "max": 9999,
+                                  "tooltip": "Last frame to renoise at full strength (inclusive). Negative counts from the end."}),
+            "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": (
+                "Multiplier on the sampler's sigma inside the mask: native H3 runs a row with mask value m at "
+                "sigma = m * sigma. Leave at 1.0 and set the strength with the sampler's denoise, as in the face "
+                "pass; lower it to weaken the masked region against that.")}),
+            "ramp_frames": ("INT", {"default": 12, "min": 0, "max": 240, "tooltip": (
+                "Frames on each side of the range over which the renoise fades in and out (smoothstep), so the "
+                "fixed stretch joins the untouched clip without a seam. 0 is a hard cut.")}),
+            "context_frames": ("INT", {"default": 17, "min": 0, "max": 480, "tooltip": (
+                "Clean frames kept on each side of the ramp inside the sampled window. They are pinned to the "
+                "source and give the model the motion to continue.")}),
+            "crop_to_window": ("BOOLEAN", {"default": True, "tooltip": (
+                "Sample only the window around the range (aligned to H3's 17-frame cycle) instead of the whole "
+                "clip. The stitch pastes it back.")}),
+            "mask_grow": ("INT", {"default": 8, "min": 0, "max": 256, "tooltip": "Grow the mask by this many pixels."}),
+            "mask_feather": ("INT", {"default": 16, "min": 0, "max": 256,
+                                     "tooltip": "Soften the mask edge over this many pixels."}),
+        }, "optional": {
+            "mask": ("MASK", {"tooltip": (
+                "Region to renoise: one static mask, one per clip frame, or one per frame of the range. "
+                "Unconnected renoises the whole frame.")}),
+            "audio": ("AUDIO", {"tooltip": "The clip's soundtrack. Kept as is unless renoise_audio is on."}),
+            "audio_vae": ("VAE", {"tooltip": "MiniMax H3 audio VAE, needed with audio."}),
+            "renoise_audio": ("BOOLEAN", {"default": False,
+                                          "tooltip": "Also renoise the soundtrack over the range and its ramps."}),
+            "inpainted_frames": ("IMAGE", {"tooltip": (
+                "Fixed frames (e.g. an inpainted keyframe) pasted over the source through the mask before "
+                "encoding, so the renoise starts from the fix. To anchor it as well, connect the same image to "
+                "Add Guide for MiniMax H3 with frame_idx from guide_frame_idx (window-relative).")}),
+            "inpainted_frame_idx": ("INT", {"default": 0, "min": -9999, "max": 9999,
+                                            "tooltip": "Clip frame where the first inpainted frame goes."}),
+        }}
+
+    RETURN_TYPES = ("LATENT", RENOISE_PLAN, "INT", "INT", "INT", "INT")
+    RETURN_NAMES = ("latent", "plan", "width", "height", "length", "guide_frame_idx")
+    FUNCTION = "plan"
+    CATEGORY = "latent/minimax"
+    DESCRIPTION = (
+        "Renoise one region over one stretch of an existing MiniMax H3 clip and keep the rest. Encodes the "
+        "window around the frame range into an AV latent whose noise mask is the (grown, feathered) mask times "
+        "a ramped interval weight; everything outside is pinned to the source. Feed the latent to a sampler "
+        "with conditioning sized by width/height/length, decode, and paste back with Renoise Stitch."
+    )
+
+    def plan(self, images, vae, frame_start, frame_end, denoise, ramp_frames, context_frames, crop_to_window,
+             mask_grow, mask_feather, mask=None, audio=None, audio_vae=None, renoise_audio=False,
+             inpainted_frames=None, inpainted_frame_idx=0):
+        import comfy.nested_tensor
+        from comfy_extras.nodes_minimax_h3 import _encode_ref_audio, temporal_shape
+
+        source_frames, height, width = images.shape[0], images.shape[1], images.shape[2]
+        if height % CANVAS_MULTIPLE or width % CANVAS_MULTIPLE:
+            raise ValueError(f"{LOG} frames are {width}x{height}; H3 needs sides that are multiples of 32 "
+                             "(its 2x2 latent patches), so scale or crop the clip first")
+        if audio is not None and audio_vae is None:
+            raise ValueError(f"{LOG} the audio input needs the audio_vae input")
+        try:
+            cover = first = None
+            if inpainted_frames is not None:
+                first = inpainted_frame_idx if inpainted_frame_idx >= 0 else source_frames + inpainted_frame_idx
+                # The window holds the whole guide clip Add Guide will anchor, so its offset is usable.
+                cover = (first, first + renoise.guide_frame_count(inpainted_frames.shape[0]) - 1)
+                if cover[0] < 0 or cover[1] >= source_frames:
+                    raise ValueError(f"inpainted frames {cover[0]}-{cover[1]} do not fit in the clip's "
+                                     f"{source_frames} frames")
+            window = renoise.plan_window(source_frames, frame_start, frame_end, ramp_frames, context_frames,
+                                         crop_to_window, cover)
+            # The splice only feeds the encoder; the stitch pastes onto the untouched clip.
+            encoded = images
+            guide = window.interval[0]
+            if inpainted_frames is not None:
+                guide = first
+                frames = torch.arange(first, first + inpainted_frames.shape[0])
+                region = None if mask is None else renoise.spatial_masks(
+                    mask, frames, source_frames, window.interval, height, width, mask_grow, mask_feather)
+                encoded = renoise.splice(images, inpainted_frames, first, region)
+            spatial = renoise.spatial_masks(mask, renoise.window_indices(window), source_frames, window.interval,
+                                            height, width, mask_grow, mask_feather)
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+        blend = renoise.blend_masks(spatial, window)
+        video = vae.encode(renoise.window_frames(encoded, window)[..., :3])
+        frame_count, latent_t, audio_t = temporal_shape(window.length)
+        if frame_count != window.length or video.shape[2] != latent_t:
+            raise RuntimeError(f"{LOG} {window.length} frames encoded to {video.shape[2]} latents, expected {latent_t}")
+        video_mask = renoise.video_noise_mask(blend, window, denoise).to(video.device)
+        if audio is not None:
+            encoded, _ = _encode_ref_audio(audio_vae, renoise.audio_slice(audio, window))
+            audio_latent = renoise.fit_audio_latent(encoded, audio_t).to(video.device)
+            audio_mask = renoise.audio_noise_mask(audio_t, window, denoise, renoise_audio)
+        else:
+            # Nothing to keep: let the sampler write a soundtrack, and mux the clip's own afterwards.
+            audio_latent = torch.zeros(1, 32, 2, audio_t, device=video.device)
+            audio_mask = torch.ones(1, 1, 2, audio_t)
+        latent = {
+            "samples": comfy.nested_tensor.NestedTensor((video, audio_latent)),
+            "noise_mask": comfy.nested_tensor.NestedTensor((video_mask, audio_mask.to(video.device))),
+        }
+        a, b = window.interval
+        touched = int((video_mask.amax(dim=(0, 1, 3, 4)) > 0).sum())
+        print(f"{LOG} renoise frames {a}-{b} (ramp {window.ramp}) in window {window.start}-"
+              f"{window.start + window.length - 1} ({window.length} frames, {latent_t} latents, "
+              f"{touched} renoised); denoise x{denoise:.2f}; audio "
+              f"{'renoised' if audio is not None and renoise_audio else 'kept' if audio is not None else 'free'}",
+              flush=True)
+        plan = {"window": window, "source": images, "blend": blend}
+        return (latent, plan, width, height, window.length, guide - window.start)
+
+
+class H3ForgeRenoiseStitch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "plan": (RENOISE_PLAN,),
+            "renoised_images": ("IMAGE", {"tooltip": "The decoded window from the sampler."}),
+        }, "optional": {
+            "source_images": ("IMAGE", {"tooltip": (
+                "Clip to paste into instead of the one the plan was made from (same length and size).")}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "blend_mask")
+    FUNCTION = "stitch"
+    CATEGORY = "latent/minimax"
+    DESCRIPTION = (
+        "Paste a renoised window back into the full clip through the plan's pixel mask (mask x ramped interval). "
+        "Every frame and pixel outside it stays bit-identical to the source. blend_mask is the full-clip paste "
+        "weight, for checking the region."
+    )
+
+    def stitch(self, plan, renoised_images, source_images=None):
+        window, blend = plan["window"], plan["blend"]
+        source = plan["source"] if source_images is None else source_images
+        if source.shape[0] < window.start + window.valid:
+            raise ValueError(f"{LOG} source clip has {source.shape[0]} frames; the plan needs "
+                             f"{window.start + window.valid}")
+        try:
+            images = renoise.stitch(source, window, blend, renoised_images)
+        except ValueError as exc:
+            raise ValueError(f"{LOG} {exc}") from exc
+        full = torch.zeros(source.shape[0], *blend.shape[1:])
+        full[window.start:window.start + window.valid] = blend[:window.valid]
+        return (images, full)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
@@ -578,6 +739,8 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgePipePrompt": H3ForgePipePrompt,
     "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
+    "H3ForgeRenoiseWindow": H3ForgeRenoiseWindow,
+    "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
@@ -586,4 +749,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
     "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
+    "H3ForgeRenoiseWindow": "H3 Forge — Masked Interval Renoise",
+    "H3ForgeRenoiseStitch": "H3 Forge — Renoise Stitch",
 }

@@ -15,6 +15,7 @@
 ./h3forge/nag.py
 ./h3forge/nodes.py
 ./h3forge/prompt.py
+./h3forge/renoise.py
 ./h3forge/state.py
 ./h3forge/timeline.py
 ./pyproject.toml
@@ -26,6 +27,7 @@
 ./tests/test_layout_windows.py
 ./tests/test_nag.py
 ./tests/test_nodes.py
+./tests/test_renoise.py
 ./tests/test_merge_announcement.py
 ./tests/test_state.py
 ./docs/audit-repair-workflows/early_dense_context.json

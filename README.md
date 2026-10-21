@@ -8,6 +8,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 4. **Pipe-delimited timeline prompting** with independently encoded, optionally unequal prompt spans and a reusable global anchor.
 5. **Image/video/voice reference prompting** that prepares shared native Ref2VA references once.
 6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
+7. **Masked interval renoise** — re-denoise one region over one stretch of an existing clip and paste it back, leaving the rest of the clip untouched.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
@@ -153,6 +154,26 @@ In `lite` mode the added attention cost is roughly `target rows × text length` 
 Knobs: start at `nag_scale 3.0` (not Wan's 11 — H3 is distilled, single-stream, and jointly generates speech and imagery, so aggressive attention extrapolation has more opportunities to damage identity, voice, or sync). Find stable `nag_tau`/`nag_alpha`, then leave them fixed and tune only the scale. `nag_sigma_end` stops NAG once sigma falls below it, saving compute in the late schedule. `first_block`/`last_block` select the DiT blocks; `video_strength`/`audio_strength` scale the injected delta per modality.
 
 The node composes with `H3 Forge — Sliding Attention + FETA` in either wiring order (both configure one shared H3Forge runtime) and works standalone. Do not stack generic ComfyUI-NAG on top.
+
+### H3 Forge — Masked Interval Renoise + Renoise Stitch
+
+A glitch confined to part of the picture for part of a clip (a hand pointing at the wrong place, a drifting face, a braid that changes colour) does not need a full regeneration. Inpaint the area if the fix needs new content, then renoise only the frames it affects.
+
+Native H3 already runs each packed video row at its own strength: a latent noise-mask value `m` puts that row at `sigma = m · sigma`, and `m = 0` rows are pinned to the clean source at the condition timestep on every step. **Masked Interval Renoise** builds that mask and the latent around it:
+
+- **Region:** the `mask` input (one static mask, one per clip frame, or one per frame of the range; unconnected means the whole frame), grown by `mask_grow` and feathered over `mask_feather` pixels.
+- **Interval:** full strength on `frame_start`–`frame_end` (inclusive, negative counts from the end), with a smoothstep ramp over `ramp_frames` on each side so the fixed stretch fades into the untouched clip instead of starting at a seam.
+- **Window:** with `crop_to_window`, only the shortest stretch on H3's 17-frame encoder cycle that holds the ramped range plus `context_frames` clean frames on each side is encoded and sampled. The H3 video VAE encodes each 17-frame cycle independently, so the window's latents are the full clip's; the clean context is pinned and gives the model the motion to continue. A 10-second clip with a 1.5-second fix samples about 4 seconds.
+- **Fix frames:** `inpainted_frames` (for example an inpainted keyframe) are pasted over the source through the mask at `inpainted_frame_idx` before encoding, so the renoise starts from the fix. To anchor it as well, connect the same image to native **Add Guide for MiniMax H3** with `frame_idx` from the node's `guide_frame_idx` output (window-relative).
+- **Audio:** connect the clip's `audio` and the audio VAE to keep the soundtrack pinned (or `renoise_audio` to renoise it over the interval too). Without audio the sampler writes a throwaway soundtrack; mux the clip's own afterwards.
+
+Outputs: the AV `latent` (samples plus nested noise mask), the `plan` for the stitch, and `width`/`height`/`length` for the prompt node that conditions the window (for example `MiniMaxH3ImageToVideo` with no keyframes, `H3 Forge — Pipe Timeline Prompt`, or Reference to Video for a character adapter pass). Sample with any stock sampler; the strength is the sampler's `denoise` times the node's `denoise` multiplier, so leave the multiplier at 1.0 and set `denoise` on the sampler as in the face pass. With `shift_video 12`, sampler `denoise 0.6` already starts the masked rows near sigma 0.95; go lower for texture or colour fixes.
+
+**Re-posing needs guides, not a prompt.** In GPU tests a text prompt alone did not move a raised arm, even at sampler `denoise 0.8`: the masked region was fully redrawn but kept the pose implied by the unmasked body. To change a pose, inpaint the new pose into keyframes and give it as guides at several frames across the interval (for example its start, middle and end, or the last frame when the interval runs to the end of the clip). A single guide holds only near its own frame, and the motion drifts back to the source pose away from it.
+
+**Renoise Stitch** pastes the decoded window back into the full clip through the same pixel mask times the ramped interval weight. Every frame and pixel outside it is bit-identical to the source, whatever the VAE round trip did to the pinned context. Its `blend_mask` output is the full-clip paste weight, for checking the region.
+
+The example graph is in [`docs/renoise-workflows`](docs/renoise-workflows) in API and UI format: load the clip with VideoHelperSuite, a region mask PNG, an inpainted keyframe, then renoise frames 96–132 and write the stitched clip with the original soundtrack.
 
 ## Requirements
 
