@@ -111,21 +111,30 @@ def _executor(fn):
     return Executor()
 
 
+@pytest.mark.parametrize("audio_context", ["auto", "full"])
 @pytest.mark.parametrize("total,window,durations", [(427, 80, (2, 18, 40)), (17, 25, (1, 1, 1))])
-def test_every_beat_owns_its_video_and_audio_output(total, window, durations, capsys):
+def test_every_beat_owns_its_video_and_audio_output(total, window, durations, audio_context, capsys):
     x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
     payload["h3forge_prompt_segment_durations"] = durations
     calls = []
+    audio_lengths = set()
+    expect_full = audio_context == "full" or total <= window
 
     def run(local_x, timestep, text, options, **kwargs):
         layout = kwargs["minimax_payload"]["layout"]
         assert layout.signature[0] == text.shape[1]
+        assert layout.signature[4] == local_x[1].shape[-1]
         assert kwargs["minimax_payload"]["text_token_tags"].numel() == text.shape[1]
-        assert local_x[1] is x[1]  # every utterance remains directly visible
+        if expect_full:
+            assert local_x[1] is x[1]  # every utterance remains directly visible
+        else:
+            assert local_x[1].shape[-1] < x[1].shape[-1]
+        audio_lengths.add(local_x[1].shape[-1])
         calls.append((int(text[0, 0, 0]), text.shape[1]))
         return [torch.full_like(t, float(text[0, 0, 0])) for t in local_x]
 
-    result = make_context_wrapper(ContextPolicy(window, 10, True, "pyramid", segment_seams="exclusive"))(
+    policy = ContextPolicy(window, 10, True, "pyramid", segment_seams="exclusive", audio_context=audio_context)
+    result = make_context_wrapper(policy)(
         _executor(run), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
     ranges, cuts = segment_ranges(total, 3, durations)
@@ -135,14 +144,25 @@ def test_every_beat_owns_its_video_and_audio_output(total, window, durations, ca
         assert torch.all(result[0][:, :, lo:hi] == index + 1)
         assert torch.all(result[1][..., audio_cuts[index]:audio_cuts[index + 1]] == index + 1)
     assert set(calls) == {(1, 3), (2, 19), (3, 5)}
+    assert len(audio_lengths) == 1
     log = capsys.readouterr().out
     assert "stagger=off" in log and "seams=exclusive" in log
-    assert "prompt_frame_cuts=" in log and "audio_context=full:" in log
+    assert "prompt_frame_cuts=" in log
+    if expect_full:
+        assert f"audio_context=full:{x[1].shape[-1]}" in log
+    else:
+        (audio_win,) = audio_lengths
+        assert f"audio_context=window:{audio_win}/{x[1].shape[-1]}" in log
 
 
-def _prompt_valued_run(x, calls):
+def _prompt_valued_run(x, calls, *, expect_full_audio=False):
     def run(local_x, timestep, text, options, **kwargs):
-        assert local_x[1] is x[1]
+        layout = kwargs["minimax_payload"]["layout"]
+        assert layout.signature[4] == local_x[1].shape[-1]
+        if expect_full_audio:
+            assert local_x[1] is x[1]
+        else:
+            assert local_x[1].shape[-1] < x[1].shape[-1]
         calls.append(int(text[0, 0, 0]))
         return [torch.full_like(t, float(text[0, 0, 0])) for t in local_x]
     return run
@@ -169,6 +189,7 @@ def test_blended_seams_ramp_between_prompts_and_stagger(capsys):
     assert not torch.all(audio == audio.round())  # the audio seam is blended too
     log = capsys.readouterr().out
     assert "stagger=on" in log and "seams=blend" in log and "prompt_windows=1x1,2x2,3x1" in log
+    assert "audio_context=window:143/377" in log
 
     # A later step moves the seams: the same graph, one sampler step further on.
     calls.clear()
@@ -183,7 +204,7 @@ def test_blended_seams_rescue_beats_inside_a_single_window():
     x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
     calls = []
     result = make_context_wrapper(ContextPolicy(25, 10, True, "pyramid"))(
-        _executor(_prompt_valued_run(x, calls)), x, torch.tensor([1000]), context,
+        _executor(_prompt_valued_run(x, calls, expect_full_audio=True)), x, torch.tensor([1000]), context,
         {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}, minimax_payload=payload)
     ranges, cuts = segment_ranges(total, 3)
     # One clip-wide window carries the majority beat (beat 1 on a tie); beats 2 and 3
@@ -215,6 +236,91 @@ def test_blended_rescue_beat_is_owned_inside_a_multi_window_plan():
     audio_cut = round(cuts[1] * 5 / 3)
     assert torch.all(result[1][..., :audio_cut] == 1)
     assert calls.count(1) == 1
+
+
+def test_audio_context_auto_keeps_single_prompt_full_and_windows_pipe_prompts(capsys):
+    total, window, overlap = 67, 25, 8
+    options = {"sigmas": torch.tensor([1.]), "sample_sigmas": torch.tensor([1., 0.])}
+    for text_lengths, mode, expect_full in [
+        ((5,), "auto", True),
+        ((5,), "window", False),
+        ((3, 7), "auto", False),
+        ((3, 7), "full", True),
+    ]:
+        x, context, payload = _context_inputs(total, text_lengths=text_lengths)
+        audio_t = x[1].shape[-1]
+        audio_mask = torch.linspace(0.0, 1.0, audio_t).view(1, 1, 1, audio_t).expand(1, 1, 2, audio_t).contiguous()
+        seen_lengths = set()
+
+        def run(local_x, timestep, text, opts, **kwargs):
+            layout = kwargs["minimax_payload"]["layout"]
+            mask = kwargs["audio_denoise_mask"]
+            seen_lengths.add(local_x[1].shape[-1])
+            if expect_full:
+                assert local_x[1] is x[1]
+                assert mask is audio_mask
+                assert layout._h3forge_audio_offset == 0
+            else:
+                offset = layout._h3forge_audio_offset
+                assert local_x[1].shape[-1] == 143
+                assert torch.equal(mask, audio_mask[..., offset:offset + 143])
+            return [torch.ones_like(local_x[0]), torch.ones_like(local_x[1])]
+
+        make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", audio_context=mode))(
+            _executor(run), x, torch.tensor([1000]), context, options,
+            minimax_payload=payload, audio_denoise_mask=audio_mask)
+        log = capsys.readouterr().out
+        if expect_full:
+            assert seen_lengths == {audio_t}
+            assert f"audio_context=full:{audio_t}" in log
+        else:
+            assert seen_lengths == {143}
+            assert f"audio_context=window:143/{audio_t}" in log
+
+
+def test_windowed_audio_preserves_exact_global_ticks_across_stagger_and_tail_clamp():
+    from h3forge.layout import target_segments
+
+    total, window, overlap = 427, 80, 10
+    x, context, payload = _context_inputs(total, text_lengths=(3, 5, 4))
+    full_layout = payload["layout"]
+    full_seg = target_segments(full_layout)
+    audio_t = x[1].shape[-1]
+    ticks = torch.arange(audio_t, dtype=torch.float32)
+    x[1] = torch.stack([ticks, ticks + 10000.0], dim=0).view(1, 1, 2, audio_t)
+    audio_mask = torch.linspace(0.0, 1.0, audio_t).view(1, 1, 1, audio_t).expand(1, 1, 2, audio_t).contiguous()
+
+    for sigma, schedule in ((1.0, [1.0, 0.5, 0.0]), (0.5, [1.0, 0.5, 0.0])):
+        offsets = []
+
+        def echo(local_x, timestep, text, opts, **kwargs):
+            local_layout = kwargs["minimax_payload"]["layout"]
+            local_seg = target_segments(local_layout)
+            assert local_x[1].shape[-1] == 455
+            assert local_layout.signature[4] == 455
+            offset = local_layout._h3forge_audio_offset
+            offsets.append(offset)
+            assert torch.equal(local_x[1], x[1][..., offset:offset + 455])
+            assert torch.equal(kwargs["audio_denoise_mask"], audio_mask[..., offset:offset + 455])
+            assert torch.equal(
+                local_layout.position_ids[local_seg.audio_start:local_seg.audio_start + 455],
+                full_layout.position_ids[full_seg.audio_start + offset:full_seg.audio_start + offset + 455],
+            )
+            assert torch.equal(
+                local_layout.position_ids[local_seg.audio_start + 455:local_seg.audio_stop],
+                full_layout.position_ids[
+                    full_seg.audio_start + audio_t + offset:full_seg.audio_start + audio_t + offset + 455
+                ],
+            )
+            return [local_x[0].clone(), local_x[1].clone()]
+
+        options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor(schedule)}
+        out = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
+            _executor(echo), x, torch.tensor([sigma * 1000]), context, options,
+            minimax_payload=payload, audio_denoise_mask=audio_mask)
+        # Tail window [347, 427) spans [1963, 2417) = 454 ticks, so its input clamps to [1962, 2417).
+        assert offsets[0] == 0 and offsets[-1] == audio_t - 455
+        assert torch.allclose(out[1], x[1], atol=1e-5, rtol=0.0)
 
 
 def test_window_failure_never_retries_full_clip():

@@ -7,13 +7,14 @@ from itertools import pairwise
 import torch
 
 from .control import control_window
-from .layout import audio_range_for_video_window, clone_window_layout, padded_spatial_shape
+from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
 from .state import require_eager_allocations, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
+AUDIO_CONTEXT_MODES = ("auto", "window", "full")
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,13 @@ class ContextPolicy:
     blend: str = "pyramid"
     segment_seams: str = "blend"
     freenoise: bool = True
+    audio_context: str = "auto"
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
+        if self.audio_context not in AUDIO_CONTEXT_MODES:
+            raise ValueError(f"audio_context must be one of {AUDIO_CONTEXT_MODES}, got {self.audio_context!r}")
 
 
 def ordered_halving(value: int) -> float:
@@ -187,6 +191,7 @@ def context_plan_summary(
     assignments: list[int] | None = None,
     frame_cuts: list[int] | None = None,
     audio_t: int | None = None,
+    audio_window: int | None = None,
     max_phase: int | None = None,
     seams: str | None = None,
 ) -> str:
@@ -221,7 +226,10 @@ def context_plan_summary(
     if frame_cuts is not None:
         bits.append("prompt_frame_cuts=" + ",".join(map(str, frame_cuts)))
     if audio_t is not None:
-        bits.append(f"audio_context=full:{audio_t}")
+        if audio_window is not None and audio_window < audio_t:
+            bits.append(f"audio_context=window:{audio_window}/{audio_t}")
+        else:
+            bits.append(f"audio_context=full:{audio_t}")
     return " ".join(bits)
 
 
@@ -229,6 +237,12 @@ def _slice_optional_video(mask, v0, v1):
     if mask is None:
         return None
     return mask[:, :, v0:v1]
+
+
+def _slice_optional_audio(mask, a0, a1):
+    if mask is None or (a0 == 0 and a1 == mask.shape[-1]):
+        return mask
+    return mask[..., a0:a1]
 
 
 def _beat_for_window(v0, v1, ranges):
@@ -351,9 +365,8 @@ def _split_packed_latent(packed: torch.Tensor, shapes) -> list[torch.Tensor]:
 def make_freenoise_wrapper(policy: ContextPolicy):
     """SAMPLER_SAMPLE wrapper: FreeNoise-shuffle the video noise on the window grid.
 
-    Only the video stream is shuffled. Audio is generated with its complete
-    timeline visible to every window, so it gains nothing from a shared noise
-    pool, and periodic audio noise is an invitation to periodic audio.
+    Only the video stream is shuffled: periodic audio noise is an invitation to
+    periodic audio, and full-audio runs already share one timeline across windows.
     """
     def wrapper(executor, guider, sigmas, extra_args, callback, noise, *args, **kwargs):
         shapes = getattr(getattr(guider, "inner_model", None), "latent_shapes", None)
@@ -377,7 +390,7 @@ def make_freenoise_wrapper(policy: ContextPolicy):
 
 
 def make_context_wrapper(policy: ContextPolicy):
-    """Window video while every forward sees the complete shared audio timeline."""
+    """Window video with full-timeline or synchronized windowed audio context."""
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
@@ -402,6 +415,8 @@ def make_context_wrapper(policy: ContextPolicy):
             from comfy.ldm.minimax.model import PackedLayout
             full_layout = PackedLayout(max(c.shape[1] for c in prompts), total_t, padded_h, padded_w,
                                        audio_t, keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+        window_audio = policy.audio_context == "window" or (policy.audio_context == "auto" and segmented)
+        audio_win = audio_window_length(full_layout, window) if window_audio else audio_t
         frame_cuts = None
         ranges = []
         audio_cuts = [0, audio_t]
@@ -434,7 +449,7 @@ def make_context_wrapper(policy: ContextPolicy):
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
@@ -442,19 +457,30 @@ def make_context_wrapper(policy: ContextPolicy):
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
         for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+            a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
+            if window_audio and audio_win < audio_t:
+                local_audio_win = audio_win if v1 - v0 == window else audio_window_length(full_layout, v1 - v0)
+                in_a0 = min(a0, audio_t - local_audio_win)
+                in_a1 = in_a0 + local_audio_win
+            else:
+                in_a0, in_a1 = 0, audio_t
             local_context = prompts[index]
             local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
                 video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
-                video_range=(v0, v1), audio_range=(0, audio_t),
+                video_range=(v0, v1), audio_range=(in_a0, in_a1),
                 keyframes=payload.get("keyframes"), refs=payload.get("refs"))
             local_payload = {**payload, "layout": local_layout}
             if tags is not None:
                 local_payload["text_token_tags"] = tags[index]
             local_kwargs = {**kwargs, "minimax_payload": local_payload,
                             "denoise_mask": _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)}
-            # The global audio input and denoise mask travel intact. Only the
-            # output projection is local, so all windows can see prior utterances.
-            local_x = [video_x[:, :, v0:v1], audio_x]
+            if "audio_denoise_mask" in kwargs:
+                local_kwargs["audio_denoise_mask"] = _slice_optional_audio(kwargs["audio_denoise_mask"], in_a0, in_a1)
+            # Single-prompt runs keep the full audio timeline so later windows hear
+            # earlier utterances; pipe-prompt runs slice to a fixed-length window so
+            # dense audio self-attention cannot bleed speech from other beats.
+            local_audio = audio_x if (in_a0 == 0 and in_a1 == audio_t) else audio_x[..., in_a0:in_a1]
+            local_x = [video_x[:, :, v0:v1], local_audio]
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
@@ -476,7 +502,6 @@ def make_context_wrapper(policy: ContextPolicy):
                 video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
                 video_den[:, :, w0:w1].add_(vw[:, :, keep])
 
-            a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             write_a0, write_a1 = a0, a1
             if owned:
                 write_a0, write_a1 = max(a0, audio_cuts[index]), min(a1, audio_cuts[index + 1])
@@ -485,7 +510,7 @@ def make_context_wrapper(policy: ContextPolicy):
                                ramp_start=a0 > 0, ramp_end=a1 < audio_t).view(1, 1, 1, -1)
             holes = [(audio_cuts[b], audio_cuts[b + 1]) for b in excluded]
             for w0, w1 in _subtract_intervals(write_a0, write_a1, holes):
-                audio_acc[..., w0:w1].add_(a_out[..., w0:w1].float() * aw[..., w0 - a0:w1 - a0])
+                audio_acc[..., w0:w1].add_(a_out[..., w0 - in_a0:w1 - in_a0].float() * aw[..., w0 - a0:w1 - a0])
                 audio_den[..., w0:w1].add_(aw[..., w0 - a0:w1 - a0])
 
         # Unconditional: a zero-weight latent would otherwise divide by the clamp

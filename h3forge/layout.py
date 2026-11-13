@@ -141,6 +141,37 @@ def audio_range_for_video_window(full_layout, v0: int, v1: int) -> tuple[int, in
     return a0, a1
 
 
+def audio_window_length(full_layout, video_window: int) -> int:
+    """Fixed audio-tick span covering every ``video_window``-latent slice of ``full_layout``.
+
+    A fixed video window overlaps ``N`` or ``N + 1`` 40 Hz audio ticks depending
+    on where its start lands on H3's ``1,4,4,4,4`` cadence. Taking the maximum
+    across all starts keeps ``PackedLayout.signature`` constant across windows
+    and stagger phases so sparse ``flex_attention`` compiles one shape per prompt.
+    """
+    seg = target_segments(full_layout)
+    latent_t, frame_rows = video_shape_from_layout(full_layout)
+    video_window = int(video_window)
+    if not (1 <= video_window <= latent_t):
+        raise ValueError(f"invalid video_window={video_window} for T={latent_t}")
+    audio_t = (seg.audio_stop - seg.audio_start) // 2
+    if video_window == latent_t or audio_t <= 1:
+        return audio_t
+
+    vpos = full_layout.position_ids[seg.video_start:seg.video_stop, 0].reshape(
+        latent_t, frame_rows)[:, 0].to(torch.float64)
+    apos = full_layout.position_ids[seg.audio_start:seg.audio_stop, 0]
+    origin = float(apos[0])
+    from comfy.ldm.minimax.model import _video_t_spans
+
+    final_stop = vpos[-1:] + float(_video_t_spans(latent_t)[-1])
+    starts = vpos[:latent_t - video_window + 1]
+    stops = torch.cat([vpos[video_window:], final_stop])
+    a0 = torch.floor(starts - origin).to(torch.int64).clamp(min=0)
+    a1 = torch.ceil(stops - origin).to(torch.int64).clamp(max=audio_t)
+    return max(1, min(audio_t, int((a1 - a0).max().item())))
+
+
 def modality_vectors(layout, device):
     """Per-token time/space coordinates and target-modality tags for sparse routing."""
     seg = target_segments(layout)
