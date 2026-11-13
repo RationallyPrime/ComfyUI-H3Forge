@@ -415,8 +415,6 @@ def make_context_wrapper(policy: ContextPolicy):
             from comfy.ldm.minimax.model import PackedLayout
             full_layout = PackedLayout(max(c.shape[1] for c in prompts), total_t, padded_h, padded_w,
                                        audio_t, keyframes=payload.get("keyframes"), refs=payload.get("refs"))
-        window_audio = policy.audio_context == "window" or (policy.audio_context == "auto" and segmented)
-        audio_win = audio_window_length(full_layout, window) if window_audio else audio_t
         frame_cuts = None
         ranges = []
         audio_cuts = [0, audio_t]
@@ -439,6 +437,18 @@ def make_context_wrapper(policy: ContextPolicy):
         else:
             starts = window_starts(total_t, window, overlap, phase, max_phase)
             plan = [(0, v0, v0 + window, v0, v0 + window, ()) for v0 in starts]
+        # Windowing audio under ``auto`` requires every beat to fit in and run in
+        # a single window: if two windows carry the same beat prompt, slicing
+        # hides the beat's earlier audio and reopens F11 inside that beat.
+        single_window_beats = (
+            segmented
+            and len({p[0] for p in plan}) == len(plan)
+            and all(hi - lo <= window for lo, hi in ranges)
+        )
+        window_audio = policy.audio_context == "window" or (
+            policy.audio_context == "auto" and single_window_beats
+        )
+        audio_win = audio_window_length(full_layout, window) if window_audio else audio_t
         # A window whose write interval is narrower than its extent owns that
         # interval: its audio is clipped to the beat's ticks as well. Windows that
         # write their whole extent blend audio over the window's own ticks, minus
@@ -459,9 +469,8 @@ def make_context_wrapper(policy: ContextPolicy):
         for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
-                local_audio_win = audio_win if v1 - v0 == window else audio_window_length(full_layout, v1 - v0)
-                in_a0 = min(a0, audio_t - local_audio_win)
-                in_a1 = in_a0 + local_audio_win
+                in_a0 = min(a0, audio_t - audio_win)
+                in_a1 = in_a0 + audio_win
             else:
                 in_a0, in_a1 = 0, audio_t
             local_context = prompts[index]
@@ -476,9 +485,9 @@ def make_context_wrapper(policy: ContextPolicy):
                             "denoise_mask": _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)}
             if "audio_denoise_mask" in kwargs:
                 local_kwargs["audio_denoise_mask"] = _slice_optional_audio(kwargs["audio_denoise_mask"], in_a0, in_a1)
-            # Single-prompt runs keep the full audio timeline so later windows hear
-            # earlier utterances; pipe-prompt runs slice to a fixed-length window so
-            # dense audio self-attention cannot bleed speech from other beats.
+            # Keep the full audio timeline whenever one prompt or beat spans
+            # multiple windows so later windows hear earlier lines; otherwise
+            # slice to the window span to bound cross-beat audio visibility.
             local_audio = audio_x if (in_a0 == 0 and in_a1 == audio_t) else audio_x[..., in_a0:in_a1]
             local_x = [video_x[:, :, v0:v1], local_audio]
             sentinel = object()

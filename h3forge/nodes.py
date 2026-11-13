@@ -330,11 +330,11 @@ def _context_optional_inputs():
             "audio_context": (list(AUDIO_CONTEXT_MODES), {
                 "default": "auto",
                 "tooltip": (
-                    "Audio input passed to each window. auto: full clip audio for a single prompt so later "
-                    "windows hear earlier lines and do not repeat them; windowed audio for pipe prompts, where "
-                    "each beat carries only its own dialogue and full audio lets other beats bleed across "
-                    "dense audio self-attention. window: always slice audio to the window. full: always pass "
-                    "the full clip audio."
+                    "Audio input passed to each window. auto: full clip audio for a single prompt or when any beat "
+                    "spans more than one window, so later windows of that prompt hear earlier lines and do not "
+                    "repeat them; windowed audio on pipe timelines where every beat fits in a single window, "
+                    "bounding cross-beat audio visibility to the window span (adjacent beats still share overlaps). "
+                    "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
     }
