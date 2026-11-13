@@ -152,3 +152,38 @@ def test_unequal_pipe_encodings_keep_one_global_prefix_origin(monkeypatch):
                                     refs=refs, keyframes=keyframes)
         dst = target_segments(local)
         assert torch.equal(local.position_ids[context.shape[1]:dst.audio_start], full.position_ids[12:src.audio_start])
+
+
+@pytest.mark.parametrize("total,window,expected", [
+    (427, 80, 455),
+    (67, 25, 143),
+    (20, 15, 86),
+    (20, 6, 36),
+    (10, 10, 57),
+])
+def test_audio_window_length_is_constant_across_all_starts(monkeypatch, total, window, expected):
+    fake_minimax.install(monkeypatch)
+    from h3forge.layout import audio_range_for_video_window, audio_window_length, clone_window_layout
+
+    frames = sum((1, 4, 4, 4, 4)[i % 5] for i in range(total))
+    audio_t = round(frames * 5 / 3)
+    full = PackedLayout(7, total, 4, 4, audio_t, keyframes=keyframe_descriptors(1), refs=reference_descriptors(1))
+    audio_win = audio_window_length(full, window)
+    assert audio_win == expected
+    signatures = set()
+    for v0 in range(total - window + 1):
+        a0, a1 = audio_range_for_video_window(full, v0, v0 + window)
+        in_a0 = min(a0, audio_t - audio_win)
+        in_a1 = in_a0 + audio_win
+        assert 0 <= in_a0 <= a0 < a1 <= in_a1 <= audio_t
+        assert in_a1 - in_a0 == audio_win
+        local = clone_window_layout(
+            full_layout=full, text_len=7, video_shape=(window, 4, 4), audio_t=audio_t,
+            video_range=(v0, v0 + window), audio_range=(in_a0, in_a1),
+            keyframes=keyframe_descriptors(1), refs=reference_descriptors(1),
+        )
+        signatures.add(local.signature)
+    assert signatures == {(7, window, 4, 4, audio_win)}
+    for bad in (0, -1, total + 1):
+        with pytest.raises(ValueError, match="video_window"):
+            audio_window_length(full, bad)

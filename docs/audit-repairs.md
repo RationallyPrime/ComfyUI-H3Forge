@@ -20,7 +20,7 @@ quality are separate results.
 | F08 — mismatched negative keys | Use native timestep modulation, Q/K normalization and rotary positioning for the negative sidecar. Selective NAG reuses the positive result and its configured dense/sparse visibility rule for swapped text keys. | Actual native DiT/attention projection comparison, per-sigma cache checks and unequal negative-length mask checks. |
 | F09 — shared payload values ignored | Compare the actual native reference/keyframe/noise-augmentation values when combining independently prepared segments. | Different reference tensors with identical metadata keys are rejected. |
 | F10 — short beats disappear | Give every beat model forwards under its own prompt on every step and log decoded-frame cuts. The first repair did this with exclusive output intervals, which made every prompt change a hard cut at the same latent on every step; `segment_seams=blend` now assigns each uniform staggered window the prompt of the beat it mostly covers, blends across the boundary, and adds a beat-confined window for any beat shorter than the stride. `exclusive` remains selectable. | The audit's 2/18/40 example covers all three beats in both modes, as does a multi-beat clip shorter than one context window; blend-mode boundary latents carry both prompts. |
-| F11 — dialogue history ends at each window | Pass the complete target audio timeline into every video window, retaining global positions. Project and fuse audio outputs only into the corresponding physical-time interval. | Native and two-window dialogue renders, plus focused audio ownership checks; render receipts below. |
+| F11 — dialogue history ends at each window | Pass the complete target audio timeline into every video window whenever a single prompt or a multi-window beat shares dialogue across windows, retaining global positions, and project/fuse audio outputs into the corresponding physical-time interval. On multi-beat pipe timelines where every beat fits in and runs in a single window, `audio_context=auto` slices a constant-length synchronized audio window to bound cross-beat audio visibility to the window span (`full` and `window` remain selectable). | Native and two-window dialogue renders, plus focused audio ownership and windowed-audio checks; render receipts below. |
 | F12 — reference modalities absent | Expose nine image, three video, three paired soundtrack and three standalone audio inputs. Require only the VAEs needed by the supplied media. Allow one segment and remove the arbitrary eight-segment ceiling. | Input contract and native reference preparation checks; loaded-model reference receipt below. |
 | F13 — repeated shared preparation | Call native reference preparation once, reuse its prepared tokenizer presentation and shared latent payload, encode texts independently, and retain core's already-refined primary text. | One native preparation call for multiple independent prompts; actual loaded-model reference path. |
 | F14 — doubles hide core behavior | Pin and load the small real core definitions under test. CI always supplies that checkout. | Native patcher, wrapper, layout and DiT contracts supplement the math tests; real H3 renders exercise the GPU boundary. |
@@ -99,9 +99,13 @@ and transcripts, including unsuccessful and non-decisive trials.
 - Segment durations control conditioning ownership at native video-token
   boundaries. They do not promise an editorial hard cut or exact spoken-word
   onset. Separately generated shots still need deliberate editing.
-- Full audio context removes the missing-input horizon between video windows.
-  It does not prove stable voices or seamless dialogue for arbitrary durations.
-  Audio attention and full output canvases grow with clip length.
+- Full audio context removes the missing-input horizon when one prompt or one
+  beat spans multiple video windows; `audio_context=auto` switches to per-window
+  audio slices only on pipe timelines where each beat occupies a single window
+  (bounding cross-beat visibility to the window span rather than the beat cut,
+  so overlapping neighbours remain audible and single-window clips stay on full
+  audio). Neither mode proves stable voices or seamless dialogue for arbitrary
+  durations, and full output canvases grow with clip length.
 - NAG remains a frozen-negative-text approximation: the negative hidden state
   does not evolve through all previous DiT blocks. Lite mode additionally uses
   separate text-only softmax denominators. Successful guidance calls alone do

@@ -79,13 +79,21 @@ def test_block_mask_cache_distinguishes_layouts_with_equal_seq_len(monkeypatch):
     assert state.mask_misses == 2
 
     # Identical segmentation but a different context-window offset is a
-    # different mask too.
+    # different mask too, for both video and audio offsets.
     layout_a_shifted = _Layout(layout_a.signature, layout_a.segments)
     layout_a_shifted._h3forge_video_offset = 5
     state.layout = layout_a_shifted
     mask_c = _make_block_mask(state, q, device=q.device)
     assert mask_c is not mask_a
     assert state.mask_misses == 3
+
+    layout_a_audio_shifted = _Layout(layout_a.signature, layout_a.segments)
+    layout_a_audio_shifted._h3forge_video_offset = 5
+    layout_a_audio_shifted._h3forge_audio_offset = 11
+    state.layout = layout_a_audio_shifted
+    mask_d = _make_block_mask(state, q, device=q.device)
+    assert mask_d is not mask_c
+    assert state.mask_misses == 4
 
     # The original segmentation still hits its own cached mask.
     state.layout = layout_a
@@ -178,6 +186,70 @@ def test_audio_self_attention_keeps_the_whole_stereo_utterance(monkeypatch, brid
     assert not allow(video_row(5, 0), video_row(2, 0))
 
 
+@pytest.mark.parametrize("bridge_stride", [0, 5])
+def test_windowed_audio_offset_matches_restricted_full_sparse_mask(monkeypatch, bridge_stride):
+    """A windowed layout with nonzero video and audio offsets must produce the
+    exact sparse mask of the full clip restricted to that window's global rows."""
+    from fake_minimax import install
+    from h3forge.layout import (
+        audio_range_for_video_window,
+        audio_window_length,
+        clone_window_layout,
+        target_segments,
+    )
+
+    install(monkeypatch)
+    calls = []
+    _fake_mask_factory(monkeypatch, calls)
+    total_t, win_t, latent_h, latent_w, audio_t = 20, 6, 4, 4, 114
+    refs = [{"kind": "image", "latent_h": 4, "latent_w": 4}, {"kind": "audio", "ref_audio_t": 7}]
+    keyframes = [{"resolved_frame_index": 2, "latent": torch.zeros(1, 1, 1, 4, 4)}]
+    full_layout = PackedLayout(4, total_t, latent_h, latent_w, audio_t, keyframes=keyframes, refs=refs)
+    full_seg = target_segments(full_layout)
+    frame_rows = (full_seg.video_stop - full_seg.video_start) // total_t
+    audio_win = audio_window_length(full_layout, win_t)
+    assert audio_win == 36
+
+    policy = AttentionPolicy(temporal_window=8.0, spatial_radius=0.25, bridge_stride=bridge_stride,
+                             first_dense_layers=0, first_dense_fraction=0.0)
+    state = RuntimeState(policy)
+    state.layout = full_layout
+    _make_block_mask(state, torch.zeros(1, 2, full_layout.seq_len, 8), device=torch.device("cpu"))
+    full_mask_mod = calls[-1]["mask_mod"]
+
+    prefix = torch.arange(full_seg.audio_start)
+    seen_nonzero_audio_offset = False
+    for v0 in range(total_t - win_t + 1):
+        v1 = v0 + win_t
+        a0, _ = audio_range_for_video_window(full_layout, v0, v1)
+        in_a0 = min(a0, audio_t - audio_win)
+        in_a1 = in_a0 + audio_win
+        if in_a0 > 0:
+            seen_nonzero_audio_offset = True
+        local_layout = clone_window_layout(
+            full_layout=full_layout, text_len=4, video_shape=(win_t, latent_h, latent_w),
+            audio_t=audio_t, video_range=(v0, v1), audio_range=(in_a0, in_a1),
+            keyframes=keyframes, refs=refs,
+        )
+        assert local_layout._h3forge_audio_offset == in_a0
+        state.layout = local_layout
+        _make_block_mask(state, torch.zeros(1, 2, local_layout.seq_len, 8), device=torch.device("cpu"))
+        win_mask_mod = calls[-1]["mask_mod"]
+
+        left_audio = torch.arange(full_seg.audio_start + in_a0, full_seg.audio_start + in_a1)
+        right_audio = torch.arange(full_seg.audio_start + audio_t + in_a0,
+                                   full_seg.audio_start + audio_t + in_a1)
+        video = torch.arange(full_seg.video_start + v0 * frame_rows,
+                             full_seg.video_start + v1 * frame_rows)
+        global_rows = torch.cat([prefix, left_audio, right_audio, video])
+        local_rows = torch.arange(local_layout.seq_len)
+
+        got = win_mask_mod(0, 0, local_rows[:, None], local_rows[None, :])
+        expected = full_mask_mod(0, 0, global_rows[:, None], global_rows[None, :])
+        assert torch.equal(got, expected)
+    assert seen_nonzero_audio_offset
+
+
 @pytest.mark.parametrize("negative_length", [2, 8])
 def test_swapped_negative_text_preserves_sparse_target_visibility(monkeypatch, negative_length):
     calls = []
@@ -256,6 +328,7 @@ def test_flex_attention_compiles_one_runner_per_shape_and_mask(monkeypatch):
     assert len(compile_calls) == 4
     # Stagger offsets are tensor captures, never guard values: not a new runner.
     state.layout._h3forge_video_offset = 3
+    state.layout._h3forge_audio_offset = 17
     _run_flex(state, q, q, q)
     assert len(compile_calls) == 4
 
