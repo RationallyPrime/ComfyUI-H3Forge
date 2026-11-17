@@ -361,6 +361,9 @@ If the combined result regresses, disable FETA first. Sparse routing and context
 
 Existing saved workflows whose blend is `pyramid` intentionally acquire the new full-window triangle. Select `overlap-linear` to retain the former H3Forge weighting.
 
+`seam_sharpness`
+: Video only, optional, default `1` (off). Every overlap latent is the weighted mean of two windows' predictions on every step. That mean is what lets the windows agree on layout while the latent is mostly noise, and it is also what leaves a soft, flickering stretch in each overlap of the finished clip, because the mean of two detailed pictures has less detail than either. Above `1`, the fusion weights are raised to a power that grows linearly from `1` at sigma 1 to `seam_sharpness` at sigma 0, so the windows still blend while the layout forms and each overlap latent is handed to the window whose centre is nearer as fine texture resolves. Windows, overlaps, stagger and audio fusion are unchanged. When it is above `1` the step-zero log adds a `seam_sharpness=… sigma=… exponent=…` line. Try `8` to `16`. No GPU receipt yet.
+
 `segment_seams`
 : How pipe-prompt boundaries are handled. `blend` (default): uniform staggered windows each carry the prompt of the beat they mostly cover and overlap-blend across the boundary; a beat shorter than the stride gets one window of its own that writes only inside the beat. `exclusive`: every beat writes only its own interval, a hard cut at the same latent on every step. Existing saved workflows acquire `blend`; select `exclusive` to retain the former behaviour.
 
