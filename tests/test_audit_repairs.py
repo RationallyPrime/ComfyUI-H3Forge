@@ -404,13 +404,13 @@ def test_seam_sharpness_blends_at_full_noise_and_separates_windows_as_noise_fall
         return out[0][0, 0, :, 0, 0], out[1]
 
     def mixed(video):
-        return int((video != video.round()).sum())  # each window predicts its own whole number
+        return int(((video - video.round()).abs() > 0.02).sum())  # each window predicts its own whole number
 
     plain, plain_audio = run(1.0, 0.0)
     noisy, _ = run(16.0, 1.0)
     clean, clean_audio = run(16.0, 0.0)
     assert torch.equal(noisy, plain)  # at full noise the sharpened policy is the plain blend
-    assert mixed(plain) >= 3 * max(mixed(clean), 1)  # far fewer latents are a mixture once the picture is clean
+    assert mixed(plain) >= 4 * max(mixed(clean), 1)  # far fewer latents are a mixture once the picture is clean
     assert torch.equal(clean[:5], plain[:5]) and torch.equal(clean[-5:], plain[-5:])
     assert torch.equal(clean_audio, plain_audio)  # audio fusion is untouched
 
