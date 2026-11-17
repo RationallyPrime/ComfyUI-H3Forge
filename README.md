@@ -4,7 +4,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 
 1. **H3-native sliding/radial sparse attention** using PyTorch FlexAttention.
 2. **Video-only FETA-style off-diagonal attention enrichment** derived from Enhance-A-Video.
-3. **Video context windows with a shared full audio timeline**, FP32 overlap fusion, and absolute H3 RoPE preservation.
+3. **Synchronized A/V context windows** with automatic full-or-windowed audio routing, FP32 overlap fusion, and absolute H3 RoPE preservation.
 4. **Pipe-delimited timeline prompting** with independently encoded, optionally unequal prompt spans and a reusable global anchor.
 5. **Image/video/voice reference prompting** that prepares shared native Ref2VA references once.
 6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
@@ -16,7 +16,7 @@ The project is deliberately a custom-node patch layer. It does **not** fork or m
 
 Earlier releases passed a Blackwell integration run. The retained long-form receipt is a successful **60.417-second, 1344 × 768, 24 fps synchronized audio/video clip**: 1,450 decoded output frames, denoised as a 427-frame H3 video latent (ComfyUI's `17k + 5` frame grid; five latent frames per 17 output frames) in one sampler execution, using the official `minimax_h3_fl2va_pruned_int8_convrot.safetensors` checkpoint. It used strict sparse attention (`40 / 8 / 40`) and strict chained context windows (`25 / 5`), peaking **under 50 GB of VRAM**. That run predates the current fusion-parity change: its then-named `pyramid` mode was the edge ramp now exposed as `overlap-linear`, so it is not yet a GPU receipt for the full-window pyramid.
 
-Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. The active video window, complete audio timeline, and reference prefix govern denoiser memory. Wall time and work grow with window count. Decoded output still occupies a full CPU image buffer; 1,450 float32 RGB frames at 1344×768 are about 16.7 GiB. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
+Here, "chained" means overlapping latent A/V context windows evaluated inside every denoising step. It does not mean rendering several clips and feeding decoded pixels from one clip into the next. The active video window, active audio span (full timeline or per-window slice), and reference prefix govern denoiser memory. Wall time and work grow with window count. Decoded output still occupies a full CPU image buffer; 1,450 float32 RGB frames at 1344×768 are about 16.7 GiB. Native ComfyUI currently exposes lengths up to 3,600 frames (about 150 seconds at 24 fps), but H3Forge only claims the retained 60.417-second run as verified; longer runs remain an explicit quality, seam, and runtime test.
 
 The 0.3 repair details and current validation are recorded in [audit-repairs.md](docs/audit-repairs.md). The earlier 60-second clip predates these changes and is not a quality result for the current revision.
 
@@ -63,15 +63,17 @@ This is overlap-add context denoising rather than "generate clip A, then feed it
 For every denoising step it:
 
 1. chooses overlapping target-video windows;
-2. includes the complete shared stereo audio latent in each forward, so earlier utterances remain directly visible;
+2. selects each forward's stereo audio input according to `audio_context` (the complete shared audio timeline when one prompt or one beat spans multiple windows, or a fixed-length synchronized audio window when each pipe beat fits in its own window);
 3. constructs a local `PackedLayout` containing only the selected prompt's actual tokens;
 4. transplants global video/audio positions and shared reference/keyframe positions;
 5. evaluates H3 jointly and projects each prediction onto the video's local interval and its matching audio interval;
 6. accumulates and normalizes predictions in FP32 before returning the model dtype.
 
+`audio_context` defaults to `auto`. Under uncapped audio self-attention, two windows carrying the same prompt need to hear each other's audio or the later window repeats spoken lines (`F11`); `auto` therefore keeps `full` both for single-prompt clips and for pipe timelines where any beat spans more than one window. When a pipe timeline gives each beat a single window that contains it (`hi - lo <= window` and one window per beat), no prompt is evaluated across two windows, so `auto` switches to `window`: each forward hears only its synchronized window span instead of the entire clip, reducing cross-beat speech bleed into silent beats. Window slicing bounds visibility to the window, not the beat boundary — a clip short enough to fit one window stays on full audio, and windows wider than a beat or overlapping a neighbour still hear the ticks inside that window span. Because a fixed video-latent span overlaps `N` or `N + 1` 40 Hz audio ticks depending on cadence phase, `window` pads by at most one tick to the maximum span across phases so `PackedLayout.signature` stays constant across staggered windows and sparse `flex_attention` compiles one shape per prompt, while output fusion still writes only the window's exact `[a0, a1)` overlap.
+
 Interior boundaries stagger using bounded ordered-halving phases. Multi-segment prompts follow `segment_seams`. The default, `blend`, is the WanVideoWrapper and ComfyUI-core arrangement: the same uniform staggered windows, each carrying the prompt of the beat it mostly covers, with neighbouring windows overlap-blending across the beat boundary like any other overlap. A prompt change is therefore a ramp about one overlap wide that moves from step to step. A beat shorter than the stride, which no window mostly covers, still gets one window centred on it that owns the beat outright: it writes only inside the beat and the regular windows do not write there, in video or audio, so every prompt reaches the model on every step and a short beat is its own prompt rather than a mixture. With a single regular window, as on a short clip, that reduces to exclusive ownership of every beat. `exclusive` keeps the earlier behaviour: every beat owns a fixed output interval on the native video-token grid, windows include neighbouring video for context but write only inside their beat, and nothing is blended across the boundary. That is a hard cut at the same latent on every denoising step, which is exactly what a visible seam at a prompt change looks like; keep it for A/B comparison.
 
-`freenoise` applies FreeNoise to the video noise before sampling: every latent frame past the first window is a seeded permutation of the frames one window earlier, so all windows draw from one noise pool and agree more in their overlaps. Audio noise is not shuffled; audio is generated with its complete timeline visible to every window, and periodic audio noise would invite periodic audio.
+`freenoise` applies FreeNoise to the video noise before sampling: every latent frame past the first window is a seeded permutation of the frames one window earlier, so all windows draw from one noise pool and agree more in their overlaps. Audio noise is not shuffled; periodic audio noise would invite periodic audio, and full-audio runs already share one timeline across windows.
 
 Native Fun ControlNet composes on either side of the context node: its complete control latent is prepared once and sliced by each global video interval. Forge preserves existing block-hook dependencies and keeps base-model NAG/FETA out of the control network's attention.
 
@@ -290,6 +292,7 @@ stagger         true
 blend           pyramid
 segment_seams   blend
 freenoise       true
+audio_context   auto
 ```
 
 For a pipe prompt, A/B `segment_seams=exclusive` and `freenoise=false` against the defaults with a fixed seed; the seam at each prompt change is the thing to compare.
@@ -363,6 +366,9 @@ Existing saved workflows whose blend is `pyramid` intentionally acquire the new 
 
 `freenoise`
 : FreeNoise shuffle of the video noise on the window grid before sampling, seeded from the sampler seed. Off leaves the sampler's noise untouched. Audio noise is never shuffled.
+
+`audio_context`
+: Audio input passed to each window forward. `auto` (default) passes the full clip audio whenever a single prompt or any pipe beat spans multiple windows so later windows of that prompt hear earlier utterances (`audio_context=full:<T>`), and slices a constant-length synchronized audio window on multi-beat pipe timelines where every beat fits in and runs in a single window (`audio_context=window:<W>/<T>`), bounding cross-beat audio visibility to the window span (adjacent beats still share window overlaps, and single-window clips stay on full audio). `window` and `full` force either mode explicitly.
 
 ### Timeline prompt
 

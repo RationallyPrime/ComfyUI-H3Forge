@@ -86,13 +86,21 @@ def test_h3forge_nodes_share_one_runtime_regardless_of_order(monkeypatch):
 
 def test_context_node_exposes_core_parity_defaults(monkeypatch):
     nodes = _import_nodes(monkeypatch)
-    required = nodes.H3ForgeContextWindows.INPUT_TYPES()["required"]
+    inputs = nodes.H3ForgeContextWindows.INPUT_TYPES()
+    required = inputs["required"]
+    optional = inputs["optional"]
     assert required["overlap_frames"][1]["default"] == 8
     assert required["blend"][0] == ["pyramid", "overlap-linear", "flat"]
     assert required["blend"][1]["default"] == "pyramid"
     assert required["segment_seams"][0] == ["blend", "exclusive"]
     assert required["segment_seams"][1]["default"] == "blend"
     assert required["freenoise"][1]["default"] is True
+    assert "audio_context" not in required  # optional so saved API graphs without it stay valid
+    assert optional["audio_context"][0] == ["auto", "window", "full"]
+    assert optional["audio_context"][1]["default"] == "auto"
+    timeline_optional = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["optional"]
+    assert timeline_optional["audio_context"][0] == ["auto", "window", "full"]
+    assert timeline_optional["audio_context"][1]["default"] == "auto"
 
 
 def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(monkeypatch):
@@ -122,6 +130,8 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
     assert ("diffusion", nodes.CTX_KEY) in patched.wrappers
     with pytest.raises(ValueError, match="segment_seams"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
+    with pytest.raises(ValueError, match="audio_context"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", audio_context="bad")
 
 
 @pytest.mark.parametrize("stride", [1, 2])
@@ -425,11 +435,12 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     # 142 video latents (481 frames, 20.04 s) as an Image to Video node would allocate them.
     video, audio = torch.zeros(1, 24, 142, 48, 84), torch.zeros(1, 32, 2, 802)
     supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
-    patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
-        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied)
+    _patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window")
     assert latent is supplied  # passed through untouched, keyframe anchors stay valid
     policy, = policies
     assert (policy.window_frames, policy.overlap_frames, policy.stagger) == (80, 13, True)
+    assert policy.audio_context == "window"
     log = capsys.readouterr().out
     assert "connected latent: 481 frames" in log and "2 windows of 80/13" in log
 

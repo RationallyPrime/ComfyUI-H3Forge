@@ -342,6 +342,19 @@ def test_context_plan_reports_work_and_prompt_assignment():
     assert "max_phase" not in summary
     assert "max_phase=5" in context_plan_summary(
         total=60, starts=[0, 20, 35], window=25, overlap=5, phase=0, max_phase=5)
+    assert "audio_context=full:2417" in context_plan_summary(
+        total=427, starts=[0, 80], window=80, overlap=10, phase=0, audio_t=2417)
+    assert "audio_context=full:2417" in context_plan_summary(
+        total=427, starts=[0, 80], window=80, overlap=10, phase=0, audio_t=2417, audio_window=2417)
+    assert "audio_context=window:455/2417" in context_plan_summary(
+        total=427, starts=[0, 80], window=80, overlap=10, phase=0, audio_t=2417, audio_window=455)
+
+
+def test_context_policy_validates_audio_context_modes():
+    for mode in ("auto", "window", "full"):
+        assert ContextPolicy(audio_context=mode).audio_context == mode
+    with pytest.raises(ValueError, match="audio_context"):
+        ContextPolicy(audio_context="clip")
 
 
 def test_single_window_path_emits_step_zero_context_plan(capsys):
