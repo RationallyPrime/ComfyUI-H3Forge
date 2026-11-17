@@ -13,6 +13,7 @@ from h3forge.context import (
     max_stagger_phase,
     ordered_halving,
     seam_exponent,
+    seam_settled,
     sharpened_video_weights,
     stagger_phase,
     window_starts,
@@ -749,3 +750,10 @@ def test_sharpened_weights_hand_each_overlap_latent_to_the_nearer_window():
     assert sharp[0, 64] > 0.999 and sharp[1, 84] > 0.999
     # A latent only one window covers keeps full weight however small its powered weight is.
     assert sharp[0, 0] == 1.0 and sharp[2, total - 1] == 1.0
+
+
+def test_stagger_stops_once_a_sharpened_run_is_resolving():
+    assert not seam_settled(1.0, 0.1)  # the plain blend staggers on every step, as before
+    assert not seam_settled(16.0, None)
+    assert not seam_settled(16.0, 0.95)
+    assert seam_settled(16.0, 0.8) and seam_settled(16.0, 0.0)

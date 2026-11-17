@@ -415,6 +415,27 @@ def test_seam_sharpness_blends_at_full_noise_and_separates_windows_as_noise_fall
     assert torch.equal(clean_audio, plain_audio)  # audio fusion is untouched
 
 
+def test_sharpened_run_holds_the_step_zero_window_layout_once_resolving():
+    total, window, overlap = 67, 25, 8
+    x, context, payload = _context_inputs(total)
+    schedule = torch.tensor([1., 0.9, 0.5, 0.])
+
+    def starts(sharpness, sigma):
+        seen = []
+        def predict(local_x, timestep, local_context, options, **kwargs):
+            seen.append(options["h3forge_active_layout"]._h3forge_video_offset)
+            return [torch.zeros_like(t) for t in local_x]
+        options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": schedule}
+        make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", seam_sharpness=sharpness))(
+            _executor(predict), x, None, context, options, minimax_payload=payload)
+        return seen
+
+    anchor = starts(1.0, 1.0)  # step 0, phase 0
+    assert starts(1.0, 0.5) != anchor  # the plain blend staggers at step 2
+    assert starts(16.0, 0.9) == starts(1.0, 0.9) != anchor  # still staggering while noisy
+    assert starts(16.0, 0.5) == anchor and starts(16.0, 0.0) == anchor
+
+
 def test_strict_sparse_contracts_raise_but_declared_dense_schedule_runs():
     state = RuntimeState(AttentionPolicy(strict=True, first_dense_layers=2))
     state.block_index = 3

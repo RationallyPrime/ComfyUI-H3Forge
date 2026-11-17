@@ -16,6 +16,7 @@ _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
 MAX_SEAM_SHARPNESS = 16.0
+SEAM_SETTLE_SIGMA = 0.8
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,11 @@ def seam_exponent(sharpness: float, sigma: float | None) -> float:
     if sharpness <= 1.0 or sigma is None:
         return 1.0
     return 1.0 + (sharpness - 1.0) * (1.0 - min(max(float(sigma), 0.0), 1.0))
+
+
+def seam_settled(sharpness: float, sigma: float | None) -> bool:
+    """Whether a sharpened run has reached the noise level where stagger stops."""
+    return sharpness > 1.0 and sigma is not None and float(sigma) <= SEAM_SETTLE_SIGMA
 
 
 def sharpened_video_weights(windows, total: int, exponent: float):
@@ -466,9 +472,16 @@ def make_context_wrapper(policy: ContextPolicy):
         phase = max_phase = 0
         blended = policy.segment_seams == "blend"
         stagger = policy.stagger and (not segmented or blended)
+        exponent = seam_exponent(policy.seam_sharpness, sigma)
         if stagger:
             max_phase = max_stagger_phase(window, overlap)
             phase = stagger_phase(step, window, overlap) if step is not None else 0
+            if seam_settled(policy.seam_sharpness, sigma):
+                # A seam that keeps moving hands each overlap latent to a different
+                # window on alternate steps, which averages their textures over the
+                # steps exactly as blending averages them within one. Hold the
+                # step-zero layout once the picture is resolving.
+                phase = 0
         if segmented:
             ranges, frame_cuts = segment_ranges(total_t, len(prompts), payload.get("h3forge_prompt_segment_durations"))
             # H3 audio has 40 ticks per 24 decoded frames. Shared cuts give each
@@ -511,12 +524,12 @@ def make_context_wrapper(policy: ContextPolicy):
         video_weights = [blend_weights(p[2] - p[1], overlap, device=video_x.device, dtype=torch.float32,
                                        mode=policy.blend, ramp_start=p[1] > 0, ramp_end=p[2] < total_t)
                          for p in plan]
-        exponent = seam_exponent(policy.seam_sharpness, sigma)
         if exponent > 1.0:
             video_weights = sharpened_video_weights(
                 [(p[1], w, writes) for p, w, writes in zip(plan, video_weights, video_writes)], total_t, exponent)
         if step == 0 and policy.seam_sharpness > 1.0:
-            print(f"{LOG} seam_sharpness={policy.seam_sharpness:g} sigma={sigma} exponent={exponent:.2f}", flush=True)
+            print(f"{LOG} seam_sharpness={policy.seam_sharpness:g} sigma={sigma} exponent={exponent:.2f} "
+                  f"stagger_until_sigma={SEAM_SETTLE_SIGMA:g}", flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
