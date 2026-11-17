@@ -12,6 +12,8 @@ from h3forge.context import (
     make_context_wrapper,
     max_stagger_phase,
     ordered_halving,
+    seam_exponent,
+    sharpened_video_weights,
     stagger_phase,
     window_starts,
 )
@@ -710,3 +712,40 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+def test_seam_exponent_follows_the_noise_level():
+    assert seam_exponent(1.0, 0.0) == 1.0  # off: the plain blend at every noise level
+    assert seam_exponent(16.0, None) == 1.0  # an unknown sigma never sharpens
+    assert seam_exponent(16.0, 1.0) == 1.0
+    assert seam_exponent(16.0, 7.0) == 1.0  # sigmas above 1 are treated as full noise
+    assert seam_exponent(16.0, 0.0) == 16.0
+    assert seam_exponent(16.0, 0.5) == pytest.approx(8.5)
+    with pytest.raises(ValueError, match="seam_sharpness"):
+        ContextPolicy(25, 8, seam_sharpness=0.5)
+    with pytest.raises(ValueError, match="seam_sharpness"):
+        ContextPolicy(25, 8, seam_sharpness=17.0)
+
+
+def test_sharpened_weights_hand_each_overlap_latent_to_the_nearer_window():
+    total, window, starts = 202, 85, (0, 64, 117)
+    weights = blend_weights(window, 21, device="cpu", dtype=torch.float32, mode="pyramid")
+    windows = [(start, weights, [(start, start + window)]) for start in starts]
+
+    def shares(exponent):
+        out = torch.zeros(len(starts), total)
+        for row, (start, share) in zip(out, zip(starts, sharpened_video_weights(windows, total, exponent))):
+            row[start:start + window] = share
+        return out
+
+    plain, sharp = shares(1.0), shares(16.0)
+    for table in (plain, sharp):
+        assert torch.allclose(table.sum(0), torch.ones(total), atol=1e-6)  # every latent is fully covered
+    assert torch.allclose(plain[0, 64:85], weights[64:] / (weights[64:] + weights[:21]))
+    # Windows 1 and 2 share latents [64, 85). The plain pyramid mixes them across the whole overlap.
+    assert int(((plain[0, 64:85] > 0.05) & (plain[0, 64:85] < 0.95)).sum()) >= 17
+    # Sharpened, the mix is confined to a few latents around the overlap's centre.
+    assert int(((sharp[0, 64:85] > 0.05) & (sharp[0, 64:85] < 0.95)).sum()) <= 3
+    assert sharp[0, 64] > 0.999 and sharp[1, 84] > 0.999
+    # A latent only one window covers keeps full weight however small its powered weight is.
+    assert sharp[0, 0] == 1.0 and sharp[2, total - 1] == 1.0

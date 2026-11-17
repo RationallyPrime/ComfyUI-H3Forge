@@ -98,6 +98,8 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
     assert "audio_context" not in required  # optional so saved API graphs without it stay valid
     assert optional["audio_context"][0] == ["auto", "window", "full"]
     assert optional["audio_context"][1]["default"] == "auto"
+    assert optional["seam_sharpness"][1] | {"tooltip": ""} == {
+        "default": 1.0, "min": 1.0, "max": 16.0, "step": 0.5, "tooltip": ""}  # off unless asked for
     timeline_optional = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["optional"]
     assert timeline_optional["audio_context"][0] == ["auto", "window", "full"]
     assert timeline_optional["audio_context"][1]["default"] == "auto"
@@ -132,6 +134,8 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
     with pytest.raises(ValueError, match="audio_context"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", audio_context="bad")
+    with pytest.raises(ValueError, match="seam_sharpness"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", seam_sharpness=64.0)
 
 
 @pytest.mark.parametrize("stride", [1, 2])

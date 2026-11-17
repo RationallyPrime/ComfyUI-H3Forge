@@ -9,12 +9,13 @@ import torch
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
+MAX_SEAM_SHARPNESS = 16.0
 
 
 @dataclass(frozen=True)
@@ -26,8 +27,11 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    seam_sharpness: float = 1.0
 
     def __post_init__(self):
+        if not 1.0 <= self.seam_sharpness <= MAX_SEAM_SHARPNESS:
+            raise ValueError(f"seam_sharpness must be within [1, {MAX_SEAM_SHARPNESS:g}], got {self.seam_sharpness!r}")
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
@@ -158,6 +162,46 @@ def blend_weights(length: int, overlap: int, *, device, dtype, mode="pyramid",
     if ramp_end:
         w[-ramp:] = edge.flip(0)
     return w.to(dtype)
+
+
+def seam_exponent(sharpness: float, sigma: float | None) -> float:
+    """Exponent applied to the video fusion weights at noise level ``sigma``.
+
+    Averaging two windows' predictions is what lets them agree on layout while
+    the latent is mostly noise, and what softens fine texture once it is not:
+    the mean of two detailed pictures has less detail than either. The exponent
+    therefore stays 1 (the plain blend) at sigma 1 and rises linearly to
+    ``sharpness`` at sigma 0, so each latent in an overlap is handed to the
+    window whose centre is nearer as the picture resolves. An unknown sigma
+    keeps the plain blend.
+    """
+    if sharpness <= 1.0 or sigma is None:
+        return 1.0
+    return 1.0 + (sharpness - 1.0) * (1.0 - min(max(float(sigma), 0.0), 1.0))
+
+
+def sharpened_video_weights(windows, total: int, exponent: float):
+    """Raise each window's fusion weights to ``exponent`` and pre-normalize them.
+
+    ``windows`` is ``[(start, weights, write_intervals), ...]`` on the video
+    latent axis. The powered weights span far more than float32 holds next to
+    the ``1e-6`` divisor floor of the overlap-add, so the shares are formed in
+    float64 and returned already divided by their per-latent sum: the caller's
+    accumulated denominator is then 1 wherever a window writes and 0 elsewhere,
+    which keeps the coverage check meaningful.
+    """
+    powered = [(weights.double() / weights.double().max()).pow(exponent) for _, weights, _ in windows]
+    total_weight = torch.zeros(total, dtype=torch.float64, device=powered[0].device)
+    for (start, _, intervals), weights in zip(windows, powered):
+        for w0, w1 in intervals:
+            total_weight[w0:w1] += weights[w0 - start:w1 - start]
+    shares = []
+    for (start, _, intervals), weights in zip(windows, powered):
+        share = torch.zeros_like(weights)
+        for w0, w1 in intervals:
+            share[w0 - start:w1 - start] = weights[w0 - start:w1 - start] / total_weight[w0:w1]
+        shares.append(share.float())
+    return shares
 
 
 def audio_overlap_frames(overlap_frames: int, video_len: int, audio_len: int) -> int:
@@ -399,7 +443,8 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options)
+        step, _ = resolve_step(transformer_options, sigma)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
@@ -462,11 +507,22 @@ def make_context_wrapper(policy: ContextPolicy):
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None),
                   flush=True)
 
+        video_writes = [_subtract_intervals(p[3], p[4], [ranges[b] for b in p[6]]) for p in plan]
+        video_weights = [blend_weights(p[2] - p[1], overlap, device=video_x.device, dtype=torch.float32,
+                                       mode=policy.blend, ramp_start=p[1] > 0, ramp_end=p[2] < total_t)
+                         for p in plan]
+        exponent = seam_exponent(policy.seam_sharpness, sigma)
+        if exponent > 1.0:
+            video_weights = sharpened_video_weights(
+                [(p[1], w, writes) for p, w, writes in zip(plan, video_weights, video_writes)], total_t, exponent)
+        if step == 0 and policy.seam_sharpness > 1.0:
+            print(f"{LOG} seam_sharpness={policy.seam_sharpness:g} sigma={sigma} exponent={exponent:.2f}", flush=True)
+
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        for (index, v0, v1, write_v0, write_v1, owned, excluded), vw, writes in zip(plan, video_weights, video_writes):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -504,9 +560,8 @@ def make_context_wrapper(policy: ContextPolicy):
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
 
-            vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
-                               ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+            vw = vw.to(v_out.device).view(1, 1, -1, 1, 1)
+            for w0, w1 in writes:
                 keep = slice(w0 - v0, w1 - v0)
                 video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
                 video_den[:, :, w0:w1].add_(vw[:, :, keep])
