@@ -546,7 +546,7 @@ def make_context_wrapper(policy: ContextPolicy):
             local_x = [video_x[:, :, v0:v1], local_audio]
             if reads[i] and policy.lead < 1.0:
                 local_x[0], local_kwargs["denoise_mask"] = _lead_context(
-                    local_x[0], local_kwargs["denoise_mask"], video_acc, reads[i], v0, timestep, policy.lead)
+                    local_x[0], local_kwargs.get("denoise_mask"), video_acc, reads[i], v0, timestep, policy.lead)
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
