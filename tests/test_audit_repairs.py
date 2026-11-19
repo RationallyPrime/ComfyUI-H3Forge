@@ -468,10 +468,10 @@ def test_handoff_against_main_bytes(monkeypatch, handoff):
     video, audio = make_context_wrapper(policy)(_executor(predict), x, torch.tensor([750.]), text,
         {"sigmas": torch.tensor([.75]), "sample_sigmas": torch.tensor([1., .75, 0.])})
     # Captured from this deterministic CPU forward on unchanged origin/main 05792b7.
-    assert hashlib.sha256(audio.numpy().tobytes()).hexdigest() == (
+    assert hashlib.sha256(bytes(audio.contiguous().flatten().view(torch.uint8).tolist())).hexdigest() == (
         "14e2314040460ac9c945b53e916aeac439b3cff1d15bee5b49b325858b28718b")
     if policy.handoff == "off":
-        assert hashlib.sha256(video.numpy().tobytes()).hexdigest() == (
+        assert hashlib.sha256(bytes(video.contiguous().flatten().view(torch.uint8).tolist())).hexdigest() == (
             "53d47776d60cfc6b6fd7e593f747a183703b6528e45bec3535e30ff06c30526f")
     else:
         starts = window_starts(202, 85, 21, stagger_phase(1, 85, 21), max_stagger_phase(85, 21))
