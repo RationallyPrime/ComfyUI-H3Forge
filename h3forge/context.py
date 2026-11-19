@@ -785,7 +785,7 @@ def make_context_wrapper(policy: ContextPolicy):
                     seg_start, seg_end, owner_tuple = overlap_segments[seg_idx]
                     keep = slice(seg_start - v0, seg_end - v0)
                     buf = seg_buffers.setdefault(seg_idx, {})
-                    buf[win_idx] = (v_out[:, :, keep].float(), vw_1d[keep])
+                    buf[win_idx] = (v_out[:, :, keep].to(torch.float32, copy=True), vw_1d[keep])
                     if len(buf) == len(owner_tuple):
                         pair_bounds = []
                         for a_idx, b_idx in pairwise(owner_tuple):
