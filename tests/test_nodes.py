@@ -99,6 +99,8 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
     assert optional["audio_context"][0] == ["auto", "window", "full"]
     assert optional["audio_context"][1]["default"] == "auto"
     timeline_optional = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["optional"]
+    for inputs in (optional, timeline_optional):
+        assert inputs["seam_repair"][0] == "BOOLEAN" and inputs["seam_repair"][1]["default"] is False
     assert timeline_optional["audio_context"][0] == ["auto", "window", "full"]
     assert timeline_optional["audio_context"][1]["default"] == "auto"
 
@@ -436,14 +438,33 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     video, audio = torch.zeros(1, 24, 142, 48, 84), torch.zeros(1, 32, 2, 802)
     supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
     _patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
-        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window")
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window", seam_repair=True)
     assert latent is supplied  # passed through untouched, keyframe anchors stay valid
     policy, = policies
     assert (policy.window_frames, policy.overlap_frames, policy.stagger) == (80, 13, True)
     assert policy.audio_context == "window"
+    assert policy.seam_repair is True
     log = capsys.readouterr().out
     assert "connected latent: 481 frames" in log and "2 windows of 80/13" in log
 
     with pytest.raises(ValueError, match="AV latent"):
         nodes.H3ForgeTimelineContextWindows().patch(
             MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})
+
+
+def test_seam_euler_sampler_node(monkeypatch):
+    from core_source import definitions
+
+    nodes = _import_nodes(monkeypatch)
+    sampler = definitions("comfy/samplers.py", ["Sampler", "KSAMPLER"])["KSAMPLER"]
+    monkeypatch.setitem(sys.modules, "comfy.samplers", SimpleNamespace(KSAMPLER=sampler))
+    node = nodes.NODE_CLASS_MAPPINGS["H3ForgeSeamEuler"]()
+    assert nodes.NODE_DISPLAY_NAME_MAPPINGS["H3ForgeSeamEuler"] == "H3Forge Seam Euler"
+    assert node.RETURN_TYPES == ("SAMPLER",)
+    required = node.INPUT_TYPES()["required"]
+    defaults = {k: v[1]["default"] for k, v in required.items()}
+    assert defaults == dict(repairs=0, repair_threshold=.15, repair_until=.4, repair_ramp=4, repair_budget=.3)
+    assert required["repairs"][1]["max"] == 4
+    result, = getattr(node, node.FUNCTION)(**defaults, repair_noise="original")
+    assert result.sampler_function is nodes.sample_seam_euler
+    assert result.extra_options == dict(defaults, repair_noise="original")

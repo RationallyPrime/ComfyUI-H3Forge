@@ -9,6 +9,7 @@ import torch
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
+from .seam_euler import SEAM_STATE, OverlapScores, SeamState
 from .state import require_eager_allocations, resolve_step
 
 LOG = "[H3Forge]"
@@ -26,6 +27,7 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    seam_repair: bool = False
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
@@ -369,6 +371,10 @@ def make_freenoise_wrapper(policy: ContextPolicy):
     periodic audio, and full-audio runs already share one timeline across windows.
     """
     def wrapper(executor, guider, sigmas, extra_args, callback, noise, *args, **kwargs):
+        if policy.seam_repair:
+            opts = extra_args["model_options"]
+            transformer = {**opts.get("transformer_options", {}), SEAM_STATE: SeamState()}
+            extra_args = {**extra_args, "model_options": {**opts, "transformer_options": transformer}}
         shapes = getattr(getattr(guider, "inner_model", None), "latent_shapes", None)
         if policy.freenoise and shapes is not None and len(shapes) >= 2 and noise.ndim == 3:
             video_t = int(shapes[0][2])
@@ -395,6 +401,15 @@ def make_context_wrapper(policy: ContextPolicy):
         require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
         total_t, audio_t = int(video_x.shape[2]), int(audio_x.shape[-1])
+        state = transformer_options.get(SEAM_STATE) if policy.seam_repair else None
+        if state is not None:
+            state.video_shape = video_x.shape
+            if not state.collecting:
+                state.scores.clear()
+            if state.row_ratio is not None:
+                mask = kwargs.get("denoise_mask")
+                ratio = state.row_ratio.expand(1, 1, total_t, *video_x.shape[-2:])
+                kwargs["denoise_mask"] = ratio if mask is None else ratio * mask
         payload = kwargs.get("minimax_payload") or {}
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
@@ -405,7 +420,7 @@ def make_context_wrapper(policy: ContextPolicy):
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
-                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                      phase=0, blend=policy.blend, audio_t=audio_t) + f" seam_repair={policy.seam_repair}", flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -459,14 +474,17 @@ def make_context_wrapper(policy: ContextPolicy):
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None) + f" seam_repair={policy.seam_repair}",
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        writes = [_subtract_intervals(lo, hi, [ranges[b] for b in excluded])
+                  for _, _, _, lo, hi, _, excluded in plan]
+        scores = OverlapScores(writes) if state is not None else None
+        for ordinal, (index, v0, v1, _, _, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -506,7 +524,9 @@ def make_context_wrapper(policy: ContextPolicy):
 
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+            if scores is not None:
+                scores.observe(ordinal, v0, v_out)
+            for w0, w1 in writes[ordinal]:
                 keep = slice(w0 - v0, w1 - v0)
                 video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
                 video_den[:, :, w0:w1].add_(vw[:, :, keep])
@@ -525,7 +545,13 @@ def make_context_wrapper(policy: ContextPolicy):
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
         assert_full_coverage(video_den, audio_den)
-        return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
-                (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
+        video = (video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype)
+        if scores is not None:
+            scores.publish(video, state)
+            if state.row_ratio is not None:
+                # Core scales by the original mask outside this wrapper. Supply
+                # only the extra factor introduced for this mixed-sigma call.
+                video = video * state.row_ratio.to(video)
+        return [video, (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
     return wrapper
