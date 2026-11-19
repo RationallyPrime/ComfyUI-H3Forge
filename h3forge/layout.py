@@ -5,6 +5,16 @@ import math
 
 import torch
 
+POSITION_MODES = ("global", "rebased", "wrapped")
+LATENTS_PER_CYCLE = 5
+FRAMES_PER_CYCLE = 17
+FRAME_RESCALE = 5.0 / 3.0
+CYCLE_TIME_SPAN = FRAMES_PER_CYCLE * FRAME_RESCALE
+# 107 video latents (362 pixel frames, 15.08 s) is the top of H3's trained range.
+TRAINED_MAX_LATENTS = 107
+TRAINED_MAX_FRAMES = 362
+TRAINED_MAX_TIME = TRAINED_MAX_FRAMES * FRAME_RESCALE
+
 
 @dataclass(frozen=True)
 class TargetSegments:
@@ -46,6 +56,52 @@ def video_shape_from_layout(layout) -> tuple[int, int]:
     return latent_t, int(times.numel() // latent_t)
 
 
+def window_position_shift(full_layout, v0: int, v1: int, position_mode: str = "global") -> float:
+    """Time-coordinate subtraction (in 40 Hz audio ticks) for one window's RoPE positions.
+
+    ``PackedLayout`` places text on ``[0, text_len)``, optional refs on
+    ``[text_len, origin)``, and target audio/video starting at ``origin`` in
+    40 Hz ticks (1.0 per audio latent, ``5/3`` per 24 fps pixel frame, and
+    ``85/3`` per 5-latent / 17-frame VAE cycle).
+
+    - ``global``: shift is ``0.0`` (absolute clip coordinates).
+    - ``rebased``: subtract ``(v0 // 5)`` full cycles so target video starts at
+      ``origin`` plus its offset inside the 5-latent cycle, and target audio
+      shifts by the same amount to preserve A/V alignment.
+    - ``wrapped``: keep global positions while the window's centre lies inside
+      H3's trained range (``[0, TRAINED_MAX_TIME]`` relative to ``origin``);
+      otherwise subtract the smallest integer multiple of ``CYCLE_TIME_SPAN``
+      (capped at ``v0 // 5`` cycles) that brings the centre into that range.
+    """
+    if position_mode not in POSITION_MODES:
+        raise ValueError(f"position_mode must be one of {POSITION_MODES}, got {position_mode!r}")
+    if position_mode == "global":
+        return 0.0
+
+    seg = target_segments(full_layout)
+    full_t, frame_rows = video_shape_from_layout(full_layout)
+    if not (0 <= v0 < v1 <= full_t):
+        raise ValueError(f"invalid video range {(v0, v1)} for T={full_t}")
+
+    max_cycles = v0 // LATENTS_PER_CYCLE
+    if position_mode == "rebased":
+        return max_cycles * CYCLE_TIME_SPAN
+
+    vpos = full_layout.position_ids[seg.video_start:seg.video_stop, 0].reshape(full_t, frame_rows)[:, 0]
+    origin = float(vpos[0])
+    start_t = float(vpos[v0]) - origin
+    if v1 < full_t:
+        stop_t = float(vpos[v1]) - origin
+    else:
+        from comfy.ldm.minimax.model import _video_t_spans
+        stop_t = float(vpos[-1]) + float(_video_t_spans(full_t)[-1]) - origin
+    centre_t = 0.5 * (start_t + stop_t)
+    if centre_t <= TRAINED_MAX_TIME:
+        return 0.0
+    cycles = min(max_cycles, max(0, math.ceil((centre_t - TRAINED_MAX_TIME) / CYCLE_TIME_SPAN - 1e-9)))
+    return cycles * CYCLE_TIME_SPAN
+
+
 def clone_window_layout(
     *,
     full_layout,
@@ -56,13 +112,17 @@ def clone_window_layout(
     audio_range: tuple[int, int],
     keyframes=None,
     refs=None,
+    position_mode: str = "global",
 ):
-    """Build a local H3 PackedLayout, then transplant global target positions.
+    """Build a local H3 PackedLayout, then transplant global or cycle-shifted target positions.
 
-    This preserves absolute multimodal RoPE coordinates while allowing the model
+    This preserves multimodal A/V RoPE alignment while allowing the model
     to process a smaller synchronized A/V window.
     """
     from comfy.ldm.minimax.model import PackedLayout
+
+    if position_mode not in POSITION_MODES:
+        raise ValueError(f"position_mode must be one of {POSITION_MODES}, got {position_mode!r}")
 
     v0, v1 = video_range
     a0, a1 = audio_range
@@ -104,6 +164,21 @@ def clone_window_layout(
     right = full_layout.position_ids[src.audio_start + full_audio_t + a0:
                                      src.audio_start + full_audio_t + a1]
     local.position_ids[dst.audio_start:dst.audio_stop] = torch.cat([left, right], dim=0)
+
+    if position_mode != "global":
+        shift = window_position_shift(full_layout, v0, v1, position_mode)
+        # A tail audio slice can start a few ticks before its video window. Drop
+        # whole cycles from the shift until no target row lands before the
+        # origin, where the text/reference prefix lives.
+        origin = float(full_layout.position_ids[src.video_start, 0])
+        earliest = float(min(local.position_ids[dst.video_start, 0], local.position_ids[dst.audio_start, 0]))
+        while shift > 0.0 and earliest - shift < origin - 1e-4:
+            shift -= CYCLE_TIME_SPAN
+        shift = max(shift, 0.0)
+        if shift != 0.0:
+            local.position_ids[dst.video_start:dst.video_stop, 0] -= shift
+            local.position_ids[dst.audio_start:dst.audio_stop, 0] -= shift
+
     # Runtime-only metadata for compiler-friendly sparse mask arithmetic.
     local._h3forge_video_offset = int(v0)
     local._h3forge_audio_offset = int(a0)
