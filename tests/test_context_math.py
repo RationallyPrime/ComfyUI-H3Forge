@@ -12,6 +12,7 @@ from h3forge.context import (
     make_context_wrapper,
     max_stagger_phase,
     ordered_halving,
+    stagger_layout_count,
     stagger_phase,
     window_starts,
 )
@@ -710,3 +711,101 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+@pytest.mark.parametrize(
+    "total,window,overlap,tail_on_cadence",
+    [
+        (202, 85, 21, False),
+        (200, 85, 21, True),
+        (427, 107, 6, True),
+        (427, 80, 11, False),
+        (427, 80, 10, False),
+        (217, 85, 13, False),
+        (427, 100, 13, False),
+    ],
+)
+def test_stagger_cadence_keeps_starts_on_cadence_and_preserves_coverage(total, window, overlap, tail_on_cadence):
+    max_phase = max_stagger_phase(window, overlap, stagger_cadence=True)
+    assert max_phase % 5 == 0
+    assert max_phase <= max_stagger_phase(window, overlap)
+
+    visited_phases = {stagger_phase(step, window, overlap, stagger_cadence=True) for step in range(64)}
+    assert visited_phases == set(range(0, max_phase + 1, 5))
+
+    anchor = window_starts(total, window, overlap, 0, max_phase, stagger_cadence=True)
+    seen_plans = set()
+    for phase in range(0, max_phase + 1, 5):
+        starts = window_starts(total, window, overlap, phase, max_phase, stagger_cadence=True)
+        seen_plans.add(tuple(starts))
+        assert starts[0] == 0 and starts[-1] == total - window
+        assert len(starts) == len(anchor)
+        assert all(s % 5 == 0 for s in (starts if tail_on_cadence else starts[:-1]))
+        overlaps = [window - (right - left) for left, right in pairwise(starts)]
+        assert min(overlaps) >= overlap
+        assert all(0 <= after - before <= phase for before, after in zip(anchor, starts))
+
+        coverage = torch.zeros(total, dtype=torch.float32)
+        for s in starts:
+            coverage[s:s + window] += blend_weights(window, overlap, device="cpu", dtype=torch.float32, mode="pyramid")
+        assert torch.all(coverage > 0)
+
+    count = stagger_layout_count(total, window, overlap, max_phase, stagger_cadence=True)
+    assert count == len(seen_plans)
+    regular_count = stagger_layout_count(total, window, overlap, max_stagger_phase(window, overlap))
+    assert count <= regular_count
+
+
+def test_stagger_cadence_battle_brief_and_validation():
+    # Baseline 28.5 s take (202/85/21): cadence stagger uses floored anchor [0, 55, 117]
+    # and visits two distinct cadence-aligned interior plans instead of collapsing to one.
+    max_phase = max_stagger_phase(85, 21, stagger_cadence=True)
+    assert max_phase == 20
+    plans = {
+        tuple(window_starts(202, 85, 21, p, max_phase, stagger_cadence=True))
+        for p in range(0, max_phase + 1, 5)
+    }
+    assert plans == {(0, 55, 117), (0, 60, 117)}
+    assert stagger_layout_count(202, 85, 21, max_phase, stagger_cadence=True) == 2
+    assert stagger_layout_count(202, 85, 21, max_stagger_phase(85, 21)) == 7
+
+    with pytest.raises(ValueError, match="multiple of 5"):
+        window_starts(202, 85, 21, 3, 20, stagger_cadence=True)
+    with pytest.raises(ValueError, match="multiple of 5"):
+        window_starts(202, 85, 21, 0, 21, stagger_cadence=True)
+
+
+def test_freenoise_uses_cadence_anchor_when_stagger_cadence_is_on():
+    from types import SimpleNamespace
+    from h3forge.context import apply_freenoise, make_freenoise_wrapper
+
+    shapes = [torch.Size([1, 2, 202, 2, 2]), torch.Size([1, 3, 2, 100])]
+    video, audio = torch.randn(shapes[0]), torch.randn(shapes[1])
+    packed = torch.cat([video.reshape(1, 1, -1), audio.reshape(1, 1, -1)], dim=-1)
+    guider = SimpleNamespace(inner_model=SimpleNamespace(latent_shapes=shapes))
+    seen = {}
+
+    def executor(g, sigmas, extra_args, callback, noise, *args):
+        seen["noise"] = noise
+        return "ok"
+
+    policy = ContextPolicy(window_frames=85, overlap_frames=21, stagger=True, stagger_cadence=True)
+    make_freenoise_wrapper(policy)(executor, guider, None, {"seed": 42}, None, packed)
+    out_video = seen["noise"][:, :, :video.numel()].reshape(shapes[0])
+
+    expected_cadence = apply_freenoise(video.clone(), 2, [0, 55, 117], 85, seed=42)
+    expected_default = apply_freenoise(video.clone(), 2, [0, 58, 117], 85, seed=42)
+    assert torch.equal(out_video, expected_cadence)
+    assert not torch.equal(out_video, expected_default)
+
+
+def test_context_policy_validates_position_mode_and_full_audio_conflict():
+    for mode in ("global", "rebased", "wrapped"):
+        assert ContextPolicy(position_mode=mode).position_mode == mode
+        assert ContextPolicy(position_mode=mode, audio_context="window").position_mode == mode
+    assert ContextPolicy(position_mode="global", audio_context="full").audio_context == "full"
+    with pytest.raises(ValueError, match="position_mode"):
+        ContextPolicy(position_mode="local")
+    for mode in ("rebased", "wrapped"):
+        with pytest.raises(ValueError, match="audio_context='full'"):
+            ContextPolicy(position_mode=mode, audio_context="full")

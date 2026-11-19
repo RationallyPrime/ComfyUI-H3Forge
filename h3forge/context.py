@@ -7,7 +7,14 @@ from itertools import pairwise
 import torch
 
 from .control import control_window
-from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
+from .layout import (
+    POSITION_MODES,
+    audio_range_for_video_window,
+    audio_window_length,
+    clone_window_layout,
+    padded_spatial_shape,
+    window_position_shift,
+)
 from .prompt import segment_ranges
 from .state import require_eager_allocations, resolve_step
 
@@ -26,12 +33,21 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    stagger_cadence: bool = False
+    position_mode: str = "global"
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
             raise ValueError(f"audio_context must be one of {AUDIO_CONTEXT_MODES}, got {self.audio_context!r}")
+        if self.position_mode not in POSITION_MODES:
+            raise ValueError(f"position_mode must be one of {POSITION_MODES}, got {self.position_mode!r}")
+        if self.position_mode != "global" and self.audio_context == "full":
+            raise ValueError(
+                f"position_mode={self.position_mode!r} cannot be combined with audio_context='full'; "
+                "use audio_context='window' or 'auto'"
+            )
 
 
 def ordered_halving(value: int) -> float:
@@ -40,24 +56,34 @@ def ordered_halving(value: int) -> float:
     return int(binary[::-1], 2) / (1 << 64)
 
 
-def max_stagger_phase(window: int, overlap: int) -> int:
+def max_stagger_phase(window: int, overlap: int, *, stagger_cadence: bool = False) -> int:
     """Largest interior-boundary shift that still keeps every adjacent overlap.
 
     Staggering exists to move seams between steps, not to let a window jump
     across its neighbour: a shift larger than the requested overlap lets two
     windows abut with no blend and puts every latent under a different
     prompt/neighbour pair on alternate steps, which reads as constant morphing.
+    With ``stagger_cadence`` the limit rounds down to a multiple of
+    ``_LATENT_CADENCE`` so active phases stay on the 5-latent VAE cycle.
     """
     stride = window - overlap
-    return max(0, min(overlap, stride - 1))
+    limit = max(0, min(overlap, stride - 1))
+    if stagger_cadence:
+        return (limit // _LATENT_CADENCE) * _LATENT_CADENCE
+    return limit
 
 
-def stagger_phase(step: int, window: int, overlap: int) -> int:
+def stagger_phase(step: int, window: int, overlap: int, *, stagger_cadence: bool = False) -> int:
     """Ordered-halving phase for ``step`` bounded to ``[0, max_stagger_phase]``."""
-    return int(ordered_halving(step) * (max_stagger_phase(window, overlap) + 1))
+    limit = max_stagger_phase(window, overlap, stagger_cadence=stagger_cadence)
+    if stagger_cadence:
+        return int(ordered_halving(step) * (limit // _LATENT_CADENCE + 1)) * _LATENT_CADENCE
+    return int(ordered_halving(step) * (limit + 1))
 
 
-def _shifted_starts(anchor: list[int], phase: int, stride: int, *, snap: bool) -> list[int]:
+def _shifted_starts(
+    anchor: list[int], phase: int, stride: int, *, snap: bool, snap_mode: str = "round",
+) -> list[int]:
     """Greedy plan ``anchor`` shifted by ``phase``, keeping anchors, count and overlap.
 
     Every adjacent pair keeps at least ``overlap`` latents in common: the next
@@ -67,7 +93,8 @@ def _shifted_starts(anchor: list[int], phase: int, stride: int, *, snap: bool) -
     interior start lands in ``[anchor[i], anchor[i] + phase]``: a phase never
     moves a seam further than itself, and a feasible ``anchor`` is a fixed point
     at phase 0. With ``snap`` each interior start moves to the nearest cadence
-    point inside its feasible interval when one exists.
+    point (or floor cadence point when ``snap_mode='floor'``) inside its
+    feasible interval when one exists.
     """
     final_start = anchor[-1]
     count = len(anchor)
@@ -81,26 +108,95 @@ def _shifted_starts(anchor: list[int], phase: int, stride: int, *, snap: bool) -
             first = ((lower + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
             last = (upper // _LATENT_CADENCE) * _LATENT_CADENCE
             if first <= last:
-                candidate = min(max(round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE, first), last)
+                if snap_mode == "floor":
+                    snapped = (candidate // _LATENT_CADENCE) * _LATENT_CADENCE
+                else:
+                    snapped = round(candidate / _LATENT_CADENCE) * _LATENT_CADENCE
+                candidate = min(max(snapped, first), last)
         starts.append(candidate)
     starts.append(final_start)
     return starts
 
 
-def _stagger_layouts(anchor: list[int], stride: int, max_phase: int) -> int:
-    """Number of distinct plans the phases ``0..max_phase`` reach from ``anchor``."""
+def _stagger_layouts(anchor: list[int], stride: int, max_phase: int, *, stagger_cadence: bool = False) -> int:
+    """Number of distinct plans the active phases ``0..max_phase`` reach from ``anchor``."""
+    if stagger_cadence:
+        return len({
+            tuple(_shifted_starts(anchor, phase, stride, snap=True))
+            for phase in range(0, max_phase + 1, _LATENT_CADENCE)
+        })
     return len({tuple(_shifted_starts(anchor, phase, stride, snap=False)) for phase in range(max_phase + 1)})
 
 
-def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_phase: int = 0) -> list[int]:
+def _window_anchor(
+    total: int, window: int, overlap: int, max_phase: int = 0, *, stagger_cadence: bool = False,
+) -> tuple[list[int], int]:
+    """Return ``(phase_0_anchor, stride)`` for ``window_starts`` and ``stagger_layout_count``."""
+    if window < 2:
+        raise ValueError("window must be >=2")
+    stride = window - overlap
+    if stride <= 0:
+        raise ValueError("overlap must be smaller than window")
+    if not isinstance(max_phase, int) or not 0 <= max_phase < stride:
+        raise ValueError(f"max_phase must be an integer in [0, {stride})")
+    if stagger_cadence and max_phase % _LATENT_CADENCE != 0:
+        raise ValueError(f"max_phase must be a multiple of {_LATENT_CADENCE} when stagger_cadence is on, got {max_phase}")
+
+    final_start = total - window
+    count = 1 + (final_start + stride - 1) // stride
+    base = [round(i * final_start / (count - 1)) for i in range(count)]
+    if count <= 2:
+        return base, stride
+
+    snapped = _shifted_starts(base, 0, stride, snap=True)
+    if stagger_cadence:
+        floored = _shifted_starts(base, 0, stride, snap=True, snap_mode="floor")
+        anchor = snapped
+        if _stagger_layouts(floored, stride, max_phase, stagger_cadence=True) > _stagger_layouts(
+            snapped, stride, max_phase, stagger_cadence=True
+        ):
+            anchor = floored
+        return anchor, stride
+
+    spread = _shifted_starts(base, 0, stride, snap=False)
+    anchor = snapped
+    if _stagger_layouts(snapped, stride, max_phase) < _stagger_layouts(spread, stride, max_phase):
+        anchor = spread
+    return anchor, stride
+
+
+def stagger_layout_count(
+    total: int, window: int, overlap: int, max_phase: int = 0, *, stagger_cadence: bool = False,
+) -> int:
+    """Count distinct window plans visited across ``0..max_phase``."""
+    if window >= total:
+        return 1
+    anchor, stride = _window_anchor(total, window, overlap, max_phase, stagger_cadence=stagger_cadence)
+    if len(anchor) <= 2:
+        return 1
+    return _stagger_layouts(anchor, stride, max_phase, stagger_cadence=stagger_cadence)
+
+
+def window_starts(
+    total: int,
+    window: int,
+    overlap: int,
+    phase: int = 0,
+    max_phase: int = 0,
+    *,
+    stagger_cadence: bool = False,
+) -> list[int]:
     """Window starts for ``phase`` of a run whose stagger visits phases ``0..max_phase``.
 
     The phase-0 plan snaps interior starts to the latent cadence unless that
     would leave the stagger fewer distinct layouts than the even spread does;
     a static run (``max_phase == 0``) therefore always snaps, and a staggering
     run keeps its off-cadence spread only where cadence and seam movement
-    collide. Every active phase is then derived from that same phase-0 plan,
-    so no seam ever moves further than the phase.
+    collide. With ``stagger_cadence`` every active phase is a multiple of
+    ``_LATENT_CADENCE`` and every movable start stays snapped to that cadence
+    (choosing a cadence-floored phase-0 anchor when it unlocks more distinct
+    cadence layouts). Every active phase is derived from that same phase-0
+    plan, so no seam ever moves further than the phase.
     """
     if window >= total:
         return [0]
@@ -112,21 +208,13 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_pha
 
     if not isinstance(phase, int) or not 0 <= phase < stride:
         raise ValueError(f"phase must be an integer in [0, {stride})")
-    if not isinstance(max_phase, int) or not 0 <= max_phase < stride:
-        raise ValueError(f"max_phase must be an integer in [0, {stride})")
+    if stagger_cadence and phase % _LATENT_CADENCE != 0:
+        raise ValueError(f"phase must be a multiple of {_LATENT_CADENCE} when stagger_cadence is on, got {phase}")
 
-    final_start = total - window
-    count = 1 + (final_start + stride - 1) // stride
-    base = [round(i * final_start / (count - 1)) for i in range(count)]
-    if count <= 2:
-        return base
-
-    spread = _shifted_starts(base, 0, stride, snap=False)
-    snapped = _shifted_starts(base, 0, stride, snap=True)
-    anchor = snapped
-    if _stagger_layouts(snapped, stride, max_phase) < _stagger_layouts(spread, stride, max_phase):
-        anchor = spread
-    return _shifted_starts(anchor, phase, stride, snap=False)
+    anchor, stride = _window_anchor(total, window, overlap, max_phase, stagger_cadence=stagger_cadence)
+    if len(anchor) <= 2:
+        return anchor
+    return _shifted_starts(anchor, phase, stride, snap=stagger_cadence)
 
 
 def blend_weights(length: int, overlap: int, *, device, dtype, mode="pyramid",
@@ -194,6 +282,10 @@ def context_plan_summary(
     audio_window: int | None = None,
     max_phase: int | None = None,
     seams: str | None = None,
+    stagger_cadence: bool = False,
+    stagger_layouts: int | None = None,
+    position_mode: str = "global",
+    position_shifts: list[float] | None = None,
 ) -> str:
     """Return one compact, truthful account of a context-window pass."""
     ranges = [(start, min(start + window, total)) for start in starts]
@@ -213,6 +305,12 @@ def context_plan_summary(
     ]
     if max_phase is not None:
         bits.append(f"max_phase={max_phase}")
+    bits.append(f"stagger_cadence={'on' if stagger_cadence else 'off'}")
+    if stagger_layouts is not None:
+        bits.append(f"stagger_layouts={stagger_layouts}")
+    bits.append(f"position_mode={position_mode}")
+    if position_shifts:
+        bits.append("position_shifts=" + ",".join("0" if s == 0 else f"-{s:.2f}" for s in position_shifts))
     if assignments:
         runs = []
         for index in assignments:
@@ -255,7 +353,7 @@ def _beat_for_window(v0, v1, ranges):
     return best
 
 
-def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=0):
+def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=0, *, stagger_cadence=False):
     """Uniform, staggerable windows that each write their whole extent under one beat's prompt.
 
     This is the WanVideoWrapper / ComfyUI-core arrangement: a window carries the
@@ -276,11 +374,13 @@ def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=
     # Prompt assignment and rescue membership come from the phase-0 plan and are
     # reused by window ordinal: a phase moves a seam, it must not flip a window
     # to another prompt or make a rescue window appear on some steps only.
-    anchors = window_starts(total, window, overlap, 0, max_phase)
+    anchors = window_starts(total, window, overlap, 0, max_phase, stagger_cadence=stagger_cadence)
     assignments = [_beat_for_window(v0, v0 + window, ranges) for v0 in anchors]
     rescued = tuple(index for index in range(len(ranges)) if index not in assignments)
     plan = [(index, v0, v0 + window, v0, v0 + window, rescued)
-            for index, v0 in zip(assignments, window_starts(total, window, overlap, phase, max_phase))]
+            for index, v0 in zip(assignments,
+                                 window_starts(total, window, overlap, phase, max_phase,
+                                               stagger_cadence=stagger_cadence))]
     for index in rescued:
         lo, hi = ranges[index]
         v0 = min(max((lo + hi - window) // 2, 0), total - window)
@@ -375,9 +475,13 @@ def make_freenoise_wrapper(policy: ContextPolicy):
             window = min(policy.window_frames, video_t)
             if video_t > window:
                 overlap = min(policy.overlap_frames, window - 1)
-                max_phase = max_stagger_phase(window, overlap) if policy.stagger else 0
+                max_phase = (
+                    max_stagger_phase(window, overlap, stagger_cadence=policy.stagger_cadence)
+                    if policy.stagger else 0
+                )
                 # The phase-0 anchor plan the context wrapper derives every phase from.
-                starts = window_starts(video_t, window, overlap, 0, max_phase)
+                starts = window_starts(video_t, window, overlap, 0, max_phase,
+                                       stagger_cadence=policy.stagger_cadence)
                 seed = int(extra_args.get("seed", 0)) if isinstance(extra_args, dict) else 0
                 parts = _split_packed_latent(noise, shapes)
                 parts[0] = apply_freenoise(parts[0].clone(), 2, starts, window, seed)
@@ -405,7 +509,8 @@ def make_context_wrapper(policy: ContextPolicy):
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
-                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                      phase=0, blend=policy.blend, audio_t=audio_t,
+                      stagger_cadence=policy.stagger_cadence, position_mode=policy.position_mode), flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -422,8 +527,11 @@ def make_context_wrapper(policy: ContextPolicy):
         blended = policy.segment_seams == "blend"
         stagger = policy.stagger and (not segmented or blended)
         if stagger:
-            max_phase = max_stagger_phase(window, overlap)
-            phase = stagger_phase(step, window, overlap) if step is not None else 0
+            max_phase = max_stagger_phase(window, overlap, stagger_cadence=policy.stagger_cadence)
+            phase = (
+                stagger_phase(step, window, overlap, stagger_cadence=policy.stagger_cadence)
+                if step is not None else 0
+            )
         if segmented:
             ranges, frame_cuts = segment_ranges(total_t, len(prompts), payload.get("h3forge_prompt_segment_durations"))
             # H3 audio has 40 ticks per 24 decoded frames. Shared cuts give each
@@ -431,22 +539,27 @@ def make_context_wrapper(policy: ContextPolicy):
             audio_cuts = [round(frame * 5 / 3) for frame in frame_cuts]
             audio_cuts[-1] = audio_t
             if blended:
-                plan = _blended_segment_windows(total_t, window, overlap, ranges, phase, max_phase)
+                plan = _blended_segment_windows(total_t, window, overlap, ranges, phase, max_phase,
+                                                stagger_cadence=policy.stagger_cadence)
             else:
                 plan = _segment_windows(total_t, window, overlap, ranges)
         else:
-            starts = window_starts(total_t, window, overlap, phase, max_phase)
+            starts = window_starts(total_t, window, overlap, phase, max_phase,
+                                   stagger_cadence=policy.stagger_cadence)
             plan = [(0, v0, v0 + window, v0, v0 + window, ()) for v0 in starts]
         # Windowing audio under ``auto`` requires every beat to fit in and run in
         # a single window: if two windows carry the same beat prompt, slicing
         # hides the beat's earlier audio and reopens F11 inside that beat.
+        # Non-global position modes shift video positions per window, so full-clip
+        # audio would collide with shifted positions; ``auto`` therefore also
+        # selects the window-audio path for those modes.
         single_window_beats = (
             segmented
             and len({p[0] for p in plan}) == len(plan)
             and all(hi - lo <= window for lo, hi in ranges)
         )
         window_audio = policy.audio_context == "window" or (
-            policy.audio_context == "auto" and single_window_beats
+            policy.audio_context == "auto" and (single_window_beats or policy.position_mode != "global")
         )
         audio_win = audio_window_length(full_layout, window) if window_audio else audio_t
         # A window whose write interval is narrower than its extent owns that
@@ -456,10 +569,20 @@ def make_context_wrapper(policy: ContextPolicy):
         plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended, excluded)
                 for index, v0, v1, w0, w1, excluded in plan]
         if step == 0:
+            distinct_layouts = (
+                stagger_layout_count(total_t, window, overlap, max_phase, stagger_cadence=policy.stagger_cadence)
+                if stagger else None
+            )
+            position_shifts = (
+                [window_position_shift(full_layout, p[1], p[2], policy.position_mode) for p in plan]
+                if policy.position_mode != "global" else None
+            )
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None,
+                  stagger_cadence=policy.stagger_cadence, stagger_layouts=distinct_layouts,
+                  position_mode=policy.position_mode, position_shifts=position_shifts),
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
@@ -477,7 +600,8 @@ def make_context_wrapper(policy: ContextPolicy):
             local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
                 video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
                 video_range=(v0, v1), audio_range=(in_a0, in_a1),
-                keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+                keyframes=payload.get("keyframes"), refs=payload.get("refs"),
+                position_mode=policy.position_mode)
             local_payload = {**payload, "layout": local_layout}
             if tags is not None:
                 local_payload["text_token_tags"] = tags[index]

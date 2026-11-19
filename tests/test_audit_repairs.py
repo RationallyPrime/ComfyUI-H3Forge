@@ -442,3 +442,123 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
     assert prepared == [67] and seen[0] == 0 and seen[-1] > 0
     assert patch.control_latent_shape == tuple(x[0].shape)
     assert patch.control_stream is None
+
+
+def test_defaults_are_bit_identical_to_main(monkeypatch):
+    import fake_minimax
+    from h3forge.layout import target_segments
+
+    fake_minimax.install(monkeypatch)
+    total, window, overlap = 202, 85, 21
+    audio_t = 1142
+    gen = torch.Generator("cpu").manual_seed(123)
+    video_x = torch.randn(1, 2, total, 2, 2, generator=gen)
+    audio_x = torch.randn(1, 2, 2, audio_t, generator=gen)
+    context = torch.randn(1, 7, 8, generator=gen)
+    full_layout = fake_minimax.PackedLayout(7, total, 2, 2, audio_t)
+    payload = {"layout": full_layout}
+    sigmas = torch.linspace(1.0, 0.0, 9)
+
+    def position_sensitive_forward(local_x, timestep, text, opts, **kwargs):
+        layout = kwargs["minimax_payload"]["layout"]
+        seg = target_segments(layout)
+        vpos = layout.position_ids[seg.video_start:seg.video_stop, 0].to(local_x[0].dtype).view(1, 1, -1, 1, 1)
+        apos = layout.position_ids[seg.audio_start:seg.audio_start + local_x[1].shape[-1], 0].to(local_x[1].dtype)
+        return [local_x[0] + vpos * 0.01, local_x[1] + apos.view(1, 1, 1, -1) * 0.01]
+
+    default_policy = ContextPolicy(window_frames=window, overlap_frames=overlap, stagger=True, blend="pyramid")
+    explicit_off = ContextPolicy(
+        window_frames=window, overlap_frames=overlap, stagger=True, blend="pyramid",
+        stagger_cadence=False, position_mode="global",
+    )
+    assert default_policy == explicit_off
+
+    # Compare against an explicit manual phase/position reference matching untouched main.
+    from h3forge.context import blend_weights, max_stagger_phase, stagger_phase, window_starts
+
+    wrapper = make_context_wrapper(default_policy)
+    for step_idx in range(4):
+        opts = {"sigmas": sigmas[step_idx:step_idx + 1], "sample_sigmas": sigmas}
+        seen_positions = []
+
+        def recording_forward(local_x, timestep, text, o, **kwargs):
+            seen_positions.append(kwargs["minimax_payload"]["layout"].position_ids.clone())
+            return position_sensitive_forward(local_x, timestep, text, o, **kwargs)
+
+        out_v, out_a = wrapper(_executor(recording_forward), [video_x, audio_x],
+                               sigmas[step_idx:step_idx + 1] * 1000.0, context, opts, minimax_payload=payload)
+
+        # Verify exact main window starts, global position_ids, and bit-identical blended video/audio.
+        mp = max_stagger_phase(window, overlap)
+        ph = stagger_phase(step_idx, window, overlap)
+        expected_starts = window_starts(total, window, overlap, ph, mp)
+        assert len(seen_positions) == len(expected_starts)
+        src = target_segments(full_layout)
+        ref_v_acc = torch.zeros_like(video_x, dtype=torch.float32)
+        ref_v_den = torch.zeros((1, 1, total, 1, 1), dtype=torch.float32)
+        for v0, pos in zip(expected_starts, seen_positions):
+            v1 = v0 + window
+            assert torch.equal(pos[-window:], full_layout.position_ids[src.video_start + v0:src.video_start + v1])
+            assert torch.equal(pos[7:7 + 2 * audio_t], full_layout.position_ids[src.audio_start:src.audio_stop])
+            vpos = full_layout.position_ids[src.video_start + v0:src.video_start + v1, 0].to(video_x.dtype)
+            pred_v = video_x[:, :, v0:v1] + vpos.view(1, 1, -1, 1, 1) * 0.01
+            w = blend_weights(window, overlap, device="cpu", dtype=torch.float32, mode="pyramid",
+                              ramp_start=v0 > 0, ramp_end=v1 < total).view(1, 1, -1, 1, 1)
+            ref_v_acc[:, :, v0:v1].add_(pred_v.float() * w)
+            ref_v_den[:, :, v0:v1].add_(w)
+        expected_v = (ref_v_acc / ref_v_den.clamp_min(1e-6)).to(video_x.dtype)
+        assert torch.equal(out_v, expected_v)
+        assert out_a.shape == audio_x.shape
+
+
+@pytest.mark.parametrize(
+    "stagger_cadence,position_mode,audio_context,expected_tokens,expect_window_audio",
+    [
+        (False, "global", "auto", ("stagger_cadence=off", "stagger_layouts=7", "position_mode=global", "audio_context=full:1142"), False),
+        (True, "global", "auto", ("stagger_cadence=on", "stagger_layouts=2", "off_cadence_starts=1", "max_phase=20", "position_mode=global"), False),
+        (False, "rebased", "auto", ("stagger_cadence=off", "position_mode=rebased", "position_shifts=0,-311.67,-651.67", "audio_context=window:"), True),
+        (True, "rebased", "window", ("stagger_cadence=on", "stagger_layouts=2", "position_mode=rebased", "position_shifts=0,-311.67,-651.67", "audio_context=window:"), True),
+        (True, "wrapped", "auto", ("stagger_cadence=on", "stagger_layouts=2", "position_mode=wrapped", "position_shifts=0,0,-311.67", "audio_context=window:"), True),
+    ],
+)
+def test_step_zero_log_and_window_audio_for_cadence_and_position_modes(
+    monkeypatch, capsys, stagger_cadence, position_mode, audio_context, expected_tokens, expect_window_audio
+):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    total, window, overlap, audio_t = 202, 85, 21, 1142
+    x = [torch.zeros(1, 1, total, 2, 2), torch.zeros(1, 1, 2, audio_t)]
+    context = torch.zeros(1, 7, 8)
+    payload = {"layout": fake_minimax.PackedLayout(7, total, 2, 2, audio_t)}
+    seen_audio_lens = set()
+    seen_v_offsets = []
+
+    def run(local_x, timestep, text, opts, **kwargs):
+        layout = kwargs["minimax_payload"]["layout"]
+        seen_audio_lens.add(local_x[1].shape[-1])
+        seen_v_offsets.append(layout._h3forge_video_offset)
+        return [torch.ones_like(local_x[0]), torch.ones_like(local_x[1])]
+
+    policy = ContextPolicy(
+        window_frames=window, overlap_frames=overlap, stagger=True, blend="pyramid",
+        audio_context=audio_context, stagger_cadence=stagger_cadence, position_mode=position_mode,
+    )
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
+    out = make_context_wrapper(policy)(
+        _executor(run), x, torch.tensor([1000.0]), context, options, minimax_payload=payload,
+    )
+    assert torch.all(out[0] == 1.0) and torch.all(out[1] == 1.0)
+    if expect_window_audio:
+        assert len(seen_audio_lens) == 1 and next(iter(seen_audio_lens)) < audio_t
+    else:
+        assert seen_audio_lens == {audio_t}
+    if stagger_cadence:
+        assert seen_v_offsets == [0, 55, 117]
+    else:
+        assert seen_v_offsets == [0, 58, 117]
+
+    log = capsys.readouterr().out
+    assert "[H3Forge] context plan " in log
+    for token in expected_tokens:
+        assert token in log, (token, log)

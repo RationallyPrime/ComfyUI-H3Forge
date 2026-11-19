@@ -187,3 +187,181 @@ def test_audio_window_length_is_constant_across_all_starts(monkeypatch, total, w
     for bad in (0, -1, total + 1):
         with pytest.raises(ValueError, match="video_window"):
             audio_window_length(full, bad)
+
+
+@pytest.mark.parametrize("refs", [None, [{"kind": "image", "latent_h": 2, "latent_w": 2}, {"kind": "audio", "ref_audio_t": 40}]])
+@pytest.mark.parametrize("v0", [0, 1, 2, 3, 4, 58, 60, 117])
+def test_rebased_positions_start_at_cycle_offset_and_keep_av_alignment(monkeypatch, refs, v0):
+    fake_minimax.install(monkeypatch)
+    from fake_minimax import video_frame_times
+    from h3forge.layout import (
+        CYCLE_TIME_SPAN,
+        audio_range_for_video_window,
+        audio_window_length,
+        clone_window_layout,
+        target_segments,
+        window_position_shift,
+    )
+
+    total, window, audio_t = 202, 85, 1142
+    full = PackedLayout(12, total, 4, 4, audio_t, refs=refs)
+    src = target_segments(full)
+    origin = float(full.position_ids[src.video_start, 0])
+    audio_win = audio_window_length(full, window)
+
+    v1 = v0 + window
+    a0, _ = audio_range_for_video_window(full, v0, v1)
+    in_a0 = min(a0, audio_t - audio_win)
+    in_a1 = in_a0 + audio_win
+
+    local_global = clone_window_layout(
+        full_layout=full, text_len=12, video_shape=(window, 4, 4), audio_t=audio_t,
+        video_range=(v0, v1), audio_range=(in_a0, in_a1), refs=refs, position_mode="global",
+    )
+    local_rebased = clone_window_layout(
+        full_layout=full, text_len=12, video_shape=(window, 4, 4), audio_t=audio_t,
+        video_range=(v0, v1), audio_range=(in_a0, in_a1), refs=refs, position_mode="rebased",
+    )
+    dst = target_segments(local_rebased)
+    shift = window_position_shift(full, v0, v1, "rebased")
+    assert shift == pytest.approx((v0 // 5) * CYCLE_TIME_SPAN)
+
+    # Video starts at target origin plus its offset inside the 5-latent cycle.
+    expected_cycle_offset = video_frame_times(5)[v0 % 5]
+    rebased_vpos = local_rebased.position_ids[dst.video_start:dst.video_stop:full.frame_rows, 0]
+    global_vpos = local_global.position_ids[dst.video_start:dst.video_stop:full.frame_rows, 0]
+    assert float(rebased_vpos[0]) - origin == pytest.approx(expected_cycle_offset, abs=1e-11)
+    assert torch.allclose(rebased_vpos, global_vpos - shift, atol=1e-11, rtol=0.0)
+
+    # Audio shifts by the exact same amount on both stereo channels, preserving A/V alignment.
+    rebased_apos = local_rebased.position_ids[dst.audio_start:dst.audio_stop, 0]
+    global_apos = local_global.position_ids[dst.audio_start:dst.audio_stop, 0]
+    assert torch.allclose(rebased_apos, global_apos - shift, atol=1e-11, rtol=0.0)
+    assert torch.allclose(
+        rebased_vpos[:, None] - rebased_apos[None, :audio_win],
+        global_vpos[:, None] - global_apos[None, :audio_win],
+        atol=1e-11,
+        rtol=0.0,
+    )
+    assert torch.equal(rebased_apos[:audio_win], rebased_apos[audio_win:])
+
+    # Prefix rows and spatial coordinates stay untouched, and sparse offsets stay global.
+    assert torch.equal(local_rebased.position_ids[:dst.audio_start], local_global.position_ids[:dst.audio_start])
+    assert torch.equal(local_rebased.position_ids[:, 1:], local_global.position_ids[:, 1:])
+    assert local_rebased._h3forge_video_offset == v0
+    assert local_rebased._h3forge_audio_offset == in_a0
+
+
+def test_wrapped_positions_keep_global_inside_trained_range_and_wrap_centre_beyond(monkeypatch):
+    fake_minimax.install(monkeypatch)
+    from h3forge.layout import (
+        CYCLE_TIME_SPAN,
+        TRAINED_MAX_TIME,
+        audio_range_for_video_window,
+        audio_window_length,
+        clone_window_layout,
+        target_segments,
+        window_position_shift,
+    )
+
+    # 202-latent clip (Battle Brief): windows 0 and 1 have centres inside trained range; window 2 wraps.
+    full = PackedLayout(10, 202, 4, 4, 1142, refs=[{"kind": "image", "latent_h": 2, "latent_w": 2}])
+    src = target_segments(full)
+    origin = float(full.position_ids[src.video_start, 0])
+    audio_win = audio_window_length(full, 85)
+
+    for v0, expect_shifted in ((0, False), (60, False), (117, True)):
+        v1 = v0 + 85
+        a0, _ = audio_range_for_video_window(full, v0, v1)
+        in_a0 = min(a0, 1142 - audio_win)
+        in_a1 = in_a0 + audio_win
+        shift = window_position_shift(full, v0, v1, "wrapped")
+        local_g = clone_window_layout(
+            full_layout=full, text_len=10, video_shape=(85, 4, 4), audio_t=1142,
+            video_range=(v0, v1), audio_range=(in_a0, in_a1),
+            refs=[{"kind": "image", "latent_h": 2, "latent_w": 2}], position_mode="global",
+        )
+        local_w = clone_window_layout(
+            full_layout=full, text_len=10, video_shape=(85, 4, 4), audio_t=1142,
+            video_range=(v0, v1), audio_range=(in_a0, in_a1),
+            refs=[{"kind": "image", "latent_h": 2, "latent_w": 2}], position_mode="wrapped",
+        )
+        dst = target_segments(local_w)
+        if not expect_shifted:
+            assert shift == 0.0
+            assert torch.equal(local_w.position_ids, local_g.position_ids)
+        else:
+            cycles = round(shift / CYCLE_TIME_SPAN)
+            assert cycles > 0 and shift == pytest.approx(cycles * CYCLE_TIME_SPAN)
+            vpos = local_w.position_ids[dst.video_start:dst.video_stop:full.frame_rows, 0] - origin
+            apos = local_w.position_ids[dst.audio_start:dst.audio_stop, 0] - origin
+            centre = 0.5 * (float(vpos[0]) + float(vpos[-1]))
+            assert 0.0 <= float(vpos[0]) and centre <= TRAINED_MAX_TIME
+            assert torch.allclose(
+                local_w.position_ids[dst.video_start:dst.video_stop, 0],
+                local_g.position_ids[dst.video_start:dst.video_stop, 0] - shift,
+                atol=1e-11, rtol=0.0,
+            )
+            assert torch.allclose(
+                local_w.position_ids[dst.audio_start:dst.audio_stop, 0],
+                local_g.position_ids[dst.audio_start:dst.audio_stop, 0] - shift,
+                atol=1e-11, rtol=0.0,
+            )
+            assert float(apos[0]) == pytest.approx(
+                float(local_g.position_ids[dst.audio_start, 0]) - origin - shift, abs=1e-11
+            )
+
+    # 60s clip (427 latents, window 100): every window's wrapped centre lies inside trained range.
+    long_full = PackedLayout(8, 427, 4, 4, 2417)
+    long_src = target_segments(long_full)
+    long_origin = float(long_full.position_ids[long_src.video_start, 0])
+    for v0 in (0, 80, 165, 245, 327):
+        shift = window_position_shift(long_full, v0, v0 + 100, "wrapped")
+        vpos = long_full.position_ids[long_src.video_start + v0 * long_full.frame_rows:
+                                      long_src.video_start + (v0 + 100) * long_full.frame_rows:long_full.frame_rows, 0]
+        shifted = vpos - long_origin - shift
+        assert float(shifted[0]) >= -1e-11
+        assert 0.5 * (float(shifted[0]) + float(shifted[-1])) <= TRAINED_MAX_TIME + 1e-9
+
+
+def test_sparse_block_mask_keeps_working_with_rebased_and_wrapped_layouts(monkeypatch):
+    fake_minimax.install(monkeypatch)
+    from h3forge.attention import _make_block_mask
+    from h3forge.layout import audio_range_for_video_window, audio_window_length, clone_window_layout
+    from h3forge.state import AttentionPolicy, RuntimeState
+
+    calls = []
+
+    def fake_create_block_mask(mask_mod, **kwargs):
+        calls.append({"mask_mod": mask_mod, **kwargs})
+        return object()
+
+    import torch.nn.attention.flex_attention as flex_module
+    monkeypatch.setattr(flex_module, "create_block_mask", fake_create_block_mask)
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+
+    full = PackedLayout(8, 202, 4, 4, 1142)
+    audio_win = audio_window_length(full, 85)
+    v0, v1 = 117, 202
+    a0, _ = audio_range_for_video_window(full, v0, v1)
+    in_a0 = min(a0, 1142 - audio_win)
+    in_a1 = in_a0 + audio_win
+
+    state = RuntimeState(AttentionPolicy())
+    masks = {}
+    for mode in ("global", "rebased", "wrapped"):
+        layout = clone_window_layout(
+            full_layout=full, text_len=8, video_shape=(85, 4, 4), audio_t=1142,
+            video_range=(v0, v1), audio_range=(in_a0, in_a1), position_mode=mode,
+        )
+        assert layout._h3forge_video_offset == v0
+        assert layout._h3forge_audio_offset == in_a0
+        state.layout = layout
+        q = torch.zeros(1, 2, layout.seq_len, 8)
+        masks[mode] = _make_block_mask(state, q, device=q.device)
+
+    # Preserved global offsets mean all three modes share the exact same compiled sparse mask.
+    assert masks["rebased"] is masks["global"]
+    assert masks["wrapped"] is masks["global"]
+    assert len(calls) == 1
+    assert (state.mask_misses, state.mask_hits) == (1, 2)

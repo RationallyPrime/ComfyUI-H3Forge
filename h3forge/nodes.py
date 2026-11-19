@@ -8,7 +8,7 @@ from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
 from .context import AUDIO_CONTEXT_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
-from .layout import padded_spatial_shape
+from .layout import POSITION_MODES, padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
 from . import renoise
 from .prompt import (
@@ -334,14 +334,34 @@ def _context_optional_inputs():
                     "spans more than one window, so later windows of that prompt hear earlier lines and do not "
                     "repeat them; windowed audio on pipe timelines where every beat fits in a single window, "
                     "bounding cross-beat audio visibility to the window span (adjacent beats still share overlaps). "
-                    "window: always slice audio to the window. full: always pass the full clip audio."
+                    "When position_mode is rebased or wrapped, auto also selects windowed audio so positions do not "
+                    "collide. window: always slice audio to the window. full: always pass the full clip audio "
+                    "(only valid with position_mode='global')."
+                ),
+            }),
+            "stagger_cadence": ("BOOLEAN", {
+                "default": False,
+                "tooltip": (
+                    "Restrict stagger phases to multiples of H3's 5-latent (17-frame) VAE cycle and keep movable "
+                    "window starts snapped to that cadence on every step. Produces fewer distinct layouts."
+                ),
+            }),
+            "position_mode": (list(POSITION_MODES), {
+                "default": "global",
+                "tooltip": (
+                    "RoPE time coordinates for each window. global: preserve absolute clip positions. rebased: "
+                    "shift each window's video and audio positions by a multiple of the 5-latent cycle so the window "
+                    "starts at target origin plus its cycle offset (inside H3's trained range). wrapped: keep global "
+                    "positions when the window's centre lies inside the trained range, otherwise subtract a multiple "
+                    "of the cycle length so its centre lies inside the trained range. Non-global modes use windowed "
+                    "audio."
                 ),
             }),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", stagger_cadence=False, position_mode="global"):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +372,9 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context,
+                               stagger_cadence=stagger_cadence,
+                               position_mode=position_mode)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +405,11 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto",
+              stagger_cadence=False, position_mode="global"):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context,
+                                 stagger_cadence, position_mode),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +462,8 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto",
+              stagger_cadence=False, position_mode="global"):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +494,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
+                                   audio_context, stagger_cadence, position_mode)
         return (patched, latent)
 
 
