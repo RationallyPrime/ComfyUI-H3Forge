@@ -5,16 +5,21 @@ from dataclasses import dataclass
 from itertools import pairwise
 
 import torch
+import torch.nn.functional as F
 
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
+_BAND_STAGGER_HOLD_SIGMA = 0.8
+_BAND_BLUR_KERNEL = (1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0)
+_BAND_ADAPTIVE_LOW = 0.15
+_BAND_ADAPTIVE_HIGH = 0.50
 
 
 @dataclass(frozen=True)
@@ -26,12 +31,25 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    band_fusion: int = 0
+    band_crossfade: int = 2
+    band_adaptive: bool = False
+    band_stagger_hold: bool = True
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
             raise ValueError(f"audio_context must be one of {AUDIO_CONTEXT_MODES}, got {self.audio_context!r}")
+        if (
+            isinstance(self.band_fusion, bool)
+            or not isinstance(self.band_fusion, int)
+            or self.band_fusion < 0
+            or self.band_fusion == 1
+        ):
+            raise ValueError(f"band_fusion must be 0 (off) or an integer >= 2, got {self.band_fusion!r}")
+        if isinstance(self.band_crossfade, bool) or not isinstance(self.band_crossfade, int) or self.band_crossfade < 0:
+            raise ValueError(f"band_crossfade must be a non-negative integer, got {self.band_crossfade!r}")
 
 
 def ordered_halving(value: int) -> float:
@@ -194,6 +212,7 @@ def context_plan_summary(
     audio_window: int | None = None,
     max_phase: int | None = None,
     seams: str | None = None,
+    band_info: str | None = None,
 ) -> str:
     """Return one compact, truthful account of a context-window pass."""
     ranges = [(start, min(start + window, total)) for start in starts]
@@ -230,7 +249,205 @@ def context_plan_summary(
             bits.append(f"audio_context=window:{audio_window}/{audio_t}")
         else:
             bits.append(f"audio_context=full:{audio_t}")
+    if band_info is not None:
+        bits.append(band_info)
     return " ".join(bits)
+
+
+def _separable_blur_2d(tensor: torch.Tensor, dilation: int = 1) -> torch.Tensor:
+    """Fixed 5-tap separable Burt-Adelson blur over latent (H, W) with replicate padding."""
+    b, c, t, h, w = tensor.shape
+    pad = 2 * dilation
+    kernel = torch.tensor(_BAND_BLUR_KERNEL, device=tensor.device, dtype=torch.float32)
+    flat = tensor.reshape(b * c * t, 1, h, w)
+    flat = F.conv2d(F.pad(flat, (pad, pad, 0, 0), mode="replicate"), kernel.view(1, 1, 1, 5), dilation=(1, dilation))
+    flat = F.conv2d(F.pad(flat, (0, 0, pad, pad), mode="replicate"), kernel.view(1, 1, 5, 1), dilation=(dilation, 1))
+    return flat.reshape(b, c, t, h, w)
+
+
+def laplacian_pyramid(tensor: torch.Tensor, levels: int) -> list[torch.Tensor]:
+    """Undecimated spatial Laplacian pyramid over latent (H, W) with exact sum reconstruction.
+
+    Returns ``[band_0, ..., band_{levels - 1}]`` ordered from lowest (coarsest)
+    to highest (finest) frequency, each in float32 with the same shape as ``tensor``.
+    """
+    if isinstance(levels, bool) or not isinstance(levels, int) or levels < 1:
+        raise ValueError(f"levels must be a positive integer, got {levels!r}")
+    current = tensor.float()
+    highs: list[torch.Tensor] = []
+    for level in range(levels - 1):
+        blurred = _separable_blur_2d(current, dilation=1 << level)
+        highs.append(current - blurred)
+        current = blurred
+    return [current, *reversed(highs)]
+
+
+def _local_spatial_mean(tensor: torch.Tensor) -> torch.Tensor:
+    """3x3 replicate-padded spatial average over (H, W) on a [B, C, T, H, W] tensor."""
+    b, c, t, h, w = tensor.shape
+    flat = tensor.reshape(b * c * t, 1, h, w)
+    pooled = F.avg_pool2d(F.pad(flat, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+    return pooled.reshape(b, c, t, h, w)
+
+
+def _adaptive_disagreement_gate(band_tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Local disagreement gate in [0, 1] per overlap latent and spatial pixel.
+
+    Returns 0 where windows agree (keep plain blend) and 1 where they disagree
+    strongly (use narrow band transition).
+    """
+    if len(band_tensors) == 2:
+        diff = (band_tensors[0] - band_tensors[1]).abs().mean(dim=1, keepdim=True)
+        scale = (band_tensors[0].abs() + band_tensors[1].abs()).mean(dim=1, keepdim=True)
+    else:
+        mean = sum(band_tensors) / len(band_tensors)
+        diff = sum((b - mean).abs() for b in band_tensors).mean(dim=1, keepdim=True)
+        scale = sum(b.abs() for b in band_tensors).mean(dim=1, keepdim=True)
+    local_diff = _local_spatial_mean(diff)
+    local_scale = _local_spatial_mean(scale).clamp_min(1e-6)
+    ratio = (local_diff / local_scale).clamp(0.0, 1.0)
+    u = ((ratio - _BAND_ADAPTIVE_LOW) / (_BAND_ADAPTIVE_HIGH - _BAND_ADAPTIVE_LOW)).clamp(0.0, 1.0)
+    return u * u * (3.0 - 2.0 * u)
+
+
+def band_overlap_weights(
+    seg_start: int,
+    seg_end: int,
+    base_weights: list[torch.Tensor],
+    levels: int,
+    crossfade: int,
+    pair_bounds: list[tuple[float, float, float, float]],
+) -> list[list[torch.Tensor]]:
+    """Per-band normalized fusion weights for an overlap segment ``[seg_start, seg_end)``.
+
+    Band 0 keeps the normalized existing blend weights; band ``levels - 1`` switches
+    over ``crossfade`` latents around the overlap center; intermediate bands linearly
+    interpolate their transition width between the full overlap and ``crossfade``.
+    """
+    count = len(base_weights)
+    device = base_weights[0].device
+    base_stack = torch.stack(base_weights, dim=0)
+    base_norm = base_stack / base_stack.sum(dim=0, keepdim=True).clamp_min(1e-6)
+    result: list[list[torch.Tensor]] = [[base_norm[i] for i in range(count)]]
+    if levels <= 1:
+        return result
+
+    coords = torch.arange(seg_start, seg_end, device=device, dtype=torch.float32) + 0.5
+    for band in range(1, levels):
+        alpha = band / (levels - 1)
+        ramps = []
+        for pair_lo, pair_hi, center, ref_length in pair_bounds:
+            ov_len = max(float(pair_hi - pair_lo), 0.0)
+            full_w = float(ref_length) if ref_length > 0.0 else ov_len
+            high_w = min(float(crossfade), full_w)
+            width = (1.0 - alpha) * full_w + alpha * high_w
+            mid = min(max(float(center), float(pair_lo)), float(pair_hi))
+            if width <= 0.0:
+                ramp = torch.where(coords > mid, 1.0, torch.where(coords < mid, 0.0, 0.5))
+            else:
+                ramp = ((coords - (mid - 0.5 * width)) / width).clamp(0.0, 1.0)
+            ramps.append(ramp)
+
+        if count == 2:
+            r0 = ramps[0]
+            result.append([1.0 - r0, r0])
+        else:
+            raw = [1.0 - ramps[0]]
+            for idx in range(1, count - 1):
+                raw.append((ramps[idx - 1] - ramps[idx]).clamp_min(0.0))
+            raw.append(ramps[-1])
+            raw_stack = torch.stack(raw, dim=0)
+            raw_sum = raw_stack.sum(dim=0, keepdim=True)
+            norm = torch.where(raw_sum > 1e-6, raw_stack / raw_sum.clamp_min(1e-6), base_norm)
+            result.append([norm[i] for i in range(count)])
+    return result
+
+
+def fuse_band_overlap(
+    slices: list[torch.Tensor],
+    base_weights: list[torch.Tensor],
+    seg_start: int,
+    seg_end: int,
+    levels: int,
+    crossfade: int,
+    pair_bounds: list[tuple[float, float, float, float]],
+    *,
+    adaptive: bool = False,
+) -> torch.Tensor:
+    """Fuse overlapping window predictions per spatial Laplacian pyramid band."""
+    pyramids = [laplacian_pyramid(tensor, levels) for tensor in slices]
+    weights = band_overlap_weights(seg_start, seg_end, base_weights, levels, crossfade, pair_bounds)
+    plain_w = [w.view(1, 1, -1, 1, 1) for w in weights[0]]
+
+    fused = torch.zeros_like(pyramids[0][0])
+    for band in range(levels):
+        band_tensors = [pyr[band] for pyr in pyramids]
+        band_w = [w.view(1, 1, -1, 1, 1) for w in weights[band]]
+        if band > 0 and adaptive:
+            gate = _adaptive_disagreement_gate(band_tensors)
+            keep_plain = 1.0 - gate
+            for wp, wb, bt in zip(plain_w, band_w, band_tensors):
+                fused.add_((keep_plain * wp + gate * wb) * bt)
+        else:
+            for wb, bt in zip(band_w, band_tensors):
+                fused.add_(wb * bt)
+    return fused
+
+
+def _partition_video_writes(
+    total_t: int,
+    write_spans: list[list[tuple[int, int]]],
+) -> tuple[list[list[tuple[int, int]]], list[tuple[int, int, tuple[int, ...]]]]:
+    """Split window write intervals into solo spans and shared overlap segments."""
+    owners_per_t: list[list[int]] = [[] for _ in range(total_t)]
+    for win_idx, spans in enumerate(write_spans):
+        for w0, w1 in spans:
+            for t in range(w0, w1):
+                owners_per_t[t].append(win_idx)
+
+    solo_spans: list[list[tuple[int, int]]] = [[] for _ in range(len(write_spans))]
+    overlap_segments: list[tuple[int, int, tuple[int, ...]]] = []
+    t = 0
+    while t < total_t:
+        cur = tuple(owners_per_t[t])
+        end = t + 1
+        while end < total_t and tuple(owners_per_t[end]) == cur:
+            end += 1
+        if len(cur) == 1:
+            solo_spans[cur[0]].append((t, end))
+        elif len(cur) >= 2:
+            overlap_segments.append((t, end, cur))
+        t = end
+    return solo_spans, overlap_segments
+
+
+def _held_pair_bounds(
+    plan,
+    total_t: int,
+    window: int,
+    overlap: int,
+    max_phase: int,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    """Phase-invariant ``(center, ref_length)`` per adjacent pair of regular windows.
+
+    Because ``window_starts`` is non-decreasing in phase and ``max_phase <= overlap``,
+    ``starts_max[i + 1] <= starts_0[i] + window`` always holds, so the midpoint of
+    their intersection lies inside every stagger phase's overlap.
+    """
+    if max_phase <= 0:
+        return {}
+    starts_0 = window_starts(total_t, window, overlap, 0, max_phase)
+    starts_max = window_starts(total_t, window, overlap, max_phase, max_phase)
+    regular = [idx for idx, entry in enumerate(plan) if not entry[5]]
+    if len(regular) != len(starts_0):
+        return {}
+    bounds: dict[tuple[int, int], tuple[float, float]] = {}
+    for pos in range(len(regular) - 1):
+        a_idx, b_idx = regular[pos], regular[pos + 1]
+        lo_all = float(starts_max[pos + 1])
+        hi_all = float(starts_0[pos] + window)
+        bounds[(a_idx, b_idx)] = (0.5 * (lo_all + hi_all), max(hi_all - lo_all, 0.0))
+    return bounds
 
 
 def _slice_optional_video(mask, v0, v1):
@@ -399,13 +616,20 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options)
+        step, _ = resolve_step(transformer_options, sigma=sigma)
+        if sigma is None and timestep is not None:
+            sigma = float(timestep.flatten()[0]) / 1000.0
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
             if step == 0:
+                band_info = (
+                    f"band_fusion={policy.band_fusion}(inactive:single-window)"
+                    if policy.band_fusion > 0 else "band_fusion=off"
+                )
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
-                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                      phase=0, blend=policy.blend, audio_t=audio_t, band_info=band_info), flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -455,18 +679,58 @@ def make_context_wrapper(policy: ContextPolicy):
         # any rescued beat, which its own window owns in both streams.
         plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended, excluded)
                 for index, v0, v1, w0, w1, excluded in plan]
+        use_band_fusion = policy.band_fusion > 0
+        solo_spans: list[list[tuple[int, int]]] = []
+        overlap_segments: list[tuple[int, int, tuple[int, ...]]] = []
+        win_to_segments: list[list[int]] = []
+        seg_buffers: dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]] = {}
+        held_bounds: dict[tuple[int, int], tuple[float, float]] = {}
+        hold_active = False
+        if use_band_fusion:
+            write_spans = [
+                _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded])
+                for _, _, _, write_v0, write_v1, _, excluded in plan
+            ]
+            solo_spans, overlap_segments = _partition_video_writes(total_t, write_spans)
+            win_to_segments = [[] for _ in range(len(plan))]
+            for seg_idx, (_, _, owner_tuple) in enumerate(overlap_segments):
+                for win_idx in owner_tuple:
+                    win_to_segments[win_idx].append(seg_idx)
+            hold_active = (
+                policy.band_stagger_hold
+                and stagger
+                and sigma is not None
+                and sigma <= _BAND_STAGGER_HOLD_SIGMA + 1e-6
+            )
+            if hold_active:
+                held_bounds = _held_pair_bounds(plan, total_t, window, overlap, max_phase)
         if step == 0:
+            if use_band_fusion:
+                overlap_latents = sum(end - start for start, end, _ in overlap_segments)
+                hold_desc = (
+                    f"on(sigma<={_BAND_STAGGER_HOLD_SIGMA:g})"
+                    if (policy.band_stagger_hold and stagger) else "off"
+                )
+                band_info = (
+                    f"band_fusion={policy.band_fusion} "
+                    f"band_crossfade={policy.band_crossfade} "
+                    f"band_adaptive={'on' if policy.band_adaptive else 'off'} "
+                    f"band_stagger_hold={hold_desc} "
+                    f"band_overlap_latents={overlap_latents}"
+                )
+            else:
+                band_info = "band_fusion=off"
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None, band_info=band_info),
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        for win_idx, (index, v0, v1, write_v0, write_v1, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -506,10 +770,46 @@ def make_context_wrapper(policy: ContextPolicy):
 
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
-                keep = slice(w0 - v0, w1 - v0)
-                video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
-                video_den[:, :, w0:w1].add_(vw[:, :, keep])
+            if not use_band_fusion:
+                for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+                    keep = slice(w0 - v0, w1 - v0)
+                    video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
+                    video_den[:, :, w0:w1].add_(vw[:, :, keep])
+            else:
+                for w0, w1 in solo_spans[win_idx]:
+                    keep = slice(w0 - v0, w1 - v0)
+                    video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
+                    video_den[:, :, w0:w1].add_(vw[:, :, keep])
+                vw_1d = vw.view(-1)
+                for seg_idx in win_to_segments[win_idx]:
+                    seg_start, seg_end, owner_tuple = overlap_segments[seg_idx]
+                    keep = slice(seg_start - v0, seg_end - v0)
+                    buf = seg_buffers.setdefault(seg_idx, {})
+                    buf[win_idx] = (v_out[:, :, keep].float(), vw_1d[keep])
+                    if len(buf) == len(owner_tuple):
+                        pair_bounds = []
+                        for a_idx, b_idx in pairwise(owner_tuple):
+                            pair_lo = float(max(plan[a_idx][1], plan[b_idx][1]))
+                            pair_hi = float(min(plan[a_idx][2], plan[b_idx][2]))
+                            if hold_active and (a_idx, b_idx) in held_bounds:
+                                center, ref_len = held_bounds[(a_idx, b_idx)]
+                            else:
+                                center = 0.5 * (pair_lo + pair_hi)
+                                ref_len = max(pair_hi - pair_lo, 0.0)
+                            pair_bounds.append((pair_lo, pair_hi, center, ref_len))
+                        fused = fuse_band_overlap(
+                            [buf[w_idx][0] for w_idx in owner_tuple],
+                            [buf[w_idx][1] for w_idx in owner_tuple],
+                            seg_start,
+                            seg_end,
+                            policy.band_fusion,
+                            policy.band_crossfade,
+                            pair_bounds,
+                            adaptive=policy.band_adaptive,
+                        )
+                        video_acc[:, :, seg_start:seg_end] = fused
+                        video_den[:, :, seg_start:seg_end] = 1.0
+                        del seg_buffers[seg_idx]
 
             write_a0, write_a1 = a0, a1
             if owned:
