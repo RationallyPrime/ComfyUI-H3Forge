@@ -10,7 +10,7 @@ from .attention import LOG, make_attention_override, prune_run_caches
 from .context import AUDIO_CONTEXT_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
-from . import renoise
+from . import renoise, sol_rotary
 from .prompt import (
     combine_conditioning_segments,
     compose_segment_prompts,
@@ -112,6 +112,25 @@ def _bind_forward_config(patched, state, configured_options):
         ATTN_KEY,
         _forward_wrapper(state, configured_options),
     )
+
+
+class H3ForgeSolRotary:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL",),
+            "cache_sigma": ("BOOLEAN", {"default": True}),
+            "cache_rotary": ("BOOLEAN", {"default": True}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/attention"
+    DESCRIPTION = "Cache native Sol's sigma decision per evaluation and H3's rotary table per sampling run."
+
+    def patch(self, model, cache_sigma, cache_rotary):
+        _require_h3(model)
+        return (sol_rotary.install(model, cache_sigma, cache_rotary),)
 
 
 class H3ForgeAttention:
@@ -753,6 +772,7 @@ class H3ForgeRenoiseStitch:
 
 
 NODE_CLASS_MAPPINGS = {
+    "H3ForgeSolRotary": H3ForgeSolRotary,
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
     "H3ForgeTimelineContextWindows": H3ForgeTimelineContextWindows,
@@ -763,6 +783,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3ForgeSolRotary": "H3 Forge — Sol Sigma + Rotary Cache",
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
     "H3ForgeTimelineContextWindows": "H3 Forge — Timeline Context Windows",

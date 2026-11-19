@@ -1,0 +1,47 @@
+--- a/comfy/ldm/minimax/model.py
++++ b/comfy/ldm/minimax/model.py
+@@ -646,10 +646,16 @@
+             return torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))  # blend the two rows by the fractional part
+         return self.time_embedder(t_vals).to(dtype)
+
++    def _rotation_table(self, layout, device, dtype):
++        return rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
++
+     def _run_blocks(self, h, t_emb, mod_segments, layout, transformer_options):
+         device = h.device
+-        # rotation table computed once per forward, consumed by the kitchen split-half rope
+-        rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), h.dtype)
++        cache = transformer_options.get("h3forge_rotary_cache")
++        if cache is None:
++            rope_freqs = self._rotation_table(layout, device, h.dtype)
++        else:
++            rope_freqs = cache.table(self, layout, device, h.dtype)
+
+         patches_replace = transformer_options.get("patches_replace", {})
+         blocks_replace = patches_replace.get("dit", {})
+--- a/comfy_extras/nodes_sparse_attention.py
++++ b/comfy_extras/nodes_sparse_attention.py
+@@ -65,13 +65,20 @@
+             self._logged.add(key)
+             logging.info(f"BlockSparseAttention: {message}")
+
+-    def dense_reason(self, transformer_options, tokens, block_index):
+-        """Why this call stays dense regardless of its tensors, or None."""
+-        sigmas = transformer_options.get("sigmas")
++    def sigma_window_reason(self, sigmas):
+         if sigmas is not None:
+             sigma = float(sigmas[0])
+             if sigma > self.sigma_start or sigma < self.sigma_end:
+                 return f"sigma {sigma:.3g} outside the start/end window"
++        return None
++
++    def dense_reason(self, transformer_options, tokens, block_index):
++        """Why this call stays dense regardless of its tensors, or None."""
++        sigmas = transformer_options.get("sigmas")
++        memo = transformer_options.get("h3forge_sol_window")
++        reason = self.sigma_window_reason(sigmas) if memo is None else memo(self, sigmas)
++        if reason is not None:
++            return reason
+         if tokens < self.min_tokens:
+             return f"{tokens} tokens < min_tokens {self.min_tokens}"
+         if self.dense_blocks:

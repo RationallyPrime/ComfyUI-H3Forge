@@ -17,6 +17,14 @@ jobs:
           sparse-checkout: |
             comfy
             comfy_extras
+      - uses: actions/checkout@v4
+        with:
+          repository: Comfy-Org/ComfyUI
+          ref: c5751c81abe131202eea9e4c66d000589013dd0b
+          path: .sol-core
+          sparse-checkout: |
+            comfy/ldm/minimax
+            comfy_extras
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -24,5 +32,6 @@ jobs:
       - run: ruff check h3forge tests __init__.py .github/scripts
       - run: PYTHONPATH=. pytest -q
         env:
+          H3FORGE_SOL_CORE_SOURCE: ${{ github.workspace }}/.sol-core
           H3FORGE_COMFY_SOURCE: ${{ github.workspace }}/.comfy-core
       - run: python -m compileall -q h3forge tests __init__.py

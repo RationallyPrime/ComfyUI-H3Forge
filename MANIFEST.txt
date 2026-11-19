@@ -37,3 +37,6 @@
 ./docs/audit-repair-workflows/reference_spoken_voice.json
 ./docs/audit-repair-workflows/seam_continuous.json
 ./docs/audit-repair-workflows/unequal_beats.json
+./h3forge/sol_rotary.py
+./patches/comfyui-0.45.0-h3-inference.patch
+./tests/test_sol_rotary.py

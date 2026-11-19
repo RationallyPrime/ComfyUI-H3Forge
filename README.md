@@ -460,3 +460,20 @@ No upstream model weights are included.
 ## License
 
 Apache-2.0. See `LICENSE`.
+
+### Native Sol sigma and rotary cache experiment (ComfyUI 0.45.0)
+
+From the ComfyUI root, with H3Forge checked out under `custom_nodes/ComfyUI-H3Forge`:
+
+```sh
+git apply --check custom_nodes/ComfyUI-H3Forge/patches/comfyui-0.45.0-h3-inference.patch
+git apply custom_nodes/ComfyUI-H3Forge/patches/comfyui-0.45.0-h3-inference.patch
+```
+
+Restart ComfyUI and insert **H3 Forge — Sol Sigma + Rotary Cache** immediately after the native
+**BlockSparseAttention** node. The patch supplies two optional hooks in core. Other graphs continue to
+use the original calculations. Keep the native Sol node, its schedule, and the same preview settings
+for all experiment arms. Compare both switches off, sigma only, rotary only, and both on using warm
+takes and fresh run names. Inspect `timing.sample`, peak VRAM, sparse/dense decisions, and output quality.
+Rotary holds one position table until the run ends or another layout replaces it. To remove the core
+hooks, bypass the Forge node, apply the same patch with `git apply -R`, and restart ComfyUI.
