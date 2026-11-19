@@ -710,3 +710,177 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+class _ConsensusModel:
+    """Fake window velocities are fixed on pass one and depend on context on replay."""
+    patch_size = (1, 2, 2)
+
+    def __init__(self, values):
+        self.class_obj = self
+        self.values = values
+        self.inputs = []
+
+    def __call__(self, x, timestep, context, options, denoise_mask, **kwargs):
+        layout = options["h3forge_active_layout"]
+        assert layout is kwargs["minimax_payload"]["layout"]
+        start = layout._h3forge_video_offset
+        repeated = any(receipt[0] == start for receipt in self.inputs)
+        self.inputs.append((start, x[0].clone(), denoise_mask, x[1], kwargs.get("audio_denoise_mask")))
+        velocity = x[0].mean() + 10 if repeated else self.values[start]
+        return [torch.full_like(x[0], velocity), torch.full_like(x[1], 100 if repeated else start)]
+
+
+def _consensus_input():
+    video = torch.arange(16, dtype=torch.float32).reshape(1, 1, 16, 1, 1).expand(-1, 2, -1, 2, 2).clone()
+    return [video, torch.zeros(1, 1, 2, 87)]
+
+
+def _consensus_forward(wrapper, model, x, sigma, options=None, **kwargs):
+    options = {**(options or {}), "sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([1., .8, .5, .3, 0.])}
+    return wrapper(model, x, torch.tensor([sigma * 1000]), torch.zeros(1, 2, 3), options, **kwargs)
+
+
+@pytest.mark.parametrize("value,threshold,sigma,fraction", [
+    (0., 0., .8, 1.), (3.5, .15, .8, 1.), (None, 1., .8, 1.),
+    (None, .15, .5, 1.), (None, .15, .3, 1.), (None, .15, .8, 0.),
+])
+def test_consensus_skips_quiet_or_ineligible_steps(monkeypatch, value, threshold, sigma, fraction):
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+    model = _ConsensusModel({0: 2., 4: 4., 8: 4.} if value is None else dict.fromkeys((0, 4, 8), value))
+    wrapper = make_context_wrapper(ContextPolicy(8, 4, False, "flat", consensus=True,
+                                   consensus_max_fraction=fraction, consensus_threshold=threshold))
+    _consensus_forward(wrapper, model, _consensus_input(), sigma)
+    assert [start for start, *_ in model.inputs] == [0, 4, 8]
+
+
+@pytest.mark.parametrize("masked", [False, True])
+def test_consensus_replays_flagged_rows_at_their_lower_sigma(monkeypatch, masked, capsys):
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+    x = _consensus_input()
+    original = x[0].clone()
+    mask = torch.ones_like(x[0][:, :1]) if masked else None
+    if masked:
+        mask[:, :, :, 0, 0] = 0
+        mask[:, :, :, 1, 0] = 0.5
+    original_mask = mask.clone() if masked else torch.ones_like(x[0][:, :1])
+    audio_mask = torch.full_like(x[1], .5)
+    values = {0: 2., 4: 4., 8: 4.}
+    model = _ConsensusModel(values)
+    sigma, lead = .8, .6
+    kwargs = dict(denoise_mask=mask, audio_denoise_mask=audio_mask)
+    policy = dict(window_frames=8, overlap_frames=4, stagger=False, blend="flat", audio_context="window")
+    first = _consensus_forward(make_context_wrapper(ContextPolicy(**policy)), _ConsensusModel(values), x, sigma, **kwargs)
+    wrapper = make_context_wrapper(ContextPolicy(**policy, consensus=True, consensus_max_fraction=1))
+    video, audio = _consensus_forward(wrapper, model, x, sigma, **kwargs)
+    assert [start for start, *_ in model.inputs] == [0, 4, 8, 0, 4]
+    assert "[4,8)=0.66667,[8,12)=0 pass1=3 pass2=2" in capsys.readouterr().out
+
+    effective = sigma * original_mask[:, :, 4:8]
+    x0 = original[:, :, 4:8] - effective * first[0][:, :, 4:8]
+    noise = original[:, :, 4:8] + (1 - effective) * first[0][:, :, 4:8]
+    expected = original.clone()
+    expected[:, :, 4:8] = (1 - lead * effective) * x0 + lead * effective * noise
+    expected_mask = original_mask.clone()
+    expected_mask[:, :, 4:8] *= lead
+    for ordinal, (start, local, local_mask, local_audio, local_audio_mask) in enumerate(model.inputs[3:]):
+        torch.testing.assert_close(local, expected[:, :, start:start+8])
+        assert torch.equal(local_mask, expected_mask[:, :, start:start+8])
+        assert torch.equal(local_audio, model.inputs[ordinal][3])
+        assert torch.equal(local_audio_mask, model.inputs[ordinal][4])
+
+    assert torch.equal(video[:, :, 4:8], first[0][:, :, 4:8])  # exchanged context keeps pass-one fusion
+    assert torch.allclose(video[:, :, :4], expected[:, :, :8].mean() + 10)
+    assert torch.allclose(video[:, :, 8:12], (expected[:, :, 4:12].mean() + 10 + values[8]) / 2)
+    assert torch.equal(video[:, :, 12:], first[0][:, :, 12:])
+    assert torch.equal(audio, first[1])
+    assert torch.equal(x[0], original)
+    if masked:
+        assert torch.equal(mask, original_mask)
+
+
+def test_consensus_cumulative_call_budget_resets_per_sampler_invocation(monkeypatch, capsys):
+    import fake_minimax
+    from h3forge.context import make_freenoise_wrapper
+    fake_minimax.install(monkeypatch)
+    policy = ContextPolicy(8, 4, False, "flat", freenoise=False, consensus=True)
+    wrapper = make_context_wrapper(policy)
+    sampler = make_freenoise_wrapper(policy)
+    x = _consensus_input()
+
+    def sample(guider, sigmas, extra_args, *args):
+        options = extra_args["model_options"]["transformer_options"]
+        counts = []
+        for i, sigma in enumerate([1., 1., .8, .8, .8, .5], start=1):
+            model = _ConsensusModel({0: 2., 4: 4., 8: 8.})
+            worker.submit(_consensus_forward, wrapper, model, x, sigma, options).result()
+            assert [r[0] for r in model.inputs[3:]] in ([], [0, 4, 8])
+            counts.append(len(model.inputs) - 3)
+            assert sum(counts) <= .4 * i * 3
+        return counts
+
+    # Leaving one budgeted call unused on the final, ineligible step is intentional.
+    from concurrent.futures import ThreadPoolExecutor
+    args = {"model_options": {"transformer_options": {}}}
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        for _ in range(2):
+            assert sampler(sample, None, None, args, None, None) == [0, 0, 3, 0, 3, 0]
+            assert args == {"model_options": {"transformer_options": {}}}
+            log = capsys.readouterr().out
+            assert "consensus=on threshold=0.15 lead=0.6 until=0.5 max_fraction=0.4" in log
+            assert "consensus run pass1=18 pass2=6" in log
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_consensus_off_matches_main_output_bytes(monkeypatch, explicit):
+    import hashlib
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+
+    class Model:
+        patch_size = (1, 2, 2)
+
+        def __call__(self, x, timestep, context, options, **kwargs):
+            offset = options["h3forge_active_layout"]._h3forge_video_offset
+            return [t * .625 + offset / 3 for t in x]
+
+    model = Model()
+    model.class_obj = model
+    x = [torch.arange(n, dtype=torch.bfloat16).reshape(shape) / 11
+         for n, shape in [(136, (1, 2, 17, 2, 2)), (186, (1, 1, 2, 93))]]
+    kwargs = {"consensus": False} if explicit else {}
+    wrapper = make_context_wrapper(ContextPolicy(9, 4, True, "pyramid", audio_context="window", **kwargs))
+    result = _consensus_forward(wrapper, model, x, .8)
+    # Raw bfloat16 bytes recorded with this executor on origin/main 05792b7.
+    assert [hashlib.sha256(bytes(t.contiguous().view(torch.uint8).flatten().tolist())).hexdigest()
+            for t in result] == [
+                "eda2c0c7eae12d578eb49c3f14f7facebe69af13203a72eb2358823eb21634ca",
+                "8a803934bb577d1377a7eb3b1c61369c407bf5ba1426d5c27a14841acb3888d6",
+            ]
+
+
+def test_consensus_triple_overlap_measures_whole_pairs_and_exchanges_once(monkeypatch, capsys):
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+    x = _consensus_input()
+    values = {0: -1., 3: 1., 6: 1.}
+    policy = dict(window_frames=10, overlap_frames=7, stagger=False, blend="flat")
+    first = _consensus_forward(make_context_wrapper(ContextPolicy(**policy)), _ConsensusModel(values), x, 1.)
+    model = _ConsensusModel(values)
+    wrapper = make_context_wrapper(ContextPolicy(**policy, consensus=True, consensus_max_fraction=1.))
+    result = _consensus_forward(wrapper, model, x, 1.)
+    assert [r[0] for r in model.inputs] == [0, 3, 6, 0, 3, 6]
+    # First two windows share seven rows. Four also carry the third writer's vote.
+    d = (7 * 4 / (4 / 9)) ** .5
+    assert f"[3,10)={d:.5g}" in capsys.readouterr().out
+    expected = x[0].clone()
+    expected[:, :, 3:10] -= .4 * first[0][:, :, 3:10]
+    expected_mask = torch.ones_like(x[0][:, :1])
+    expected_mask[:, :, 3:10] = .6
+    for start, local, mask, *_ in model.inputs[3:]:
+        torch.testing.assert_close(local, expected[:, :, start:start+10])
+        assert torch.equal(mask, expected_mask[:, :, start:start+10])
+    assert torch.equal(result[0][:, :, 3:10], first[0][:, :, 3:10])
+    assert torch.equal(result[1], first[1])

@@ -6,7 +6,7 @@ from itertools import pairwise
 
 import torch
 
-from .consensus import ConsensusCalls, ConsensusStep, sampler_calls
+from .consensus import CALLS_KEY, ConsensusCalls, ConsensusStep
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
@@ -398,13 +398,12 @@ def make_freenoise_wrapper(policy: ContextPolicy):
                       flush=True)
         if policy.consensus:
             calls = ConsensusCalls()
-            token = sampler_calls.set(calls)
-            try:
-                result = executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
-                print(f"{LOG} consensus run pass1={calls.first} pass2={calls.second}", flush=True)
-                return result
-            finally:
-                sampler_calls.reset(token)
+            model_options = extra_args["model_options"]
+            options = {**model_options["transformer_options"], CALLS_KEY: calls}
+            extra_args = {**extra_args, "model_options": {**model_options, "transformer_options": options}}
+            result = executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
+            print(f"{LOG} consensus run pass1={calls.first} pass2={calls.second}", flush=True)
+            return result
         return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
 
     return wrapper
@@ -422,7 +421,7 @@ def make_context_wrapper(policy: ContextPolicy):
         segmented = len(prompts) > 1
         sigma = resolve_sigma(transformer_options) if policy.consensus else None
         step, _ = resolve_step(transformer_options, sigma)
-        calls = (sampler_calls.get() or ConsensusCalls()) if policy.consensus else None
+        calls = (transformer_options.get(CALLS_KEY) or ConsensusCalls()) if policy.consensus else None
         if step == 0:
             print(f"{LOG} consensus={'on' if policy.consensus else 'off'} threshold={policy.consensus_threshold} "
                   f"lead={policy.consensus_lead} until={policy.consensus_until} "
@@ -431,7 +430,7 @@ def make_context_wrapper(policy: ContextPolicy):
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
             if calls is not None:
-                calls.first += 1
+                calls.admit(1, 0, policy.consensus_max_fraction)
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
                       phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
@@ -498,10 +497,8 @@ def make_context_wrapper(policy: ContextPolicy):
         writes = [_subtract_intervals(w0, w1, [ranges[b] for b in excluded])
                   for _, _, _, w0, w1, _, excluded in plan]
         consensus = None
-        if calls is not None:
-            calls.first += len(plan)
-            if sigma is not None and sigma > policy.consensus_until and policy.consensus_max_fraction > 0:
-                consensus = ConsensusStep(writes)
+        if calls is not None and sigma is not None and sigma > policy.consensus_until and policy.consensus_max_fraction:
+            consensus = ConsensusStep(writes)
 
         def predict(i, video=None, mask=None):
             index, v0, v1 = plan[i][:3]
@@ -581,13 +578,13 @@ def make_context_wrapper(policy: ContextPolicy):
                         flagged[-1] = (flagged[-1][0], max(hi, flagged[-1][1]))
                     else:
                         flagged.append((lo, hi))
-            available = math.floor(policy.consensus_max_fraction * calls.first) - calls.second
-            if flagged and available:
-                calls.second += consensus.repredict(plan, flagged, available, video_x, kwargs.get("denoise_mask"),
-                                                    fused, sigma, policy.consensus_lead, predict, video_den)
+            consensus.repredict(plan, flagged, calls, video_x, kwargs.get("denoise_mask"),
+                                fused, sigma, policy, predict, video_den)
             values = ",".join(f"[{lo},{hi})={d:.5g}" for (lo, hi), d in scores)
             print(f"{LOG} consensus step={step} sigma={sigma:.5g} d={values or 'none'} "
                   f"pass1={calls.first} pass2={calls.second}", flush=True)
+        elif calls is not None:
+            calls.admit(len(plan), 0, policy.consensus_max_fraction)
         return [fused.to(video_x.dtype),
                 (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
