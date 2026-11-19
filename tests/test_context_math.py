@@ -1078,3 +1078,12 @@ def test_neighbour_keyframe_packs_against_real_comfy_core():
         local.position_ids[vid_seg[0]:vid_seg[0] + frame_rows],
     )
     assert 0.5 <= local_payload["visual_cond_noise_aug"] <= 0.999
+
+
+def test_neighbour_keyframe_x0_slice_pads_odd_spatial_dims_to_patch_grid():
+    from h3forge.context import _x0_latent_slice
+
+    x = torch.arange(2 * 3 * 5 * 3, dtype=torch.float32).view(1, 2, 3, 5, 3)
+    out = _x0_latent_slice(x, torch.zeros_like(x), 0.5, 1, 6, 4)
+    assert out.shape == (1, 2, 1, 6, 4)
+    assert torch.equal(out[..., :5, :3], x[:, :, 1:2])

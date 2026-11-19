@@ -481,7 +481,7 @@ def _x0_latent_slice(local_video_x, v_out, sigma: float, rel_idx: int, padded_h:
     x0 = (x_slice - eff_sigma * v_slice).detach()
     if x0.shape[3] != padded_h or x0.shape[4] != padded_w:
         x0 = torch.nn.functional.pad(
-            x0, (0, padded_w - x0.shape[4], 0, padded_h - x0.shape[3]), mode="circular"
+            x0, (0, padded_w - x0.shape[4], 0, padded_h - x0.shape[3], 0, 0), mode="circular"
         )
     return x0
 
@@ -513,8 +513,9 @@ def _inject_neighbour_keyframes(payload: dict, extra_keyframes: list[tuple[dict,
 def make_context_wrapper(policy: ContextPolicy):
     """Window video with full-timeline or synchronized windowed audio context."""
     nk_enabled = policy.neighbour_keyframe != "off"
-    prev_step_cache: dict[int, dict[int, torch.Tensor]] = {}
-    cache_state = {"last_sigma": None, "shape": None, "count": None}
+    # One cache per conditioning branch: with separate cond/uncond forwards each
+    # branch must read its own previous-step estimates, not the other branch's.
+    branch_caches: dict[tuple, dict] = {}
 
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         require_eager_allocations(executor.class_obj)
@@ -595,7 +596,12 @@ def make_context_wrapper(policy: ContextPolicy):
                 for index, v0, v1, w0, w1, excluded in plan]
 
         nk_active = False
+        prev_step_cache: dict[int, dict[int, torch.Tensor]] = {}
+        cache_state: dict = {}
         if nk_enabled:
+            branch = tuple(transformer_options.get("cond_or_uncond") or ())
+            cache_state = branch_caches.setdefault(
+                branch, {"last_sigma": None, "shape": None, "count": None, "prev": {}, "cur": {}})
             shape_key = (total_t, int(video_x.shape[3]), int(video_x.shape[4]))
             if (
                 step == 0
@@ -607,14 +613,18 @@ def make_context_wrapper(policy: ContextPolicy):
                     and sigma > cache_state["last_sigma"] + 1e-6
                 )
             ):
-                prev_step_cache.clear()
+                cache_state["prev"], cache_state["cur"] = {}, {}
+            elif sigma is not None and sigma != cache_state["last_sigma"]:
+                # A new sampler step for this branch: what it wrote last step becomes readable.
+                cache_state["prev"], cache_state["cur"] = cache_state["cur"], {}
             cache_state["shape"] = shape_key
             cache_state["count"] = len(plan)
             if sigma is not None:
                 cache_state["last_sigma"] = sigma
             nk_active = sigma is not None and sigma >= policy.neighbour_keyframe_until
             if not nk_active:
-                prev_step_cache.clear()
+                cache_state["prev"], cache_state["cur"] = {}, {}
+            prev_step_cache = cache_state["prev"]
 
         if step == 0:
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
@@ -781,8 +791,7 @@ def make_context_wrapper(policy: ContextPolicy):
                 audio_den[..., w0:w1].add_(aw[..., w0 - a0:w1 - a0])
 
         if nk_active and policy.neighbour_keyframe == "both":
-            prev_step_cache.clear()
-            prev_step_cache.update(next_step_cache)
+            cache_state["cur"] = next_step_cache
 
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
