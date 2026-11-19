@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import blake2b
 from itertools import combinations
 
 import torch
@@ -60,9 +61,27 @@ class OverlapScores:
 
 
 def _fresh_noise(video, seed, step, retry):
-    # Four possible retries per base step. Keep the generator private to this draw.
-    generator = torch.Generator(device="cpu").manual_seed((seed + step * 4 + retry) % (1 << 64))
+    # Domain-separate from Comfy's initial video noise, including step 0 / retry 0.
+    key = f"{seed}/{step}/{retry}".encode("ascii")
+    digest = blake2b(key, person=b"H3Forge repair", digest_size=8).digest()
+    generator = torch.Generator(device="cpu").manual_seed(int.from_bytes(digest, "little"))
     return torch.randn(video.shape, generator=generator, dtype=torch.float32, device="cpu").to(video)
+
+
+def _renoise_rows(advanced, x0, noise, sigma, following, weight, fresh):
+    noisy = (1 - sigma) * x0 + sigma * noise
+    if not fresh:
+        # The original noise is correlated with the residual already in the row.
+        return torch.lerp(advanced, noisy, weight)
+
+    # Blend independent residuals in quadrature. A plain lerp halves their
+    # variance near the middle of a ramp when adjacent sigmas are close.
+    old = (1 - weight) * following
+    new = weight * sigma
+    row_sigma = following + weight * (sigma - following)
+    residual = (1 - weight) * (advanced - (1 - following) * x0) + new * noise
+    norm = torch.hypot(old, new).clamp_min(torch.finfo(advanced.dtype).tiny)
+    return (1 - row_sigma) * x0 + residual * (row_sigma / norm)
 
 
 @torch.no_grad()
@@ -129,8 +148,9 @@ def sample_seam_euler(model, x, sigmas, extra_args=None, callback=None, disable=
             mixed = x.clone()
             trial = state.video(mixed)
             trial.copy_(next_video)
-            trial.index_copy_(2, active_t, torch.lerp(next_video.index_select(2, active_t),
-                              (1 - sigma) * local_x0 + sigma * noise, weights.index_select(2, active_t)))
+            renoised = _renoise_rows(next_video.index_select(2, active_t), local_x0, noise, sigma,
+                                     following, weights.index_select(2, active_t), repair_noise == "fresh")
+            trial.index_copy_(2, active_t, renoised)
             if protected is not None:
                 trial.copy_(torch.where(protected, state.video(x), trial))
                 row_sigma = torch.where(protected, sigma, row_sigma)

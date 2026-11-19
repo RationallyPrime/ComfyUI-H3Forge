@@ -9,7 +9,7 @@ import torch
 from core_source import definitions
 from fake_minimax import install
 from h3forge.context import ContextPolicy, make_context_wrapper, make_freenoise_wrapper
-from h3forge.seam_euler import SEAM_STATE, OverlapScores, SeamState, _fresh_noise, sample_seam_euler
+from h3forge.seam_euler import SEAM_STATE, OverlapScores, SeamState, _fresh_noise, _renoise_rows, sample_seam_euler
 from test_audit_repairs import _executor
 
 
@@ -160,6 +160,15 @@ def test_fresh_noise_reproducible_and_private(monkeypatch, core_euler):
     assert torch.equal(before, torch.random.get_rng_state())
 
 
+def test_first_fresh_repair_does_not_replay_initial_video_noise():
+    # Comfy prepare_noise starts a CPU generator at the run seed. These dimensions
+    # exercise the vectorized normal generator used for a video and its overlap.
+    seed = 42
+    base = torch.randn((1, 24, 202, 4, 8), generator=torch.Generator().manual_seed(seed))
+    fresh = _fresh_noise(base[:, :, :21], seed, 0, 0)
+    assert not torch.equal(fresh.flatten(), base.flatten()[:fresh.numel()])
+
+
 def test_existing_inpaint_token_keeps_base_state_label_and_output(monkeypatch, core_euler):
     opts = dict(pinned=True, sigmas=(.8, .2), repair_ramp=0, repair_budget=1)
     base, _, _ = _run(monkeypatch, repairs=0, **opts)
@@ -201,3 +210,19 @@ def test_scores_use_pairwise_shared_writes_and_final_fused_denominator():
     state = SeamState()
     metric.publish(fused, state)
     assert state.scores == pytest.approx({(1, 2): float("inf"), (3, 5): 2., (3, 6): 4.})
+
+
+def test_fresh_ramp_residual_matches_the_sigma_given_to_h3():
+    rng = torch.Generator().manual_seed(42)
+    x0 = torch.full((65536,), 3.)
+    original = torch.randn(x0.shape, generator=rng)
+    fresh = torch.randn(x0.shape, generator=rng)
+    sigma, following = torch.tensor(1.), torch.tensor(.98)
+    advanced = (1 - following) * x0 + following * original
+    for w in (.1, .5, 1.):
+        row_sigma = following + w * (sigma - following)
+        trial = _renoise_rows(advanced, x0, fresh, sigma, following, torch.tensor(w), fresh=True)
+        residual = trial - (1 - row_sigma) * x0
+        assert float(residual.std()) == pytest.approx(float(row_sigma), abs=.01)
+        assert float(residual.mean()) == pytest.approx(0, abs=.01)
+    torch.testing.assert_close(trial, fresh)
