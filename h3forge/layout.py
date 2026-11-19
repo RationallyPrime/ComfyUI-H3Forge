@@ -56,11 +56,15 @@ def clone_window_layout(
     audio_range: tuple[int, int],
     keyframes=None,
     refs=None,
+    extra_keyframes=None,
 ):
     """Build a local H3 PackedLayout, then transplant global target positions.
 
     This preserves absolute multimodal RoPE coordinates while allowing the model
-    to process a smaller synchronized A/V window.
+    to process a smaller synchronized A/V window. Optional ``extra_keyframes``
+    are ``(descriptor, anchor_video_latent)`` pairs appended after any shared
+    ``keyframes`` for this window only; each receives the global RoPE position
+    of ``anchor_video_latent`` in ``full_layout``.
     """
     from comfy.ldm.minimax.model import PackedLayout
 
@@ -71,17 +75,35 @@ def clone_window_layout(
         raise ValueError(f"local video shape T={local_t} does not match window {video_range}")
     if not (0 <= a0 < a1 <= int(audio_t)):
         raise ValueError(f"invalid audio range {audio_range} for T={audio_t}")
+    extra_list = list(extra_keyframes or ())
+    all_keyframes = list(keyframes or ()) + [kf for kf, _ in extra_list] if extra_list else keyframes
     local = PackedLayout(text_len, local_t, latent_h, latent_w, a1 - a0,
-                         keyframes=keyframes, refs=refs)
+                         keyframes=all_keyframes, refs=refs)
     expected_signature = (int(text_len), local_t, latent_h, latent_w, a1 - a0)
     if local.signature != expected_signature:
         raise ValueError(f"local PackedLayout signature {local.signature} != expected {expected_signature}")
     src = target_segments(full_layout)
     dst = target_segments(local)
+    full_t, frame_rows = video_shape_from_layout(full_layout)
+    if v1 > full_t:
+        raise ValueError(f"video window {video_range} exceeds full latent length {full_t}")
+
+    if extra_list:
+        insert_at = 1 if full_layout.segments and full_layout.segments[0][2] == "text" else 0
+        while insert_at < len(full_layout.segments) and full_layout.segments[insert_at][2] in ("cond", "cond_audio"):
+            insert_at += 1
+        extra_segs = local.segments[insert_at:insert_at + len(extra_list)]
+        matched_local = local.segments[:insert_at] + local.segments[insert_at + len(extra_list):]
+    else:
+        extra_segs = ()
+        matched_local = local.segments
+
+    if len(full_layout.segments) != len(matched_local):
+        raise ValueError("window reference structure differs from the full layout")
     # Independently refined text has native per-segment lengths. Preserve the
     # shared refs/keyframes at the template's origin without inserting fake
     # text rows in the local stream.
-    for (fa, fb, fk), (la, lb, lk) in zip(full_layout.segments, local.segments):
+    for (fa, fb, fk), (la, lb, lk) in zip(full_layout.segments, matched_local):
         if fk != lk:
             raise ValueError("window reference structure differs from the full layout")
         if fk not in ("text", "audio", "video"):
@@ -89,9 +111,17 @@ def clone_window_layout(
                 raise ValueError("window reference row count differs from the full layout")
             local.position_ids[la:lb] = full_layout.position_ids[fa:fb]
 
-    full_t, frame_rows = video_shape_from_layout(full_layout)
-    if v1 > full_t:
-        raise ValueError(f"video window {video_range} exceeds full latent length {full_t}")
+    if extra_list:
+        if len(extra_segs) != len(extra_list):
+            raise ValueError("window extra keyframe segment count differs from request")
+        for (la, lb, lk), (_, anchor_latent) in zip(extra_segs, extra_list):
+            anchor = int(anchor_latent)
+            if lk != "cond" or lb - la != frame_rows:
+                raise ValueError("extra keyframe must occupy one single-frame video cond segment")
+            if not (0 <= anchor < full_t):
+                raise ValueError(f"extra keyframe anchor {anchor} out of range [0, {full_t})")
+            src_a0 = src.video_start + anchor * frame_rows
+            local.position_ids[la:lb] = full_layout.position_ids[src_a0:src_a0 + frame_rows]
 
     # Video rows are frame-major and therefore a contiguous slice.
     src_v0 = src.video_start + v0 * frame_rows

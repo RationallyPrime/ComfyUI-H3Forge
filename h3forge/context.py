@@ -9,12 +9,15 @@ import torch
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
+_CADENCE_FRAME_OFFSETS = (0, 1, 5, 9, 13)
+_VISUAL_COND_TIMESTEP = 0.999
 SEGMENT_SEAMS = ("blend", "exclusive")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
+NEIGHBOUR_KEYFRAME_MODES = ("off", "first", "both")
 
 
 @dataclass(frozen=True)
@@ -26,12 +29,25 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    neighbour_keyframe: str = "off"
+    neighbour_keyframe_until: float = 0.3
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
             raise ValueError(f"audio_context must be one of {AUDIO_CONTEXT_MODES}, got {self.audio_context!r}")
+        if self.neighbour_keyframe not in NEIGHBOUR_KEYFRAME_MODES:
+            raise ValueError(
+                f"neighbour_keyframe must be one of {NEIGHBOUR_KEYFRAME_MODES}, got {self.neighbour_keyframe!r}"
+            )
+        if (not isinstance(self.neighbour_keyframe_until, (int, float))
+                or isinstance(self.neighbour_keyframe_until, bool)
+                or not math.isfinite(self.neighbour_keyframe_until)
+                or not 0.0 <= float(self.neighbour_keyframe_until) <= 1.0):
+            raise ValueError(
+                f"neighbour_keyframe_until must be a finite float in [0, 1], got {self.neighbour_keyframe_until!r}"
+            )
 
 
 def ordered_halving(value: int) -> float:
@@ -40,20 +56,28 @@ def ordered_halving(value: int) -> float:
     return int(binary[::-1], 2) / (1 << 64)
 
 
-def max_stagger_phase(window: int, overlap: int) -> int:
+def max_stagger_phase(window: int, overlap: int, *, cadence_only: bool = False) -> int:
     """Largest interior-boundary shift that still keeps every adjacent overlap.
 
     Staggering exists to move seams between steps, not to let a window jump
     across its neighbour: a shift larger than the requested overlap lets two
     windows abut with no blend and puts every latent under a different
     prompt/neighbour pair on alternate steps, which reads as constant morphing.
+    When ``cadence_only`` is set, the shift is rounded down to a multiple of
+    H3's 5-latent cadence.
     """
     stride = window - overlap
-    return max(0, min(overlap, stride - 1))
+    raw = max(0, min(overlap, stride - 1))
+    if cadence_only:
+        return (raw // _LATENT_CADENCE) * _LATENT_CADENCE
+    return raw
 
 
-def stagger_phase(step: int, window: int, overlap: int) -> int:
+def stagger_phase(step: int, window: int, overlap: int, *, cadence_only: bool = False) -> int:
     """Ordered-halving phase for ``step`` bounded to ``[0, max_stagger_phase]``."""
+    if cadence_only:
+        steps = max_stagger_phase(window, overlap, cadence_only=True) // _LATENT_CADENCE
+        return int(ordered_halving(step) * (steps + 1)) * _LATENT_CADENCE
     return int(ordered_halving(step) * (max_stagger_phase(window, overlap) + 1))
 
 
@@ -92,7 +116,15 @@ def _stagger_layouts(anchor: list[int], stride: int, max_phase: int) -> int:
     return len({tuple(_shifted_starts(anchor, phase, stride, snap=False)) for phase in range(max_phase + 1)})
 
 
-def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_phase: int = 0) -> list[int]:
+def window_starts(
+    total: int,
+    window: int,
+    overlap: int,
+    phase: int = 0,
+    max_phase: int = 0,
+    *,
+    cadence_only: bool = False,
+) -> list[int]:
     """Window starts for ``phase`` of a run whose stagger visits phases ``0..max_phase``.
 
     The phase-0 plan snaps interior starts to the latent cadence unless that
@@ -100,7 +132,8 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_pha
     a static run (``max_phase == 0``) therefore always snaps, and a staggering
     run keeps its off-cadence spread only where cadence and seam movement
     collide. Every active phase is then derived from that same phase-0 plan,
-    so no seam ever moves further than the phase.
+    so no seam ever moves further than the phase. When ``cadence_only`` is set,
+    every interior start stays snapped to the 5-latent cadence across all phases.
     """
     if window >= total:
         return [0]
@@ -123,6 +156,8 @@ def window_starts(total: int, window: int, overlap: int, phase: int = 0, max_pha
 
     spread = _shifted_starts(base, 0, stride, snap=False)
     snapped = _shifted_starts(base, 0, stride, snap=True)
+    if cadence_only:
+        return _shifted_starts(snapped, phase, stride, snap=True)
     anchor = snapped
     if _stagger_layouts(snapped, stride, max_phase) < _stagger_layouts(spread, stride, max_phase):
         anchor = spread
@@ -255,7 +290,7 @@ def _beat_for_window(v0, v1, ranges):
     return best
 
 
-def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=0):
+def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=0, *, cadence_only=False):
     """Uniform, staggerable windows that each write their whole extent under one beat's prompt.
 
     This is the WanVideoWrapper / ComfyUI-core arrangement: a window carries the
@@ -276,11 +311,12 @@ def _blended_segment_windows(total, window, overlap, ranges, phase=0, max_phase=
     # Prompt assignment and rescue membership come from the phase-0 plan and are
     # reused by window ordinal: a phase moves a seam, it must not flip a window
     # to another prompt or make a rescue window appear on some steps only.
-    anchors = window_starts(total, window, overlap, 0, max_phase)
+    anchors = window_starts(total, window, overlap, 0, max_phase, cadence_only=cadence_only)
     assignments = [_beat_for_window(v0, v0 + window, ranges) for v0 in anchors]
     rescued = tuple(index for index in range(len(ranges)) if index not in assignments)
     plan = [(index, v0, v0 + window, v0, v0 + window, rescued)
-            for index, v0 in zip(assignments, window_starts(total, window, overlap, phase, max_phase))]
+            for index, v0 in zip(assignments, window_starts(total, window, overlap, phase, max_phase,
+                                                            cadence_only=cadence_only))]
     for index in rescued:
         lo, hi = ranges[index]
         v0 = min(max((lo + hi - window) // 2, 0), total - window)
@@ -375,9 +411,13 @@ def make_freenoise_wrapper(policy: ContextPolicy):
             window = min(policy.window_frames, video_t)
             if video_t > window:
                 overlap = min(policy.overlap_frames, window - 1)
-                max_phase = max_stagger_phase(window, overlap) if policy.stagger else 0
+                cadence_only = policy.neighbour_keyframe != "off"
+                max_phase = (
+                    max_stagger_phase(window, overlap, cadence_only=cadence_only)
+                    if policy.stagger else 0
+                )
                 # The phase-0 anchor plan the context wrapper derives every phase from.
-                starts = window_starts(video_t, window, overlap, 0, max_phase)
+                starts = window_starts(video_t, window, overlap, 0, max_phase, cadence_only=cadence_only)
                 seed = int(extra_args.get("seed", 0)) if isinstance(extra_args, dict) else 0
                 parts = _split_packed_latent(noise, shapes)
                 parts[0] = apply_freenoise(parts[0].clone(), 2, starts, window, seed)
@@ -389,8 +429,94 @@ def make_freenoise_wrapper(policy: ContextPolicy):
     return wrapper
 
 
+def _latent_pixel_frame(latent_idx: int) -> int:
+    """Start decoded pixel-frame index for global video latent ``latent_idx`` on H3's 1,4,4,4,4 cadence."""
+    cycle, rem = divmod(int(latent_idx), _LATENT_CADENCE)
+    return cycle * 17 + _CADENCE_FRAME_OFFSETS[rem]
+
+
+def neighbour_keyframe_noise_aug(sigma: float, existing_aug: float | None = None) -> float:
+    """Map current video sigma to H3's t-space ``visual_cond_noise_aug`` in ``[0.5, 0.999]``.
+
+    Core mixes cond rows as ``aug * z + (1 - aug) * noise`` and labels them at
+    timestep ``max(1 - sigma, aug)``. Mapping ``1 - 0.5 * sigma`` keeps early
+    ``x0`` estimates informative at high sigma (where shift-12 spends its first
+    half of steps) while telling the model to treat them as noisy guides.
+    """
+    s = min(max(float(sigma), 0.0), 1.0)
+    aug = min(_VISUAL_COND_TIMESTEP, 1.0 - 0.5 * s)
+    if existing_aug is not None:
+        aug = min(aug, float(existing_aug))
+    return aug
+
+
+def _first_neighbour_anchor(prev_v0: int, prev_v1: int, v0: int, v1: int) -> int | None:
+    """First cadence-aligned latent inside the overlap of ``[prev_v0, prev_v1)`` and ``[v0, v1)``."""
+    lo = max(prev_v0, v0)
+    hi = min(prev_v1, v1)
+    if lo >= hi:
+        return None
+    cadence = ((lo + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
+    return cadence if cadence < hi else lo
+
+
+def _last_neighbour_anchor(v0: int, v1: int, next_v0: int, next_v1: int) -> int | None:
+    """Last cadence-aligned latent inside the overlap of ``[v0, v1)`` and ``[next_v0, next_v1)``."""
+    lo = max(v0, next_v0)
+    hi = min(v1, next_v1)
+    if lo >= hi:
+        return None
+    cadence = ((hi - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
+    return cadence if cadence >= lo else hi - 1
+
+
+def _x0_latent_slice(local_video_x, v_out, sigma: float, rel_idx: int, padded_h: int, padded_w: int,
+                     local_denoise_mask=None) -> torch.Tensor:
+    """Single-latent flow-matching ``x0`` estimate ``x - sigma * v``, padded to H3's spatial patch grid."""
+    x_slice = local_video_x[:, :, rel_idx:rel_idx + 1].float()
+    v_slice = v_out[:, :, rel_idx:rel_idx + 1].float()
+    eff_sigma = sigma
+    if local_denoise_mask is not None:
+        eff_sigma = local_denoise_mask[:, :, rel_idx:rel_idx + 1].float() * sigma
+    x0 = (x_slice - eff_sigma * v_slice).detach()
+    if x0.shape[3] != padded_h or x0.shape[4] != padded_w:
+        x0 = torch.nn.functional.pad(
+            x0, (0, padded_w - x0.shape[4], 0, padded_h - x0.shape[3], 0, 0), mode="circular"
+        )
+    return x0
+
+
+def _inject_neighbour_keyframes(payload: dict, extra_keyframes: list[tuple[dict, int]], sigma: float) -> dict:
+    """Return a shallow copy of ``payload`` with neighbour keyframes inserted in PackedLayout order."""
+    existing_kfs = list(payload.get("keyframes") or ())
+    existing_refs = list(payload.get("refs") or ())
+    new_kfs = [kf for kf, _ in extra_keyframes]
+    new_latents = [kf["latent"] for kf in new_kfs]
+    n_existing_kf_video = sum(1 for kf in existing_kfs if kf.get("latent") is not None)
+    if "cond_video_latents" in payload:
+        base_cond = list(payload["cond_video_latents"])
+        cond_video_latents = base_cond[:n_existing_kf_video] + new_latents + base_cond[n_existing_kf_video:]
+    else:
+        cond_video_latents = (
+            [kf["latent"] for kf in existing_kfs if kf.get("latent") is not None]
+            + new_latents
+            + [r["latent"] for r in existing_refs if r.get("latent") is not None]
+        )
+    return {
+        **payload,
+        "keyframes": existing_kfs + new_kfs,
+        "cond_video_latents": cond_video_latents,
+        "visual_cond_noise_aug": neighbour_keyframe_noise_aug(sigma, payload.get("visual_cond_noise_aug")),
+    }
+
+
 def make_context_wrapper(policy: ContextPolicy):
     """Window video with full-timeline or synchronized windowed audio context."""
+    nk_enabled = policy.neighbour_keyframe != "off"
+    # One cache per conditioning branch: with separate cond/uncond forwards each
+    # branch must read its own previous-step estimates, not the other branch's.
+    branch_caches: dict[tuple, dict] = {}
+
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
@@ -399,13 +525,24 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options)
+        if sigma is None and timestep is not None:
+            sigma = float(timestep.flatten()[0]) / 1000.0
+        step, _ = resolve_step(transformer_options, sigma=sigma)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
                       phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                if nk_enabled:
+                    print(
+                        f"{LOG} neighbour_keyframe={policy.neighbour_keyframe} "
+                        f"until={policy.neighbour_keyframe_until:.2f} active=no (single window)",
+                        flush=True,
+                    )
+                else:
+                    print(f"{LOG} neighbour_keyframe=off", flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -422,8 +559,8 @@ def make_context_wrapper(policy: ContextPolicy):
         blended = policy.segment_seams == "blend"
         stagger = policy.stagger and (not segmented or blended)
         if stagger:
-            max_phase = max_stagger_phase(window, overlap)
-            phase = stagger_phase(step, window, overlap) if step is not None else 0
+            max_phase = max_stagger_phase(window, overlap, cadence_only=nk_enabled)
+            phase = stagger_phase(step, window, overlap, cadence_only=nk_enabled) if step is not None else 0
         if segmented:
             ranges, frame_cuts = segment_ranges(total_t, len(prompts), payload.get("h3forge_prompt_segment_durations"))
             # H3 audio has 40 ticks per 24 decoded frames. Shared cuts give each
@@ -431,11 +568,13 @@ def make_context_wrapper(policy: ContextPolicy):
             audio_cuts = [round(frame * 5 / 3) for frame in frame_cuts]
             audio_cuts[-1] = audio_t
             if blended:
-                plan = _blended_segment_windows(total_t, window, overlap, ranges, phase, max_phase)
+                plan = _blended_segment_windows(
+                    total_t, window, overlap, ranges, phase, max_phase, cadence_only=nk_enabled
+                )
             else:
                 plan = _segment_windows(total_t, window, overlap, ranges)
         else:
-            starts = window_starts(total_t, window, overlap, phase, max_phase)
+            starts = window_starts(total_t, window, overlap, phase, max_phase, cadence_only=nk_enabled)
             plan = [(0, v0, v0 + window, v0, v0 + window, ()) for v0 in starts]
         # Windowing audio under ``auto`` requires every beat to fit in and run in
         # a single window: if two windows carry the same beat prompt, slicing
@@ -455,18 +594,72 @@ def make_context_wrapper(policy: ContextPolicy):
         # any rescued beat, which its own window owns in both streams.
         plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended, excluded)
                 for index, v0, v1, w0, w1, excluded in plan]
+
+        nk_active = False
+        prev_step_cache: dict[int, dict[int, torch.Tensor]] = {}
+        cache_state: dict = {}
+        if nk_enabled:
+            branch = tuple(transformer_options.get("cond_or_uncond") or ())
+            cache_state = branch_caches.setdefault(
+                branch, {"last_sigma": None, "shape": None, "count": None, "prev": {}, "cur": {}})
+            shape_key = (total_t, int(video_x.shape[3]), int(video_x.shape[4]))
+            if (
+                step == 0
+                or cache_state["shape"] != shape_key
+                or cache_state["count"] != len(plan)
+                or (
+                    sigma is not None
+                    and cache_state["last_sigma"] is not None
+                    and sigma > cache_state["last_sigma"] + 1e-6
+                )
+            ):
+                cache_state["prev"], cache_state["cur"] = {}, {}
+            elif sigma is not None and sigma != cache_state["last_sigma"]:
+                # A new sampler step for this branch: what it wrote last step becomes readable.
+                cache_state["prev"], cache_state["cur"] = cache_state["cur"], {}
+            cache_state["shape"] = shape_key
+            cache_state["count"] = len(plan)
+            if sigma is not None:
+                cache_state["last_sigma"] = sigma
+            nk_active = sigma is not None and sigma >= policy.neighbour_keyframe_until
+            if not nk_active:
+                cache_state["prev"], cache_state["cur"] = {}, {}
+            prev_step_cache = cache_state["prev"]
+
         if step == 0:
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None),
                   flush=True)
+            if nk_enabled:
+                stagger_note = (
+                    f"cadence_multiples(step={_LATENT_CADENCE},max_phase={max_phase})" if stagger else "off"
+                )
+                aug_now = (
+                    f"{neighbour_keyframe_noise_aug(sigma, payload.get('visual_cond_noise_aug')):.3f}"
+                    if sigma is not None else "n/a"
+                )
+                anchors = [
+                    _first_neighbour_anchor(plan[i - 1][1], plan[i - 1][2], plan[i][1], plan[i][2])
+                    for i in range(1, len(plan))
+                ]
+                print(
+                    f"{LOG} neighbour_keyframe={policy.neighbour_keyframe} "
+                    f"until={policy.neighbour_keyframe_until:.2f} active={'yes' if nk_active else 'no'} "
+                    f"stagger={stagger_note} step0_aug={aug_now} first_anchors={anchors}",
+                    flush=True,
+                )
+            else:
+                print(f"{LOG} neighbour_keyframe=off", flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        prev_window_x0: tuple[int, int, dict[int, torch.Tensor]] | None = None
+        next_step_cache: dict[int, dict[int, torch.Tensor]] = {}
+        for win_idx, (index, v0, v1, write_v0, write_v1, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -474,22 +667,62 @@ def make_context_wrapper(policy: ContextPolicy):
             else:
                 in_a0, in_a1 = 0, audio_t
             local_context = prompts[index]
-            local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
-                video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
-                video_range=(v0, v1), audio_range=(in_a0, in_a1),
-                keyframes=payload.get("keyframes"), refs=payload.get("refs"))
-            local_payload = {**payload, "layout": local_layout}
+            extra_keyframes: list[tuple[dict, int]] = []
+            if nk_active:
+                if win_idx > 0 and prev_window_x0 is not None:
+                    prev_v0, prev_v1, prev_x0 = prev_window_x0
+                    anchor = _first_neighbour_anchor(prev_v0, prev_v1, v0, v1)
+                    if anchor is not None and anchor in prev_x0:
+                        extra_keyframes.append(
+                            ({"resolved_frame_index": _latent_pixel_frame(anchor), "latent": prev_x0[anchor]}, anchor)
+                        )
+                if policy.neighbour_keyframe == "both" and win_idx + 1 < len(plan):
+                    cached = prev_step_cache.get(win_idx + 1)
+                    if cached:
+                        next_v0, next_v1 = plan[win_idx + 1][1], plan[win_idx + 1][2]
+                        target = _last_neighbour_anchor(v0, v1, next_v0, next_v1)
+                        chosen = target if target in cached else None
+                        if chosen is None:
+                            lo = max(v0, next_v0)
+                            candidates = [a for a in cached if lo <= a < v1]
+                            if candidates:
+                                chosen = max(candidates)
+                        if chosen is not None and (not extra_keyframes or chosen != extra_keyframes[0][1]):
+                            extra_keyframes.append(
+                                (
+                                    {"resolved_frame_index": _latent_pixel_frame(chosen), "latent": cached[chosen]},
+                                    chosen,
+                                )
+                            )
+
+            local_layout = clone_window_layout(
+                full_layout=full_layout,
+                text_len=local_context.shape[1],
+                video_shape=(v1 - v0, padded_h, padded_w),
+                audio_t=audio_t,
+                video_range=(v0, v1),
+                audio_range=(in_a0, in_a1),
+                keyframes=payload.get("keyframes"),
+                refs=payload.get("refs"),
+                extra_keyframes=extra_keyframes or None,
+            )
+            if extra_keyframes:
+                local_payload = _inject_neighbour_keyframes(payload, extra_keyframes, sigma)
+                local_payload["layout"] = local_layout
+            else:
+                local_payload = {**payload, "layout": local_layout}
             if tags is not None:
                 local_payload["text_token_tags"] = tags[index]
-            local_kwargs = {**kwargs, "minimax_payload": local_payload,
-                            "denoise_mask": _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)}
+            local_denoise_mask = _slice_optional_video(kwargs.get("denoise_mask"), v0, v1)
+            local_kwargs = {**kwargs, "minimax_payload": local_payload, "denoise_mask": local_denoise_mask}
             if "audio_denoise_mask" in kwargs:
                 local_kwargs["audio_denoise_mask"] = _slice_optional_audio(kwargs["audio_denoise_mask"], in_a0, in_a1)
             # Keep the full audio timeline whenever one prompt or beat spans
             # multiple windows so later windows hear earlier lines; otherwise
             # slice to the window span to bound cross-beat audio visibility.
             local_audio = audio_x if (in_a0 == 0 and in_a1 == audio_t) else audio_x[..., in_a0:in_a1]
-            local_x = [video_x[:, :, v0:v1], local_audio]
+            local_video = video_x[:, :, v0:v1]
+            local_x = [local_video, local_audio]
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
@@ -503,6 +736,41 @@ def make_context_wrapper(policy: ContextPolicy):
                     transformer_options.pop("h3forge_active_layout", None)
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
+
+            if nk_active:
+                if win_idx + 1 < len(plan):
+                    next_v0, next_v1 = plan[win_idx + 1][1], plan[win_idx + 1][2]
+                    anchor = _first_neighbour_anchor(v0, v1, next_v0, next_v1)
+                    if anchor is not None:
+                        prev_window_x0 = (
+                            v0,
+                            v1,
+                            {
+                                anchor: _x0_latent_slice(
+                                    local_video, v_out, sigma, anchor - v0, padded_h, padded_w, local_denoise_mask
+                                )
+                            },
+                        )
+                    else:
+                        prev_window_x0 = None
+                if policy.neighbour_keyframe == "both" and win_idx > 0:
+                    prev_plan_v0, prev_plan_v1 = plan[win_idx - 1][1], plan[win_idx - 1][2]
+                    back_anchors = set()
+                    cur_back = _last_neighbour_anchor(prev_plan_v0, prev_plan_v1, v0, v1)
+                    if cur_back is not None:
+                        back_anchors.add(cur_back)
+                    if stagger and max_phase > 0:
+                        span_hi = min(v1, prev_plan_v1 + max_phase)
+                        first_cad = ((v0 + _LATENT_CADENCE - 1) // _LATENT_CADENCE) * _LATENT_CADENCE
+                        for cand in range(first_cad, span_hi, _LATENT_CADENCE):
+                            back_anchors.add(cand)
+                    if back_anchors:
+                        next_step_cache[win_idx] = {
+                            a: _x0_latent_slice(
+                                local_video, v_out, sigma, a - v0, padded_h, padded_w, local_denoise_mask
+                            )
+                            for a in sorted(back_anchors)
+                        }
 
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
@@ -521,6 +789,9 @@ def make_context_wrapper(policy: ContextPolicy):
             for w0, w1 in _subtract_intervals(write_a0, write_a1, holes):
                 audio_acc[..., w0:w1].add_(a_out[..., w0 - in_a0:w1 - in_a0].float() * aw[..., w0 - a0:w1 - a0])
                 audio_den[..., w0:w1].add_(aw[..., w0 - a0:w1 - a0])
+
+        if nk_active and policy.neighbour_keyframe == "both":
+            cache_state["cur"] = next_step_cache
 
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
