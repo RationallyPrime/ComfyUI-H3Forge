@@ -26,22 +26,27 @@ class RotaryCache:
         self.key = None
         self.value = None
 
+    def _matches(self, model, layout, device, dtype):
+        if self.key is None:
+            return False
+        old_model, old_layout, old_device, old_dtype, pos, freq = self.key
+        return (old_model is model and old_layout is layout and old_device == device and old_dtype == dtype
+                and pos.matches(layout.position_ids) and freq.matches(model.rope.inv_freq))
+
     def table(self, model, layout, device, dtype):
         from comfy.model_prefetch import pause_malloc_graph
 
-        positions, frequencies = layout.position_ids, model.rope.inv_freq
-        if self.key is not None:
-            old_model, old_layout, old_device, old_dtype, pos, freq = self.key
-            if (old_model is model and old_layout is layout and old_device == device and old_dtype == dtype
-                    and pos.matches(positions) and freq.matches(frequencies)):
-                return self.value
+        if self._matches(model, layout, device, dtype):
+            return self.value
 
-        # The table and optional inference-tensor snapshots outlive this forward.
-        # Build them outside the native per-forward allocation recorder.
+        # Persistent allocations must also be *released* outside the recorder.
+        # Drop the old entry first so two large tables never overlap on a miss.
         with pause_malloc_graph():
+            self.key = self.value = None
             value = model._rotation_table(layout, device, dtype)
-            key = (model, layout, device, dtype, _TensorStamp(positions), _TensorStamp(frequencies))
-        self.key, self.value = key, value
+            self.key = (model, layout, device, dtype, _TensorStamp(layout.position_ids),
+                        _TensorStamp(model.rope.inv_freq))
+            self.value = value
         return value
 
 

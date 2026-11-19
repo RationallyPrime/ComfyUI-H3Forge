@@ -1,4 +1,4 @@
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import importlib
 import os
 from pathlib import Path
@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from types import SimpleNamespace
+import weakref
 
 import pytest
 import torch
@@ -133,3 +134,35 @@ def test_rotary_invalidation_and_interrupted_run(native, inference):
         assert "h3forge_rotary_cache" not in opts
 
     wrappers["diffusion"](outside_run, None, None, None, options)
+
+
+def test_rotary_replacement_releases_persistent_tensors_inside_pause(native, monkeypatch):
+    _, _, model, _ = native
+    from h3forge.sol_rotary import RotaryCache
+
+    paused = False
+    @contextmanager
+    def pause():
+        nonlocal paused
+        paused = True
+        try:
+            yield
+        finally:
+            paused = False
+
+    monkeypatch.setattr(sys.modules["comfy.model_prefetch"], "pause_malloc_graph", pause)
+    cache = RotaryCache()
+    drops = []
+    with torch.inference_mode():
+        a, b = (SimpleNamespace(position_ids=torch.full((4, 3), i)) for i in (1, 2))
+        model.rope.inv_freq = model.rope.inv_freq.clone()
+        def collect(label):
+            drops.append((label, paused))
+        for i, layout in enumerate([a, b, a]):
+            result = cache.table(model, layout, torch.device("cpu"), torch.float32)
+            assert torch.equal(result, model._rotation_table(layout, torch.device("cpu"), torch.float32))
+            for label, tensor in [(f"table{i}", result), (f"pos{i}", cache.key[-2].snapshot),
+                                  (f"freq{i}", cache.key[-1].snapshot)]:
+                weakref.finalize(tensor, collect, label)
+            del result, tensor
+    assert sorted(drops) == sorted((f"{name}{i}", True) for name in ("table", "pos", "freq") for i in (0, 1))

@@ -475,5 +475,8 @@ Restart ComfyUI and insert **H3 Forge — Sol Sigma + Rotary Cache** immediately
 use the original calculations. Keep the native Sol node, its schedule, and the same preview settings
 for all experiment arms. Compare both switches off, sigma only, rotary only, and both on using warm
 takes and fresh run names. Inspect `timing.sample`, peak VRAM, sparse/dense decisions, and output quality.
-Rotary holds one position table until the run ends or another layout replaces it. To remove the core
+The rotary arm targets CFG 1 with a single stable packed layout per take, as in the production cockpit.
+It holds one table. Alternating conditional and unconditional layouts, or context windows that create
+fresh layouts each evaluation, rebuild the table each time and can be slower. For those graphs leave
+rotary off and test sigma independently. To remove the core
 hooks, bypass the Forge node, apply the same patch with `git apply -R`, and restart ComfyUI.
