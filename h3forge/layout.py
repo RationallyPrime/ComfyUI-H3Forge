@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 import math
 
 import torch
@@ -46,13 +48,21 @@ def video_shape_from_layout(layout) -> tuple[int, int]:
     return latent_t, int(times.numel() // latent_t)
 
 
+def video_frame_positions(layout) -> torch.Tensor:
+    """Return the per-latent-frame global time coordinates for target video rows."""
+    seg = target_segments(layout)
+    latent_t, frame_rows = video_shape_from_layout(layout)
+    return layout.position_ids[seg.video_start:seg.video_stop, 0].reshape(latent_t, frame_rows)[:, 0]
+
+
 def clone_window_layout(
     *,
     full_layout,
     text_len: int,
     video_shape: tuple[int, int, int],
     audio_t: int,
-    video_range: tuple[int, int],
+    video_range: tuple[int, int] | None = None,
+    video_indices: Sequence[int] | None = None,
     audio_range: tuple[int, int],
     keyframes=None,
     refs=None,
@@ -60,15 +70,24 @@ def clone_window_layout(
     """Build a local H3 PackedLayout, then transplant global target positions.
 
     This preserves absolute multimodal RoPE coordinates while allowing the model
-    to process a smaller synchronized A/V window.
+    to process a smaller synchronized A/V window or a non-contiguous subset of
+    target video latents.
     """
     from comfy.ldm.minimax.model import PackedLayout
 
-    v0, v1 = video_range
+    if (video_range is None) == (video_indices is None):
+        raise ValueError("pass exactly one of video_range or video_indices")
     a0, a1 = audio_range
     local_t, latent_h, latent_w = map(int, video_shape)
-    if local_t != v1 - v0:
-        raise ValueError(f"local video shape T={local_t} does not match window {video_range}")
+    if video_range is not None:
+        v0, v1 = video_range
+        if local_t != v1 - v0:
+            raise ValueError(f"local video shape T={local_t} does not match window {video_range}")
+        indices = None
+    else:
+        indices = [int(i) for i in video_indices]
+        if local_t != len(indices):
+            raise ValueError(f"local video shape T={local_t} does not match video_indices length {len(indices)}")
     if not (0 <= a0 < a1 <= int(audio_t)):
         raise ValueError(f"invalid audio range {audio_range} for T={audio_t}")
     local = PackedLayout(text_len, local_t, latent_h, latent_w, a1 - a0,
@@ -90,13 +109,24 @@ def clone_window_layout(
             local.position_ids[la:lb] = full_layout.position_ids[fa:fb]
 
     full_t, frame_rows = video_shape_from_layout(full_layout)
-    if v1 > full_t:
-        raise ValueError(f"video window {video_range} exceeds full latent length {full_t}")
-
-    # Video rows are frame-major and therefore a contiguous slice.
-    src_v0 = src.video_start + v0 * frame_rows
-    src_v1 = src.video_start + v1 * frame_rows
-    local.position_ids[dst.video_start:dst.video_stop] = full_layout.position_ids[src_v0:src_v1]
+    if video_range is not None:
+        if not (0 <= v0 < v1 <= full_t):
+            raise ValueError(f"video window {video_range} exceeds full latent length {full_t}")
+        # Video rows are frame-major and therefore a contiguous slice.
+        src_v0 = src.video_start + v0 * frame_rows
+        src_v1 = src.video_start + v1 * frame_rows
+        local.position_ids[dst.video_start:dst.video_stop] = full_layout.position_ids[src_v0:src_v1]
+        video_offset = int(v0)
+    else:
+        if not indices or indices[0] < 0 or indices[-1] >= full_t or any(b <= a for a, b in pairwise(indices)):
+            raise ValueError(f"video_indices must be strictly increasing inside [0, {full_t}), got {indices}")
+        full_video = full_layout.position_ids[src.video_start:src.video_stop].reshape(full_t, frame_rows, -1)
+        idx = torch.tensor(indices, dtype=torch.long, device=full_layout.position_ids.device)
+        local.position_ids[dst.video_start:dst.video_stop] = full_video.index_select(0, idx).reshape(
+            -1, full_video.shape[-1]
+        )
+        video_offset = int(indices[0])
+        local._h3forge_video_indices = tuple(indices)
 
     # Audio rows are channel-major: [L0..Lt-1, R0..Rt-1].
     full_audio_t = (src.audio_stop - src.audio_start) // 2
@@ -105,7 +135,7 @@ def clone_window_layout(
                                      src.audio_start + full_audio_t + a1]
     local.position_ids[dst.audio_start:dst.audio_stop] = torch.cat([left, right], dim=0)
     # Runtime-only metadata for compiler-friendly sparse mask arithmetic.
-    local._h3forge_video_offset = int(v0)
+    local._h3forge_video_offset = video_offset
     local._h3forge_audio_offset = int(a0)
     return local
 

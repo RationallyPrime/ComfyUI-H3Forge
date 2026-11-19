@@ -710,3 +710,369 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+@pytest.mark.parametrize(
+    "total,window",
+    [
+        (202, 85),   # exact 28.5 s Battle Brief / Sparring Hall geometry
+        (67, 25),
+        (427, 100),  # 60 s clip, all 86 single-frame latents fit
+        (427, 80),   # more single-frame latents (86) than window budget
+        (852, 100),  # 120 s clip, subsamples single-frame anchors
+        (17, 4),
+        (20, 2),
+        (21, 2),
+        (10, 10),
+        (10, 15),
+    ],
+)
+def test_sparse_video_indices_cover_endpoints_cadence_and_respect_window(total, window):
+    from h3forge.context import sparse_video_indices
+
+    indices = sparse_video_indices(total, window)
+    assert indices[0] == 0
+    assert indices[-1] == total - 1
+    assert len(indices) <= min(total, window)
+    assert all(0 <= idx < total for idx in indices)
+    assert all(b > a for a, b in pairwise(indices))
+
+    singles = list(range(0, total, 5))
+    if total <= window:
+        assert indices == list(range(total))
+    elif len(singles) + int((total - 1) % 5 != 0) <= window:
+        assert set(singles).issubset(indices)
+        assert len(indices) == window
+    else:
+        assert len(indices) == window
+
+
+def test_sparse_video_indices_202_85_includes_all_cycle_anchors_and_tail():
+    from h3forge.context import sparse_video_indices
+
+    indices = sparse_video_indices(202, 85)
+    assert len(indices) == 85
+    assert indices[0] == 0 and indices[-1] == 201
+    singles = set(range(0, 202, 5))
+    assert len(singles) == 41
+    assert singles.issubset(indices)
+    four_frame = [i for i in indices if i % 5 != 0]
+    assert len(four_frame) == 44
+
+
+def test_interpolate_sparse_video_returns_exact_values_at_sparse_rows_and_lerps_between():
+    from h3forge.context import interpolate_sparse_video
+
+    indices = [0, 2, 5, 9]
+    total_t = 10
+    sparse = torch.randn(1, 4, len(indices), 6, 8)
+
+    uniform = interpolate_sparse_video(sparse, indices, total_t)
+    assert uniform.shape == (1, 4, total_t, 6, 8)
+    for local_i, global_i in enumerate(indices):
+        assert torch.equal(uniform[:, :, global_i], sparse[:, :, local_i])
+    # Index 1 sits halfway between 0 and 2 on a uniform index grid.
+    assert torch.allclose(uniform[:, :, 1], 0.5 * sparse[:, :, 0] + 0.5 * sparse[:, :, 1])
+    # Index 3 sits 1/3 of the way from 2 to 5.
+    assert torch.allclose(uniform[:, :, 3], (2 / 3) * sparse[:, :, 1] + (1 / 3) * sparse[:, :, 2])
+
+    # With H3 physical frame times (1, 4, 4, 4, 4 cadence), latent 1 is 1 frame after
+    # latent 0 and 4 frames before latent 2 -> alpha = 1/5 = 0.2.
+    import fake_minimax
+    times = torch.tensor(fake_minimax.video_frame_times(total_t), dtype=torch.float64) + 12.0
+    physical = interpolate_sparse_video(sparse, indices, total_t, times=times)
+    for local_i, global_i in enumerate(indices):
+        assert torch.equal(physical[:, :, global_i], sparse[:, :, local_i])
+    assert torch.allclose(physical[:, :, 1], 0.8 * sparse[:, :, 0] + 0.2 * sparse[:, :, 1], atol=1e-6)
+
+
+def test_spatial_lowpass_preserves_constants_and_fuse_replaces_low_band():
+    from h3forge.context import fuse_layout_guide, spatial_lowpass
+
+    const = torch.full((1, 2, 6, 12, 16), 3.25)
+    assert torch.allclose(spatial_lowpass(const, radius=3), const, atol=1e-6)
+
+    # Zero-mean checkerboard high-frequency component + constant low-band field.
+    yy = torch.arange(16).view(1, 1, 1, 16, 1)
+    xx = torch.arange(16).view(1, 1, 1, 1, 16)
+    high = (((yy + xx) % 2) * 2 - 1).float() * 4.0
+    windowed = torch.full((1, 2, 6, 16, 16), 2.0) + high
+    sparse = torch.full((1, 2, 3, 16, 16), 10.0)
+    indices = [0, 2, 5]
+
+    fused = fuse_layout_guide(windowed, sparse, indices, 0.5, radius=3)
+    # Interior pixels preserve the high-frequency component and lerp the low band to 6.0.
+    interior = fused[:, :, :, 4:-4, 4:-4]
+    expected_interior = torch.full_like(interior, 6.0) + high[:, :, :, 4:-4, 4:-4]
+    assert torch.allclose(interior, expected_interior, atol=0.1)
+    assert torch.allclose(fused.mean(dim=(-2, -1)), torch.full((1, 2, 6), 6.0), atol=1e-5)
+    assert fuse_layout_guide(windowed, sparse, indices, 0.0, radius=3) is windowed
+
+
+def test_context_policy_validates_layout_guide_fields():
+    assert ContextPolicy().layout_guide == 0.0
+    assert ContextPolicy().layout_guide_until == 0.7
+    assert ContextPolicy(layout_guide=0.5, layout_guide_until=0.6).layout_guide == 0.5
+    for bad in (-0.1, 1.1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="layout_guide"):
+            ContextPolicy(layout_guide=bad)
+        with pytest.raises(ValueError, match="layout_guide_until"):
+            ContextPolicy(layout_guide_until=bad)
+
+
+def test_layout_guide_zero_is_bit_identical_and_below_threshold_skips_sparse_pass(monkeypatch, capsys):
+    from types import SimpleNamespace
+    import fake_minimax
+    from fake_minimax import PackedLayout
+
+    fake_minimax.install(monkeypatch)
+    total_t, window, overlap, h, w = 37, 15, 5, 8, 8
+    audio_t = 207
+    torch.manual_seed(0)
+    video = torch.randn(1, 4, total_t, h, w)
+    audio = torch.randn(1, 2, 2, audio_t)
+    context = torch.randn(1, 5, 8)
+    full_layout = PackedLayout(5, total_t, h, w, audio_t)
+
+    def make_exec(recorded):
+        class Executor:
+            class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+            def __call__(self, local_x, timestep, ctx, opts, **kwargs):
+                layout = kwargs["minimax_payload"]["layout"]
+                recorded.append(getattr(layout, "_h3forge_video_indices", None))
+                return [local_x[0] * 0.75 + 0.1, local_x[1] * 0.5 - 0.2]
+        return Executor()
+
+    options_high = {"sigmas": torch.tensor([0.9]), "sample_sigmas": torch.tensor([1.0, 0.9, 0.5, 0.0])}
+    options_step0 = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.7, 0.5, 0.0])}
+    options_low = {"sigmas": torch.tensor([0.7]), "sample_sigmas": torch.tensor([1.0, 0.7, 0.5, 0.0])}
+
+    # Guide = 0 never runs the sparse pass and matches default policy bit-for-bit.
+    calls_default, calls_zero = [], []
+    base = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
+        make_exec(calls_default), [video, audio], torch.tensor([1000.0]), context, options_step0,
+        minimax_payload={"layout": full_layout},
+    )
+    log_off = capsys.readouterr().out
+    assert "layout_guide=0.00 (off)" in log_off
+
+    explicit_zero = make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", layout_guide=0.0, layout_guide_until=0.7)
+    )(
+        make_exec(calls_zero), [video, audio], torch.tensor([1000.0]), context, options_step0,
+        minimax_payload={"layout": full_layout},
+    )
+    assert all(entry is None for entry in calls_default)
+    assert calls_default == calls_zero
+    assert torch.equal(base[0], explicit_zero[0])
+    assert torch.equal(base[1], explicit_zero[1])
+
+    # At sigma == layout_guide_until (and below), layout_guide > 0 skips sparse pass and is bit-identical to off.
+    calls_at_threshold, calls_off_at_threshold = [], []
+    guided_low = make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", layout_guide=0.6, layout_guide_until=0.7)
+    )(
+        make_exec(calls_at_threshold), [video, audio], torch.tensor([700.0]), context, options_low,
+        minimax_payload={"layout": full_layout},
+    )
+    off_low = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
+        make_exec(calls_off_at_threshold), [video, audio], torch.tensor([700.0]), context, options_low,
+        minimax_payload={"layout": full_layout},
+    )
+    assert all(entry is None for entry in calls_at_threshold)
+    assert len(calls_at_threshold) == len(calls_off_at_threshold)
+    assert torch.equal(guided_low[0], off_low[0])
+    assert torch.equal(guided_low[1], off_low[1])
+
+    # Above threshold, sparse pass runs once before the windowed passes.
+    calls_high = []
+    make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", layout_guide=0.5, layout_guide_until=0.7)
+    )(
+        make_exec(calls_high), [video, audio], torch.tensor([900.0]), context, options_high,
+        minimax_payload={"layout": full_layout},
+    )
+    assert calls_high[0] is not None and len(calls_high[0]) == window
+    assert all(entry is None for entry in calls_high[1:])
+
+
+@pytest.mark.parametrize("guide_weight", [0.5, 1.0])
+def test_layout_guide_fuses_known_low_band_field_with_fake_minimax(monkeypatch, capsys, guide_weight):
+    from types import SimpleNamespace
+    import fake_minimax
+    from fake_minimax import PackedLayout
+    from h3forge.context import interpolate_sparse_video, sparse_video_indices, spatial_lowpass
+    from h3forge.layout import target_segments, video_frame_positions
+
+    fake_minimax.install(monkeypatch)
+    total_t, window, overlap, h, w = 202, 85, 21, 8, 8
+    audio_t = round(sum((1, 4, 4, 4, 4)[i % 5] for i in range(total_t)) * 5 / 3)
+    video = torch.arange(total_t, dtype=torch.float32).view(1, 1, total_t, 1, 1).expand(1, 2, total_t, h, w).clone()
+    audio = torch.ones(1, 2, 2, audio_t)
+    denoise_mask = torch.linspace(0.0, 1.0, total_t).view(1, 1, total_t, 1, 1).expand(1, 1, total_t, h, w).clone()
+    context = torch.zeros(1, 6, 8)
+    full_layout = PackedLayout(6, total_t, h, w, audio_t)
+    full_seg = target_segments(full_layout)
+    expected_indices = sparse_video_indices(total_t, window)
+
+    # Known spatially-constant low-band field from the sparse pass: 10 + 0.1 * frame_index.
+    sparse_frame_values = (10.0 + 0.1 * torch.tensor(expected_indices, dtype=torch.float32)).view(1, 1, -1, 1, 1)
+    # Known windowed field: spatially-constant low band (2.0) + high-frequency zero-mean detail.
+    yy = torch.arange(h).view(1, 1, 1, h, 1)
+    xx = torch.arange(w).view(1, 1, 1, 1, w)
+    windowed_detail = (((yy + xx) % 2) * 2 - 1).float() * 0.5
+    seen = []
+
+    class Executor:
+        class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+        def __call__(self, local_x, timestep, ctx, opts, **kwargs):
+            layout = kwargs["minimax_payload"]["layout"]
+            assert opts["h3forge_active_layout"] is layout
+            indices = getattr(layout, "_h3forge_video_indices", None)
+            if indices is not None:
+                seen.append(("sparse", indices))
+                assert list(indices) == expected_indices
+                assert local_x[1] is audio
+                # Verify global RoPE coordinates were transplanted for each sparse latent.
+                loc_seg = target_segments(layout)
+                frame_rows = full_layout.frame_rows
+                for local_i, global_i in enumerate(indices):
+                    assert torch.equal(
+                        layout.position_ids[loc_seg.video_start + local_i * frame_rows:
+                                            loc_seg.video_start + (local_i + 1) * frame_rows],
+                        full_layout.position_ids[full_seg.video_start + global_i * frame_rows:
+                                                 full_seg.video_start + (global_i + 1) * frame_rows],
+                    )
+                # Verify video and denoise_mask were indexed on the exact sparse subset.
+                assert torch.equal(local_x[0][:, :, :, 0, 0],
+                                   torch.tensor(indices, dtype=torch.float32).view(1, 1, -1).expand(1, 2, -1))
+                assert torch.equal(kwargs["denoise_mask"],
+                                   denoise_mask.index_select(2, torch.tensor(indices, dtype=torch.long)))
+                sparse_v = sparse_frame_values.expand(1, 2, len(indices), h, w).clone()
+                # Sentinel audio output must be discarded completely.
+                sparse_a = torch.full_like(local_x[1], 999.0)
+                return [sparse_v, sparse_a]
+
+            seen.append(("window", layout._h3forge_video_offset))
+            win_v = torch.full_like(local_x[0], 2.0) + windowed_detail
+            win_a = torch.full_like(local_x[1], 3.0)
+            return [win_v, win_a]
+
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.85, 0.5, 0.0])}
+    policy = ContextPolicy(window, overlap, True, "pyramid", layout_guide=guide_weight, layout_guide_until=0.7)
+    v_out, a_out = make_context_wrapper(policy)(
+        Executor(), [video, audio], torch.tensor([1000.0]), context, options,
+        minimax_payload={"layout": full_layout}, denoise_mask=denoise_mask,
+    )
+
+    # Sparse pass ran once first, followed by the 3 regular windows.
+    assert seen[0][0] == "sparse"
+    assert [tag for tag, _ in seen[1:]] == ["window", "window", "window"]
+    # Audio is strictly from the windows (sentinel 999 discarded).
+    assert torch.all(a_out == 3.0)
+
+    # Verify step-0 log receipt.
+    log = capsys.readouterr().out
+    assert f"layout_guide={guide_weight:.2f} until=0.70 active=yes" in log
+    assert "sparse_latents=85/202 span=0..201" in log
+    assert "guided_steps=2/3" in log
+
+    # Verify the fused low band equals lerp(windowed_low, sparse_low, layout_guide).
+    expected_windowed = torch.full((1, 2, total_t, h, w), 2.0) + windowed_detail
+    expected_sparse_interp = interpolate_sparse_video(
+        sparse_frame_values.expand(1, 2, len(expected_indices), h, w),
+        expected_indices,
+        total_t,
+        times=video_frame_positions(full_layout),
+    )
+    windowed_low = spatial_lowpass(expected_windowed)
+    sparse_low = spatial_lowpass(expected_sparse_interp)
+    expected_low = torch.lerp(windowed_low, sparse_low, guide_weight)
+    expected_fused = (expected_windowed - windowed_low) + expected_low
+    assert torch.allclose(v_out, expected_fused, atol=1e-5)
+    # Spatial mean per frame equals lerp(2.0, sparse_interp_value, guide_weight) exactly.
+    assert torch.allclose(
+        v_out.mean(dim=(-2, -1)),
+        torch.lerp(torch.full((1, 2, total_t), 2.0), expected_sparse_interp[:, :, :, 0, 0], guide_weight),
+        atol=1e-5,
+    )
+
+
+def test_layout_guide_skips_cleanly_on_segmented_pipe_prompts(monkeypatch, capsys):
+    from types import SimpleNamespace
+    import fake_minimax
+    from fake_minimax import PackedLayout
+
+    fake_minimax.install(monkeypatch)
+    total_t, window, overlap = 67, 25, 8
+    audio_t = 377
+    video = torch.randn(1, 2, total_t, 4, 4)
+    audio = torch.randn(1, 2, 2, audio_t)
+    prompts = (torch.ones(1, 3, 8), torch.full((1, 5, 8), 2.0))
+    payload = {
+        "layout": PackedLayout(5, total_t, 4, 4, audio_t),
+        "h3forge_prompt_segments": prompts,
+        "h3forge_prompt_segment_tags": (torch.ones(3, dtype=torch.long), torch.ones(5, dtype=torch.long)),
+    }
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
+
+    def make_exec(sparse_seen):
+        class Executor:
+            class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+            def __call__(self, local_x, timestep, ctx, opts, **kwargs):
+                if getattr(kwargs["minimax_payload"]["layout"], "_h3forge_video_indices", None) is not None:
+                    sparse_seen.append(True)
+                return [torch.full_like(local_x[0], float(ctx[0, 0, 0])),
+                        torch.full_like(local_x[1], float(ctx[0, 0, 0]))]
+        return Executor()
+
+    sparse_seen = []
+    guided = make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", layout_guide=0.5, layout_guide_until=0.7)
+    )(make_exec(sparse_seen), [video, audio], torch.tensor([1000.0]), prompts[0], options, minimax_payload=payload)
+    log = capsys.readouterr().out
+    assert not sparse_seen
+    assert "layout_guide=0.50 until=0.70 skipped=segmented" in log
+
+    baseline = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid"))(
+        make_exec([]), [video, audio], torch.tensor([1000.0]), prompts[0], options, minimax_payload=payload,
+    )
+    assert torch.equal(guided[0], baseline[0])
+    assert torch.equal(guided[1], baseline[1])
+
+
+def test_control_window_slices_non_contiguous_video_indices():
+    from types import SimpleNamespace
+    from h3forge.control import control_window
+
+    class MiniMaxH3FunControlPatch:
+        sigma_start = 1.0
+        sigma_end = 0.0
+        control_latent = None
+        control_latent_shape = None
+        control_stream = "stale"
+        pristine_stream = "stale"
+
+        def prepare_control_latent(self, shape):
+            self.control_latent = torch.arange(shape[2]).view(1, 1, -1, 1, 1).expand(shape).clone()
+            self.control_latent_shape = tuple(shape)
+
+        def wrapper(self):
+            pass
+
+    patch = MiniMaxH3FunControlPatch()
+    executor = SimpleNamespace(wrappers=(patch.wrapper,))
+    full_shape = (1, 2, 20, 4, 4)
+    indices = [0, 5, 10, 15, 19]
+
+    with control_window(executor, full_shape, None, torch.tensor([900.0]), {"sigmas": torch.tensor([0.9])},
+                        video_indices=indices):
+        assert patch.control_latent_shape == (1, 2, 5, 4, 4)
+        assert torch.equal(patch.control_latent[0, 0, :, 0, 0], torch.tensor(indices))
+        assert patch.control_stream is None and patch.pristine_stream is None
+
+    assert patch.control_latent_shape == full_shape
+    assert torch.equal(patch.control_latent[0, 0, :, 0, 0], torch.arange(20))

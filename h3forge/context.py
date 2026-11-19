@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 import math
 from dataclasses import dataclass
 from itertools import pairwise
 
 import torch
+import torch.nn.functional as F
 
 from .control import control_window
-from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
+from .layout import (
+    audio_range_for_video_window,
+    audio_window_length,
+    clone_window_layout,
+    padded_spatial_shape,
+    video_frame_positions,
+)
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
+LAYOUT_GUIDE_LOWPASS_RADIUS = 3
 SEGMENT_SEAMS = ("blend", "exclusive")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
 
@@ -26,12 +35,18 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    layout_guide: float = 0.0
+    layout_guide_until: float = 0.7
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
             raise ValueError(f"audio_context must be one of {AUDIO_CONTEXT_MODES}, got {self.audio_context!r}")
+        if not math.isfinite(self.layout_guide) or not 0.0 <= self.layout_guide <= 1.0:
+            raise ValueError(f"layout_guide must be in [0, 1], got {self.layout_guide!r}")
+        if not math.isfinite(self.layout_guide_until) or not 0.0 <= self.layout_guide_until <= 1.0:
+            raise ValueError(f"layout_guide_until must be in [0, 1], got {self.layout_guide_until!r}")
 
 
 def ordered_halving(value: int) -> float:
@@ -239,6 +254,195 @@ def _slice_optional_video(mask, v0, v1):
     return mask[:, :, v0:v1]
 
 
+def _index_optional_video(mask, indices: Sequence[int]):
+    if mask is None:
+        return None
+    idx = torch.tensor(indices, dtype=torch.long, device=mask.device)
+    return mask.index_select(2, idx)
+
+
+def sparse_video_indices(total: int, window: int) -> list[int]:
+    """Select <= ``window`` video latents spanning ``[0, total - 1]`` for the coarse layout pass.
+
+    Prefers every H3 cycle's single-frame latent (``0, 5, 10, ...``), ensures
+    the first and last latents are present, and fills any remaining budget up to
+    ``window`` with evenly spaced four-frame latents. When the clip has more
+    single-frame latents than the window budget allows, evenly subsamples those
+    anchors while preserving the first and last latents.
+    """
+    total, window = int(total), int(window)
+    if total < 1:
+        raise ValueError(f"total must be >= 1, got {total}")
+    if window < 1:
+        raise ValueError(f"window must be >= 1, got {window}")
+    if total <= window:
+        return list(range(total))
+    if window < 2:
+        raise ValueError("window must be >= 2 when total > window")
+
+    singles = list(range(0, total, _LATENT_CADENCE))
+    last = total - 1
+    need_tail = last % _LATENT_CADENCE != 0
+    if len(singles) + int(need_tail) > window:
+        if not need_tail:
+            return [singles[round(k * (len(singles) - 1) / (window - 1))] for k in range(window)]
+        if window == 2:
+            return [0, last]
+        kept = [singles[round(k * (len(singles) - 1) / (window - 2))] for k in range(window - 1)]
+        kept.append(last)
+        return kept
+
+    selected = set(singles)
+    selected.add(last)
+    extra = window - len(selected)
+    if extra > 0:
+        pool = [i for i in range(total) if i not in selected]
+        take = min(extra, len(pool))
+        selected.update(pool[int((k + 0.5) * len(pool) / take)] for k in range(take))
+    return sorted(selected)
+
+
+def interpolate_sparse_video(
+    sparse: torch.Tensor,
+    indices: Sequence[int],
+    total_t: int,
+    *,
+    times: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Linearly interpolate ``sparse`` video latents along time onto ``[0, total_t)``.
+
+    Values at the supplied ``indices`` are returned exactly (no rounding drift).
+    When ``times`` is given (length ``total_t``), interpolation weights follow
+    those physical timestamps rather than uniform latent indices.
+    """
+    total_t = int(total_t)
+    idx_list = [int(i) for i in indices]
+    if not idx_list or len(idx_list) != int(sparse.shape[2]):
+        raise ValueError(f"sparse T={sparse.shape[2]} does not match indices length {len(idx_list)}")
+    if idx_list[0] < 0 or idx_list[-1] >= total_t or any(b <= a for a, b in pairwise(idx_list)):
+        raise ValueError(f"indices must be strictly increasing inside [0, {total_t}), got {idx_list}")
+
+    device = sparse.device
+    idx_t = torch.tensor(idx_list, dtype=torch.long, device=device)
+    grid = torch.arange(total_t, dtype=torch.long, device=device)
+    right_pos = torch.searchsorted(idx_t, grid).clamp(max=len(idx_list) - 1)
+    left_pos = (right_pos - 1).clamp(min=0)
+    is_anchor = idx_t[right_pos] == grid
+    left_pos = torch.where(is_anchor, right_pos, left_pos)
+
+    if times is None:
+        coord = grid.to(torch.float32)
+    else:
+        if times.numel() != total_t:
+            raise ValueError(f"times length {times.numel()} != total_t {total_t}")
+        t64 = times.detach().to(dtype=torch.float64)
+        coord = (t64 - t64[0]).to(device=device, dtype=torch.float32)
+
+    s = sparse.float()
+    out = s.index_select(2, left_pos)
+    interp = torch.nonzero(left_pos != right_pos, as_tuple=False).flatten()
+    if interp.numel():
+        c_left = coord[idx_t[left_pos[interp]]]
+        c_right = coord[idx_t[right_pos[interp]]]
+        span = c_right - c_left
+        alpha = torch.where(span > 0, (coord[interp] - c_left) / span.clamp_min(1e-6), torch.zeros_like(span))
+        alpha = alpha.clamp(0.0, 1.0).view(1, 1, -1, 1, 1)
+        out[:, :, interp] = torch.lerp(
+            s.index_select(2, left_pos[interp]),
+            s.index_select(2, right_pos[interp]),
+            alpha,
+        )
+    return out
+
+
+def spatial_lowpass(x: torch.Tensor, radius: int = LAYOUT_GUIDE_LOWPASS_RADIUS) -> torch.Tensor:
+    """Separable 2D Gaussian low-pass filter over the spatial latent axes (H, W)."""
+    if radius < 0:
+        raise ValueError(f"low-pass radius must be >= 0, got {radius}")
+    if radius == 0 or (x.shape[-2] <= 1 and x.shape[-1] <= 1):
+        return x.float()
+    b, c, t, h, w = x.shape
+    sigma = max(radius / 2.0, 0.5)
+    coords = torch.arange(-radius, radius + 1, device=x.device, dtype=torch.float32)
+    kernel = torch.exp(-0.5 * (coords / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+    flat = x.float().reshape(b * c * t, 1, h, w)
+    if h > 1:
+        flat = F.pad(flat, (0, 0, radius, radius), mode="replicate")
+        flat = F.conv2d(flat, kernel.view(1, 1, -1, 1))
+    if w > 1:
+        flat = F.pad(flat, (radius, radius, 0, 0), mode="replicate")
+        flat = F.conv2d(flat, kernel.view(1, 1, 1, -1))
+    return flat.reshape(b, c, t, h, w)
+
+
+def fuse_layout_guide(
+    windowed: torch.Tensor,
+    sparse: torch.Tensor,
+    indices: Sequence[int],
+    weight: float,
+    *,
+    times: torch.Tensor | None = None,
+    radius: int = LAYOUT_GUIDE_LOWPASS_RADIUS,
+) -> torch.Tensor:
+    """Replace the spatial low band of ``windowed`` with a lerp toward interpolated ``sparse``."""
+    if weight <= 0.0:
+        return windowed
+    interp = interpolate_sparse_video(sparse, indices, int(windowed.shape[2]), times=times)
+    windowed_f = windowed.float()
+    windowed_low = spatial_lowpass(windowed_f, radius=radius)
+    sparse_low = spatial_lowpass(interp, radius=radius)
+    guided_low = torch.lerp(windowed_low, sparse_low, float(weight))
+    return (windowed_f - windowed_low) + guided_low
+
+
+def _log_layout_guide_step0(
+    policy: ContextPolicy,
+    *,
+    total_t: int,
+    window: int,
+    segmented: bool,
+    sigma: float | None,
+    sparse_indices: Sequence[int] | None,
+    transformer_options: dict,
+) -> None:
+    if policy.layout_guide <= 0.0:
+        print(f"{LOG} layout_guide=0.00 (off)", flush=True)
+        return
+    if total_t <= window:
+        print(
+            f"{LOG} layout_guide={policy.layout_guide:.2f} until={policy.layout_guide_until:.2f} "
+            f"skipped=single_window",
+            flush=True,
+        )
+        return
+    if segmented:
+        print(
+            f"{LOG} layout_guide={policy.layout_guide:.2f} until={policy.layout_guide_until:.2f} "
+            f"skipped=segmented",
+            flush=True,
+        )
+        return
+    active = sigma is not None and sigma > policy.layout_guide_until
+    bits = [
+        f"layout_guide={policy.layout_guide:.2f}",
+        f"until={policy.layout_guide_until:.2f}",
+        f"active={'yes' if active else 'no'}",
+    ]
+    if sigma is not None:
+        bits.append(f"sigma={sigma:.3f}")
+    if sparse_indices:
+        bits.append(f"sparse_latents={len(sparse_indices)}/{total_t}")
+        bits.append(f"span={sparse_indices[0]}..{sparse_indices[-1]}")
+    bits.append(f"lowpass_radius={LAYOUT_GUIDE_LOWPASS_RADIUS}")
+    sample_sigmas = transformer_options.get("sample_sigmas")
+    if sample_sigmas is not None and getattr(sample_sigmas, "ndim", 0) >= 1 and sample_sigmas.shape[0] > 1:
+        step_sigmas = sample_sigmas[:-1].detach().float()
+        guided = int((step_sigmas > policy.layout_guide_until).sum())
+        bits.append(f"guided_steps={guided}/{int(step_sigmas.shape[0])}")
+    print(f"{LOG} " + " ".join(bits), flush=True)
+
+
 def _slice_optional_audio(mask, a0, a1):
     if mask is None or (a0 == 0 and a1 == mask.shape[-1]):
         return mask
@@ -399,13 +603,21 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options)
+        step, _ = resolve_step(transformer_options, sigma=sigma)
+        guide_sigma = sigma
+        if guide_sigma is None and policy.layout_guide > 0.0 and timestep is not None:
+            guide_sigma = float(timestep.flatten()[0]) / 1000.0
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
                       phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                _log_layout_guide_step0(
+                    policy, total_t=total_t, window=window, segmented=segmented,
+                    sigma=guide_sigma, sparse_indices=None, transformer_options=transformer_options,
+                )
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -455,12 +667,62 @@ def make_context_wrapper(policy: ContextPolicy):
         # any rescued beat, which its own window owns in both streams.
         plan = [(index, v0, v1, w0, w1, (w0, w1) != (v0, v1) or not blended, excluded)
                 for index, v0, v1, w0, w1, excluded in plan]
+        guide_enabled = policy.layout_guide > 0.0 and total_t > window and not segmented
+        sparse_indices = sparse_video_indices(total_t, window) if guide_enabled else None
+        guide_active = guide_enabled and guide_sigma is not None and guide_sigma > policy.layout_guide_until
         if step == 0:
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None),
                   flush=True)
+            _log_layout_guide_step0(
+                policy, total_t=total_t, window=window, segmented=segmented,
+                sigma=guide_sigma, sparse_indices=sparse_indices, transformer_options=transformer_options,
+            )
+
+        sparse_v_out = None
+        if guide_active:
+            sparse_context = prompts[0]
+            sparse_layout = clone_window_layout(
+                full_layout=full_layout,
+                text_len=sparse_context.shape[1],
+                video_shape=(len(sparse_indices), padded_h, padded_w),
+                audio_t=audio_t,
+                video_indices=sparse_indices,
+                audio_range=(0, audio_t),
+                keyframes=payload.get("keyframes"),
+                refs=payload.get("refs"),
+            )
+            sparse_payload = {**payload, "layout": sparse_layout}
+            if tags is not None:
+                sparse_payload["text_token_tags"] = tags[0]
+            sparse_kwargs = {
+                **kwargs,
+                "minimax_payload": sparse_payload,
+                "denoise_mask": _index_optional_video(kwargs.get("denoise_mask"), sparse_indices),
+            }
+            idx_tensor = torch.tensor(sparse_indices, dtype=torch.long, device=video_x.device)
+            sparse_x = [video_x.index_select(2, idx_tensor), audio_x]
+            sentinel = object()
+            previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
+            transformer_options["h3forge_active_layout"] = sparse_layout
+            try:
+                with control_window(
+                    executor, video_x.shape, None, timestep, transformer_options, video_indices=sparse_indices,
+                ):
+                    sparse_v_out, _ = executor(
+                        sparse_x, timestep, sparse_context, transformer_options, **sparse_kwargs,
+                    )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"{LOG} layout guide sparse pass ({len(sparse_indices)} latents) failed: {exc}"
+                ) from exc
+            finally:
+                if previous_layout is sentinel:
+                    transformer_options.pop("h3forge_active_layout", None)
+                else:
+                    transformer_options["h3forge_active_layout"] = previous_layout
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
@@ -525,7 +787,16 @@ def make_context_wrapper(policy: ContextPolicy):
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
         assert_full_coverage(video_den, audio_den)
-        return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
+        video_out = video_acc / video_den.clamp_min(1e-6)
+        if sparse_v_out is not None:
+            video_out = fuse_layout_guide(
+                video_out,
+                sparse_v_out,
+                sparse_indices,
+                policy.layout_guide,
+                times=video_frame_positions(full_layout),
+            )
+        return [video_out.to(video_x.dtype),
                 (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
     return wrapper

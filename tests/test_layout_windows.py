@@ -187,3 +187,68 @@ def test_audio_window_length_is_constant_across_all_starts(monkeypatch, total, w
     for bad in (0, -1, total + 1):
         with pytest.raises(ValueError, match="video_window"):
             audio_window_length(full, bad)
+
+
+@pytest.mark.parametrize(
+    "keyframes,refs",
+    [
+        pytest.param(None, None, id="t2va"),
+        pytest.param(keyframe_descriptors(1), None, id="i2va-first-frame"),
+        pytest.param(keyframe_descriptors(2), None, id="fl2va-first-last"),
+        pytest.param(None, reference_descriptors(3), id="ref2va-reference-rows"),
+        pytest.param(keyframe_descriptors(1), reference_descriptors(2), id="keyframes-plus-refs"),
+    ],
+)
+def test_clone_window_layout_transplants_non_contiguous_video_indices(monkeypatch, keyframes, refs):
+    fake_minimax.install(monkeypatch)
+    from h3forge.layout import clone_window_layout, target_segments, video_frame_positions
+
+    full = PackedLayout(7, 20, 4, 4, 114, keyframes=keyframes, refs=refs)
+    indices = [0, 2, 5, 10, 15, 19]
+    local = clone_window_layout(
+        full_layout=full,
+        text_len=7,
+        video_shape=(len(indices), 4, 4),
+        audio_t=114,
+        video_indices=indices,
+        audio_range=(0, 114),
+        keyframes=keyframes,
+        refs=refs,
+    )
+    src, dst = target_segments(full), target_segments(local)
+    frame_rows = full.frame_rows
+
+    for local_i, global_i in enumerate(indices):
+        local_slice = local.position_ids[dst.video_start + local_i * frame_rows:
+                                         dst.video_start + (local_i + 1) * frame_rows]
+        full_slice = full.position_ids[src.video_start + global_i * frame_rows:
+                                       src.video_start + (global_i + 1) * frame_rows]
+        assert torch.equal(local_slice, full_slice)
+
+    assert torch.equal(local.position_ids[:dst.audio_start], full.position_ids[:src.audio_start])
+    assert torch.equal(local.position_ids[dst.audio_start:dst.audio_stop],
+                       full.position_ids[src.audio_start:src.audio_stop])
+    assert local._h3forge_video_offset == 0
+    assert local._h3forge_video_indices == tuple(indices)
+    assert local._h3forge_audio_offset == 0
+    assert torch.equal(video_frame_positions(local), video_frame_positions(full)[indices])
+
+
+def test_clone_window_layout_validates_video_indices_arguments(monkeypatch):
+    fake_minimax.install(monkeypatch)
+    from h3forge.layout import clone_window_layout
+
+    full = PackedLayout(7, 10, 4, 4, 57)
+    with pytest.raises(ValueError, match="exactly one"):
+        clone_window_layout(full_layout=full, text_len=7, video_shape=(3, 4, 4), audio_t=57,
+                            audio_range=(0, 57))
+    with pytest.raises(ValueError, match="exactly one"):
+        clone_window_layout(full_layout=full, text_len=7, video_shape=(3, 4, 4), audio_t=57,
+                            video_range=(0, 3), video_indices=[0, 1, 2], audio_range=(0, 57))
+    with pytest.raises(ValueError, match="video_indices length"):
+        clone_window_layout(full_layout=full, text_len=7, video_shape=(4, 4, 4), audio_t=57,
+                            video_indices=[0, 5, 9], audio_range=(0, 57))
+    for bad in ([5, 2, 9], [0, 5, 5], [-1, 5, 9], [0, 5, 10]):
+        with pytest.raises(ValueError, match="strictly increasing"):
+            clone_window_layout(full_layout=full, text_len=7, video_shape=(3, 4, 4), audio_t=57,
+                                video_indices=bad, audio_range=(0, 57))
