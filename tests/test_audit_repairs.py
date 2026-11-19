@@ -399,6 +399,11 @@ def test_strict_sparse_contracts_raise_but_declared_dense_schedule_runs():
     state.layout.seq_len = 5
     state.block_index = 0
     assert override(lambda *args, **kwargs: q, q, q, q, 2, skip_reshape=True) is q
+    # Non-contiguous sparse layout-guide layouts run dense attention even under strict=True.
+    state.block_index = 3
+    state.layout = SimpleNamespace(seq_len=5, _h3forge_video_indices=(0, 5, 9))
+    assert override(lambda *args, **kwargs: q, q, q, q, 2, skip_reshape=True) is q
+    assert state.declines.get("sparse-layout-guide") == 1
 
 
 def test_different_shared_reference_values_are_rejected():

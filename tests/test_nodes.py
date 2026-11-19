@@ -98,9 +98,14 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
     assert "audio_context" not in required  # optional so saved API graphs without it stay valid
     assert optional["audio_context"][0] == ["auto", "window", "full"]
     assert optional["audio_context"][1]["default"] == "auto"
+    assert "layout_guide" not in required and "layout_guide_until" not in required
+    assert optional["layout_guide"][0] == "FLOAT" and optional["layout_guide"][1]["default"] == 0.0
+    assert optional["layout_guide_until"][0] == "FLOAT" and optional["layout_guide_until"][1]["default"] == 0.7
     timeline_optional = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["optional"]
     assert timeline_optional["audio_context"][0] == ["auto", "window", "full"]
     assert timeline_optional["audio_context"][1]["default"] == "auto"
+    assert timeline_optional["layout_guide"][1]["default"] == 0.0
+    assert timeline_optional["layout_guide_until"][1]["default"] == 0.7
 
 
 def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(monkeypatch):
@@ -132,6 +137,10 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
     with pytest.raises(ValueError, match="audio_context"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", audio_context="bad")
+    with pytest.raises(ValueError, match="layout_guide"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", layout_guide=1.5)
+    with pytest.raises(ValueError, match="layout_guide_until"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", layout_guide_until=-0.1)
 
 
 @pytest.mark.parametrize("stride", [1, 2])
@@ -436,11 +445,13 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     video, audio = torch.zeros(1, 24, 142, 48, 84), torch.zeros(1, 32, 2, 802)
     supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
     _patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
-        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window")
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window",
+        layout_guide=0.5, layout_guide_until=0.65)
     assert latent is supplied  # passed through untouched, keyframe anchors stay valid
     policy, = policies
     assert (policy.window_frames, policy.overlap_frames, policy.stagger) == (80, 13, True)
     assert policy.audio_context == "window"
+    assert (policy.layout_guide, policy.layout_guide_until) == (0.5, 0.65)
     log = capsys.readouterr().out
     assert "connected latent: 481 frames" in log and "2 windows of 80/13" in log
 

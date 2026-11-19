@@ -337,11 +337,26 @@ def _context_optional_inputs():
                     "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
+            "layout_guide": ("FLOAT", {
+                "default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                "tooltip": (
+                    "Coarse full-clip layout guide strength on high-noise steps (0 = off). Runs one extra sparse "
+                    "global pass spanning the whole clip within one window budget and blends its low spatial band "
+                    "into the windowed video prediction. Skipped on pipe-prompt runs."
+                ),
+            }),
+            "layout_guide_until": ("FLOAT", {
+                "default": 0.7, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": (
+                    "Sigma threshold above which the coarse layout guide runs. Steps at or below this sigma run "
+                    "the normal windowed pass unchanged."
+                ),
+            }),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", layout_guide=0.0, layout_guide_until=0.7):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +367,9 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context,
+                               layout_guide=layout_guide,
+                               layout_guide_until=layout_guide_until)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +400,11 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto",
+              layout_guide=0.0, layout_guide_until=0.7):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context,
+                                 layout_guide, layout_guide_until),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +457,8 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto",
+              layout_guide=0.0, layout_guide_until=0.7):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +489,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
+                                   audio_context, layout_guide, layout_guide_until)
         return (patched, latent)
 
 
