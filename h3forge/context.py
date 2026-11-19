@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from itertools import pairwise
+from itertools import groupby, pairwise
 
 import torch
 
@@ -14,6 +14,7 @@ from .state import require_eager_allocations, resolve_step
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
+HANDOFF_MODES = ("off", "earlier", "later", "lead")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
 
 
@@ -26,8 +27,14 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    handoff: str = "off"
+    lead: float = 0.5
 
     def __post_init__(self):
+        if self.handoff not in HANDOFF_MODES:
+            raise ValueError(f"handoff must be one of {HANDOFF_MODES}, got {self.handoff!r}")
+        if not 0.0 <= self.lead <= 1.0:
+            raise ValueError(f"lead must be in [0, 1], got {self.lead!r}")
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
@@ -304,6 +311,50 @@ def _subtract_intervals(start, stop, holes):
     return pieces
 
 
+def _video_fusion_spans(plan, ranges, total, handoff):
+    """Per window: global spans to write and spans already owned by an earlier window."""
+    writes = [_subtract_intervals(w0, w1, [ranges[b] for b in excluded])
+              for _, _, _, w0, w1, _, excluded in plan]
+    reads = [[] for _ in plan]
+    if handoff == "off":
+        return writes, reads
+
+    # Only eligible writers compete. This preserves exclusive and rescued beats,
+    # even when several windows have the same start or three overlaps coincide.
+    owners = [-1] * total
+    order = range(len(plan))
+    for i in order if handoff == "later" else reversed(order):
+        for lo, hi in writes[i]:
+            owners[lo:hi] = [i] * (hi - lo)
+
+    for i, (_, v0, v1, *_) in enumerate(plan):
+        writes[i] = []
+        lo = v0
+        for owner, group in groupby(owners[v0:v1]):
+            hi = lo + sum(1 for _ in group)
+            if owner == i:
+                writes[i].append((lo, hi))
+            elif handoff == "lead" and 0 <= owner < i:
+                reads[i].append((lo, hi))
+            lo = hi
+    return writes, reads
+
+
+def _lead_context(video, mask, velocities, spans, start, timestep, lead):
+    """Advance read-only rows along their owner's flow, relative to their incoming mask."""
+    video = video.clone()
+    mask = torch.ones_like(video[:, :1], dtype=torch.float32) if mask is None else mask.float().clone()
+    # Native _forward receives sigma * 1000 and returns raw video velocity.
+    # Interpolating x0 and noise at lead * row_sigma reduces to x + (lead - 1) * row_sigma * v.
+    delta_sigma = (timestep.flatten()[0].float() / 1000.0).clamp(min=1e-6) * (lead - 1.0)
+    for lo, hi in spans:
+        local = slice(lo - start, hi - start)
+        strength = mask[:, :, local]
+        video[:, :, local] = video[:, :, local].float() + delta_sigma * strength * velocities[:, :, lo:hi]
+        strength.mul_(lead)
+    return video, mask
+
+
 def _segment_windows(total, window, overlap, ranges):
     """Give every beat forwards and exclusive output ownership on the native grid.
 
@@ -391,6 +442,8 @@ def make_freenoise_wrapper(policy: ContextPolicy):
 
 def make_context_wrapper(policy: ContextPolicy):
     """Window video with full-timeline or synchronized windowed audio context."""
+    handoff_log = f"handoff={policy.handoff}" + (f" lead={policy.lead:g}" if policy.handoff == "lead" else "")
+
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
@@ -405,7 +458,7 @@ def make_context_wrapper(policy: ContextPolicy):
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
-                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                      phase=0, blend=policy.blend, audio_t=audio_t), handoff_log, flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -459,14 +512,15 @@ def make_context_wrapper(policy: ContextPolicy):
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None), handoff_log,
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        writes, reads = _video_fusion_spans(plan, ranges, total_t, policy.handoff)
+        for i, (index, v0, v1, _, _, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -490,6 +544,9 @@ def make_context_wrapper(policy: ContextPolicy):
             # slice to the window span to bound cross-beat audio visibility.
             local_audio = audio_x if (in_a0 == 0 and in_a1 == audio_t) else audio_x[..., in_a0:in_a1]
             local_x = [video_x[:, :, v0:v1], local_audio]
+            if reads[i] and policy.lead < 1.0:
+                local_x[0], local_kwargs["denoise_mask"] = _lead_context(
+                    local_x[0], local_kwargs["denoise_mask"], video_acc, reads[i], v0, timestep, policy.lead)
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
@@ -504,12 +561,17 @@ def make_context_wrapper(policy: ContextPolicy):
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
 
-            vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
-                               ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+            if policy.handoff == "off":
+                vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
+                                   ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
+            for w0, w1 in writes[i]:
                 keep = slice(w0 - v0, w1 - v0)
-                video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
-                video_den[:, :, w0:w1].add_(vw[:, :, keep])
+                if policy.handoff == "off":
+                    video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
+                    video_den[:, :, w0:w1].add_(vw[:, :, keep])
+                else:
+                    video_acc[:, :, w0:w1].copy_(v_out[:, :, keep])
+                    video_den[:, :, w0:w1] = 1
 
             write_a0, write_a1 = a0, a1
             if owned:

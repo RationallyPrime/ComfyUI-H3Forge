@@ -7,7 +7,7 @@ import torch
 from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
-from .context import AUDIO_CONTEXT_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
+from .context import AUDIO_CONTEXT_MODES, HANDOFF_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
 from . import renoise
@@ -337,11 +337,19 @@ def _context_optional_inputs():
                     "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
+            "handoff": (list(HANDOFF_MODES), {
+                "default": "off",
+                "tooltip": "Video overlap owner. Earlier or later selects that window. Lead also gives the "
+                           "following window a cleaner view of the earlier window's prediction.",
+            }),
+            "lead": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
+                               "tooltip": "Fraction of overlap noise retained in lead mode. Zero feeds the "
+                                          "clean estimate. One keeps the original noisy input."}),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", handoff="off", lead=0.5):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +360,7 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context, handoff=handoff, lead=lead)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +391,9 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto", handoff="off", lead=0.5):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context, handoff, lead),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +446,7 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto", handoff="off", lead=0.5):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +477,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
+                                   audio_context, handoff, lead)
         return (patched, latent)
 
 
