@@ -167,6 +167,14 @@ def clone_window_layout(
 
     if position_mode != "global":
         shift = window_position_shift(full_layout, v0, v1, position_mode)
+        # A tail audio slice can start a few ticks before its video window. Drop
+        # whole cycles from the shift until no target row lands before the
+        # origin, where the text/reference prefix lives.
+        origin = float(full_layout.position_ids[src.video_start, 0])
+        earliest = float(min(local.position_ids[dst.video_start, 0], local.position_ids[dst.audio_start, 0]))
+        while shift > 0.0 and earliest - shift < origin - 1e-4:
+            shift -= CYCLE_TIME_SPAN
+        shift = max(shift, 0.0)
         if shift != 0.0:
             local.position_ids[dst.video_start:dst.video_stop, 0] -= shift
             local.position_ids[dst.audio_start:dst.audio_stop, 0] -= shift

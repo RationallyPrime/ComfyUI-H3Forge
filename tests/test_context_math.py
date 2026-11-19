@@ -809,3 +809,28 @@ def test_context_policy_validates_position_mode_and_full_audio_conflict():
     for mode in ("rebased", "wrapped"):
         with pytest.raises(ValueError, match="audio_context='full'"):
             ContextPolicy(position_mode=mode, audio_context="full")
+
+
+def test_rebased_tail_audio_slice_never_moves_before_the_origin(monkeypatch):
+    import fake_minimax
+    from h3forge.layout import clone_window_layout, target_segments
+
+    fake_minimax.install(monkeypatch)
+    from comfy.ldm.minimax.model import PackedLayout
+
+    total, window, audio_t, a_len = 202, 85, 1142, 484
+    full = PackedLayout(12, total, 4, 4, audio_t)
+    seg = target_segments(full)
+    origin = float(full.position_ids[seg.video_start, 0])
+    v0 = total - window
+    for a0 in (audio_t - a_len, audio_t - a_len - 40):
+        local = clone_window_layout(full_layout=full, text_len=12, video_shape=(window, 4, 4), audio_t=audio_t,
+                                    video_range=(v0, total), audio_range=(a0, a0 + a_len), position_mode="rebased")
+        dst = target_segments(local)
+        video = local.position_ids[dst.video_start:dst.video_stop, 0]
+        audio = local.position_ids[dst.audio_start:dst.audio_stop, 0]
+        assert float(min(video.min(), audio.min())) >= origin - 1e-4
+        # Video and audio still move together.
+        shift_v = float(full.position_ids[seg.video_start + v0 * full.frame_rows, 0] - video[0])
+        shift_a = float(full.position_ids[seg.audio_start + a0, 0] - audio[0])
+        assert shift_v == pytest.approx(shift_a, abs=1e-3)
