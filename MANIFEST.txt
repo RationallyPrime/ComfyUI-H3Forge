@@ -9,6 +9,7 @@
 ./docs/audit-repairs-validation.json
 ./h3forge/__init__.py
 ./h3forge/attention.py
+./h3forge/consensus.py
 ./h3forge/context.py
 ./h3forge/control.py
 ./h3forge/layout.py

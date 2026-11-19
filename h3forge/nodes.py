@@ -337,11 +337,22 @@ def _context_optional_inputs():
                     "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
+            "consensus": ("BOOLEAN", {"default": ContextPolicy.consensus,
+                                      "tooltip": "Re-predict video windows that disagree in an overlap."}),
+            "consensus_threshold": ("FLOAT", {"default": ContextPolicy.consensus_threshold, "min": 0.0,
+                                              "step": 0.01, "tooltip": "Minimum relative velocity disagreement."}),
+            "consensus_lead": ("FLOAT", {"default": ContextPolicy.consensus_lead, "min": 0.0, "max": 1.0,
+                                         "step": 0.01, "tooltip": "Fraction of row sigma used for overlap context."}),
+            "consensus_until": ("FLOAT", {"default": ContextPolicy.consensus_until, "min": 0.0, "max": 1.0,
+                                          "step": 0.01, "tooltip": "Only exchange context above this video sigma."}),
+            "consensus_max_fraction": ("FLOAT", {"default": ContextPolicy.consensus_max_fraction,
+                                                 "min": 0.0, "max": 1.0, "step": 0.01,
+                                                 "tooltip": "Maximum extra calls per pass-one call in this sample."}),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", **consensus_options):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +363,7 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context, **consensus_options)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +394,9 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto", **consensus_options):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context, **consensus_options),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +449,7 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto", **consensus_options):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +480,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
+                                   audio_context, **consensus_options)
         return (patched, latent)
 
 

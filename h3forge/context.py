@@ -6,10 +6,11 @@ from itertools import pairwise
 
 import torch
 
+from .consensus import ConsensusCalls, ConsensusStep, sampler_calls
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -27,7 +28,18 @@ class ContextPolicy:
     freenoise: bool = True
     audio_context: str = "auto"
 
+    consensus: bool = False
+    consensus_threshold: float = 0.15
+    consensus_lead: float = 0.6
+    consensus_until: float = 0.5
+    consensus_max_fraction: float = 0.4
+
     def __post_init__(self):
+        if not math.isfinite(self.consensus_threshold) or self.consensus_threshold < 0:
+            raise ValueError("consensus_threshold must be finite and nonnegative")
+        for name in ("consensus_lead", "consensus_until", "consensus_max_fraction"):
+            if not 0 <= getattr(self, name) <= 1:
+                raise ValueError(f"{name} must be in [0, 1]")
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
@@ -384,6 +396,15 @@ def make_freenoise_wrapper(policy: ContextPolicy):
                 noise = torch.cat([part.reshape(part.shape[0], 1, -1) for part in parts], dim=-1)
                 print(f"{LOG} freenoise video_latents={video_t} window={window} starts={starts} seed={seed}",
                       flush=True)
+        if policy.consensus:
+            calls = ConsensusCalls()
+            token = sampler_calls.set(calls)
+            try:
+                result = executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
+                print(f"{LOG} consensus run pass1={calls.first} pass2={calls.second}", flush=True)
+                return result
+            finally:
+                sampler_calls.reset(token)
         return executor(guider, sigmas, extra_args, callback, noise, *args, **kwargs)
 
     return wrapper
@@ -399,10 +420,18 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options) if policy.consensus else None
+        step, _ = resolve_step(transformer_options, sigma)
+        calls = (sampler_calls.get() or ConsensusCalls()) if policy.consensus else None
+        if step == 0:
+            print(f"{LOG} consensus={'on' if policy.consensus else 'off'} threshold={policy.consensus_threshold} "
+                  f"lead={policy.consensus_lead} until={policy.consensus_until} "
+                  f"max_fraction={policy.consensus_max_fraction}", flush=True)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
+            if calls is not None:
+                calls.first += 1
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
                       phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
@@ -466,7 +495,16 @@ def make_context_wrapper(policy: ContextPolicy):
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        writes = [_subtract_intervals(w0, w1, [ranges[b] for b in excluded])
+                  for _, _, _, w0, w1, _, excluded in plan]
+        consensus = None
+        if calls is not None:
+            calls.first += len(plan)
+            if sigma is not None and sigma > policy.consensus_until and policy.consensus_max_fraction > 0:
+                consensus = ConsensusStep(writes)
+
+        def predict(i, video=None, mask=None):
+            index, v0, v1 = plan[i][:3]
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -489,13 +527,15 @@ def make_context_wrapper(policy: ContextPolicy):
             # multiple windows so later windows hear earlier lines; otherwise
             # slice to the window span to bound cross-beat audio visibility.
             local_audio = audio_x if (in_a0 == 0 and in_a1 == audio_t) else audio_x[..., in_a0:in_a1]
-            local_x = [video_x[:, :, v0:v1], local_audio]
+            if video is not None:
+                local_kwargs["denoise_mask"] = mask
+            local_x = [video_x[:, :, v0:v1] if video is None else video, local_audio]
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
             try:
                 with control_window(executor, video_x.shape, (v0, v1), timestep, transformer_options):
-                    v_out, a_out = executor(local_x, timestep, local_context, transformer_options, **local_kwargs)
+                    output = executor(local_x, timestep, local_context, transformer_options, **local_kwargs)
             except Exception as exc:
                 raise RuntimeError(f"{LOG} window [{v0},{v1}) prompt {index + 1} failed: {exc}") from exc
             finally:
@@ -504,9 +544,15 @@ def make_context_wrapper(policy: ContextPolicy):
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
 
+            return output, a0, a1, in_a0
+
+        for i, (index, v0, v1, _, _, owned, excluded) in enumerate(plan):
+            (v_out, a_out), a0, a1, in_a0 = predict(i)
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
-            for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
+            if consensus is not None:
+                consensus.record(i, v0, v_out, vw)
+            for w0, w1 in writes[i]:
                 keep = slice(w0 - v0, w1 - v0)
                 video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
                 video_den[:, :, w0:w1].add_(vw[:, :, keep])
@@ -525,7 +571,24 @@ def make_context_wrapper(policy: ContextPolicy):
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
         assert_full_coverage(video_den, audio_den)
-        return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
+        fused = video_acc / video_den.clamp_min(1e-6)
+        if consensus is not None:
+            scores = consensus.disagreements(fused)
+            flagged = []
+            for (lo, hi), d in sorted(scores):
+                if d > 0 and d >= policy.consensus_threshold:
+                    if flagged and lo <= flagged[-1][1]:
+                        flagged[-1] = (flagged[-1][0], max(hi, flagged[-1][1]))
+                    else:
+                        flagged.append((lo, hi))
+            available = math.floor(policy.consensus_max_fraction * calls.first) - calls.second
+            if flagged and available:
+                calls.second += consensus.repredict(plan, flagged, available, video_x, kwargs.get("denoise_mask"),
+                                                    fused, sigma, policy.consensus_lead, predict, video_den)
+            values = ",".join(f"[{lo},{hi})={d:.5g}" for (lo, hi), d in scores)
+            print(f"{LOG} consensus step={step} sigma={sigma:.5g} d={values or 'none'} "
+                  f"pass1={calls.first} pass2={calls.second}", flush=True)
+        return [fused.to(video_x.dtype),
                 (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
     return wrapper
