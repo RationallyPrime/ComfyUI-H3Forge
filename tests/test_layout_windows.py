@@ -187,3 +187,63 @@ def test_audio_window_length_is_constant_across_all_starts(monkeypatch, total, w
     for bad in (0, -1, total + 1):
         with pytest.raises(ValueError, match="video_window"):
             audio_window_length(full, bad)
+
+
+@pytest.mark.parametrize(
+    "keyframes,refs",
+    [
+        pytest.param(None, None, id="t2va"),
+        pytest.param(keyframe_descriptors(1), None, id="i2va"),
+        pytest.param(None, reference_descriptors(2), id="ref2va"),
+        pytest.param(keyframe_descriptors(1), reference_descriptors(2), id="keyframes-plus-refs"),
+    ],
+)
+@pytest.mark.parametrize("anchors", [(5,), (5, 15)], ids=["one-extra", "two-extra"])
+def test_clone_window_layout_transplants_extra_neighbour_keyframes(monkeypatch, keyframes, refs, anchors):
+    fake_minimax.install(monkeypatch)
+    from h3forge.layout import audio_range_for_video_window, clone_window_layout, target_segments
+
+    full = PackedLayout(12, 20, 4, 4, 114, keyframes=keyframes, refs=refs)
+    v0, v1 = 5, 16
+    a0, a1 = audio_range_for_video_window(full, v0, v1)
+    extra = [
+        ({"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 4, 4)}, anchor)
+        for anchor in anchors
+    ]
+    # Deliberately use a different local text_len to verify global coordinate transplant.
+    local = clone_window_layout(
+        full_layout=full, text_len=7, video_shape=(v1 - v0, 4, 4), audio_t=114,
+        video_range=(v0, v1), audio_range=(a0, a1),
+        keyframes=keyframes, refs=refs, extra_keyframes=extra,
+    )
+    src, dst = target_segments(full), target_segments(local)
+    frame_rows = full.frame_rows
+
+    # Extra cond segments sit right after text + shared keyframes and before refs/audio/video.
+    insert_at = 1 + sum(1 for s in full.segments if s[2] in ("cond", "cond_audio"))
+    for offset, anchor in enumerate(anchors):
+        la, lb, lk = local.segments[insert_at + offset]
+        assert lk == "cond" and lb - la == frame_rows
+        expected = full.position_ids[src.video_start + anchor * frame_rows:src.video_start + (anchor + 1) * frame_rows]
+        assert torch.equal(local.position_ids[la:lb], expected)
+
+    # Shared target video/audio positions remain identical to full_layout.
+    assert torch.equal(
+        local.position_ids[dst.video_start:dst.video_stop],
+        full.position_ids[src.video_start + v0 * frame_rows:src.video_start + v1 * frame_rows],
+    )
+    # Without extra_keyframes, mismatched prefix structure still fails loudly.
+    with pytest.raises(ValueError, match="reference structure differs"):
+        clone_window_layout(
+            full_layout=full, text_len=7, video_shape=(v1 - v0, 4, 4), audio_t=114,
+            video_range=(v0, v1), audio_range=(a0, a1),
+            keyframes=list(keyframes or ()) + [extra[0][0]], refs=refs,
+        )
+    # Out-of-range anchor is rejected.
+    with pytest.raises(ValueError, match="out of range"):
+        clone_window_layout(
+            full_layout=full, text_len=7, video_shape=(v1 - v0, 4, 4), audio_t=114,
+            video_range=(v0, v1), audio_range=(a0, a1),
+            keyframes=keyframes, refs=refs,
+            extra_keyframes=[({"resolved_frame_index": 0, "latent": torch.zeros(1, 24, 1, 4, 4)}, 20)],
+        )

@@ -710,3 +710,371 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+def test_context_policy_validates_neighbour_keyframe_options():
+    for mode in ("off", "first", "both"):
+        policy = ContextPolicy(neighbour_keyframe=mode, neighbour_keyframe_until=0.3)
+        assert policy.neighbour_keyframe == mode
+        assert policy.neighbour_keyframe_until == 0.3
+    assert ContextPolicy().neighbour_keyframe == "off"
+    with pytest.raises(ValueError, match="neighbour_keyframe"):
+        ContextPolicy(neighbour_keyframe="last")
+    for bad in (-0.1, 1.1, float("nan"), True):
+        with pytest.raises(ValueError, match="neighbour_keyframe_until"):
+            ContextPolicy(neighbour_keyframe_until=bad)
+
+
+def test_neighbour_keyframe_off_is_bit_identical_to_main(monkeypatch, capsys):
+    import fake_minimax
+    from types import SimpleNamespace
+
+    fake_minimax.install(monkeypatch)
+    total_t, window, overlap, audio_t = 67, 25, 8, 377
+    gen = torch.Generator().manual_seed(123)
+    video = torch.randn(1, 4, total_t, 4, 4, generator=gen)
+    audio = torch.randn(1, 2, 2, audio_t, generator=gen)
+    context = torch.randn(1, 6, 8, generator=gen)
+    sigmas = torch.tensor([1.0, 0.7, 0.2, 0.0])
+
+    def run_policy(policy):
+        calls = []
+
+        class Executor:
+            class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+            def __call__(self, local_x, timestep, local_ctx, opts, **kwargs):
+                pl = kwargs["minimax_payload"]
+                calls.append((
+                    pl["layout"]._h3forge_video_offset,
+                    pl.get("keyframes"),
+                    pl.get("cond_video_latents"),
+                    pl.get("visual_cond_noise_aug"),
+                ))
+                # Deterministic window-dependent velocity prediction.
+                offset = pl["layout"]._h3forge_video_offset
+                v_pred = local_x[0] * 0.5 + float(offset) * 0.01
+                a_pred = local_x[1] * 0.25
+                return [v_pred, a_pred]
+
+        wrapper = make_context_wrapper(policy)
+        outs = []
+        for s in (1.0, 0.7, 0.2):
+            opts = {"sample_sigmas": sigmas, "sigmas": torch.tensor([s])}
+            outs.append(wrapper(Executor(), [video, audio], torch.tensor([s * 1000.0]), context, opts))
+        return outs, calls
+
+    default_outs, default_calls = run_policy(ContextPolicy(window, overlap, True, "pyramid"))
+    off_outs, off_calls = run_policy(
+        ContextPolicy(window, overlap, True, "pyramid", neighbour_keyframe="off", neighbour_keyframe_until=0.3)
+    )
+    for (dv, da), (ov, oa) in zip(default_outs, off_outs):
+        assert torch.equal(dv, ov)
+        assert torch.equal(da, oa)
+    assert default_calls == off_calls
+    assert all(kf is None and cl is None and aug is None for _, kf, cl, aug in off_calls)
+
+    # Compare step 0 directly against manual main-style overlap-add reference.
+    ref_starts = window_starts(total_t, window, overlap, 0, max_stagger_phase(window, overlap))
+    ref_acc = torch.zeros_like(video)
+    ref_den = torch.zeros(1, 1, total_t, 1, 1)
+    for v0 in ref_starts:
+        v1 = v0 + window
+        v_pred = video[:, :, v0:v1] * 0.5 + float(v0) * 0.01
+        w = blend_weights(window, overlap, device=video.device, dtype=torch.float32, mode="pyramid",
+                          ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
+        ref_acc[:, :, v0:v1] += v_pred * w
+        ref_den[:, :, v0:v1] += w
+    assert torch.equal(off_outs[0][0], ref_acc / ref_den.clamp_min(1e-6))
+    assert "[H3Forge] neighbour_keyframe=off" in capsys.readouterr().out
+
+
+def test_neighbour_keyframe_first_passes_previous_window_x0_and_cadence_stagger(monkeypatch, capsys):
+    import fake_minimax
+    from types import SimpleNamespace
+    from h3forge.context import neighbour_keyframe_noise_aug
+    from h3forge.layout import target_segments
+
+    fake_minimax.install(monkeypatch)
+    # Real baseline geometry: 202 latents (5*40+2), window 85, overlap 21 -> starts [0, 60, 117].
+    total_t, window, overlap, audio_t = 202, 85, 21, 1140
+    gen = torch.Generator().manual_seed(7)
+    video = torch.randn(1, 4, total_t, 4, 4, generator=gen)
+    audio = torch.randn(1, 2, 2, audio_t, generator=gen)
+    context = torch.randn(1, 6, 8, generator=gen)
+    sigmas = torch.tensor([0.9, 0.5, 0.2, 0.0])
+
+    existing_ref = {"kind": "image", "latent_h": 4, "latent_w": 4, "latent": torch.full((1, 4, 1, 4, 4), 9.0)}
+    base_payload = {"refs": [existing_ref], "cond_video_latents": [existing_ref["latent"]]}
+
+    seen = []
+
+    class Executor:
+        class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+        def __call__(self, local_x, timestep, local_ctx, opts, **kwargs):
+            pl = kwargs["minimax_payload"]
+            layout = pl["layout"]
+            v0 = layout._h3forge_video_offset
+            # Window-specific velocity so each window produces a distinct x0 estimate.
+            v_pred = torch.full_like(local_x[0], float(len(seen) + 1))
+            seen.append((v0, pl, v_pred.clone()))
+            return [v_pred, local_x[1].clone()]
+
+    policy = ContextPolicy(window, overlap, True, "pyramid", neighbour_keyframe="first", neighbour_keyframe_until=0.3)
+    wrapper = make_context_wrapper(policy)
+
+    # Step 0 (sigma=0.9 >= 0.3): active.
+    opts0 = {"sample_sigmas": sigmas, "sigmas": torch.tensor([0.9])}
+    out_v, out_a = wrapper(Executor(), [video, audio], torch.tensor([900.0]), context, opts0,
+                           minimax_payload=base_payload)
+
+    # Audio fusion is untouched (executor returned local_x[1], weighted mean equals audio).
+    assert torch.allclose(out_a, audio)
+    # Original payload was not mutated.
+    assert "keyframes" not in base_payload
+    assert len(base_payload["cond_video_latents"]) == 1
+    assert "visual_cond_noise_aug" not in base_payload
+
+    assert [v0 for v0, _, _ in seen] == [0, 60, 117]
+    # Window 0: no neighbour keyframe added.
+    assert seen[0][1].get("keyframes") is None
+    assert len(seen[0][1]["cond_video_latents"]) == 1
+
+    # Window 1 ([60, 145)): gets window 0's x0 at global latent 60 (on cadence, v0 itself).
+    pl1 = seen[1][1]
+    expected_x0_60 = video[:, :, 60:61].float() - 0.9 * seen[0][2][:, :, 60:61].float()
+    assert len(pl1["keyframes"]) == 1
+    assert pl1["keyframes"][0]["resolved_frame_index"] == (60 // 5) * 17
+    assert torch.allclose(pl1["keyframes"][0]["latent"], expected_x0_60)
+    # cond_video_latents order: [neighbour_kf, existing_ref] matching PackedLayout!
+    assert len(pl1["cond_video_latents"]) == 2
+    assert torch.equal(pl1["cond_video_latents"][0], pl1["keyframes"][0]["latent"])
+    assert torch.equal(pl1["cond_video_latents"][1], existing_ref["latent"])
+    assert pl1["visual_cond_noise_aug"] == pytest.approx(neighbour_keyframe_noise_aug(0.9))
+    # Layout cond segment sits at global latent 60's exact RoPE coordinates.
+    layout1 = pl1["layout"]
+    cond_seg1 = next(s for s in layout1.segments if s[2] == "cond")
+    v_seg1 = target_segments(layout1)
+    assert torch.equal(
+        layout1.position_ids[cond_seg1[0]:cond_seg1[1]],
+        layout1.position_ids[v_seg1.video_start:v_seg1.video_start + layout1.frame_rows],
+    )
+
+    # Window 2 ([117, 202)): final start 117 is off-cadence, so anchor picks first cadence-0
+    # latent in overlap [117, 145) -> latent 120 (rel index 60 in window 1, rel index 3 in window 2).
+    pl2 = seen[2][1]
+    expected_x0_120 = video[:, :, 120:121].float() - 0.9 * seen[1][2][:, :, 60:61].float()
+    assert len(pl2["keyframes"]) == 1
+    assert pl2["keyframes"][0]["resolved_frame_index"] == (120 // 5) * 17
+    assert torch.allclose(pl2["keyframes"][0]["latent"], expected_x0_120)
+    layout2 = pl2["layout"]
+    cond_seg2 = next(s for s in layout2.segments if s[2] == "cond")
+    v_seg2 = target_segments(layout2)
+    fr = layout2.frame_rows
+    assert torch.equal(
+        layout2.position_ids[cond_seg2[0]:cond_seg2[1]],
+        layout2.position_ids[v_seg2.video_start + 3 * fr:v_seg2.video_start + 4 * fr],
+    )
+
+    # Step 0 log line confirms option, cadence-restricted stagger, aug, and anchors.
+    log = capsys.readouterr().out
+    assert "[H3Forge] neighbour_keyframe=first" in log
+    assert "until=0.30" in log and "active=yes" in log
+    assert "stagger=cadence_multiples(step=5,max_phase=20)" in log
+    assert "first_anchors=[60, 120]" in log
+
+    # Step 2 (sigma=0.2 < 0.3): below until threshold -> no neighbour keyframes injected.
+    seen.clear()
+    opts_low = {"sample_sigmas": sigmas, "sigmas": torch.tensor([0.2])}
+    wrapper(Executor(), [video, audio], torch.tensor([200.0]), context, opts_low, minimax_payload=base_payload)
+    assert all(pl.get("keyframes") is None for _, pl, _ in seen)
+    assert all(len(pl["cond_video_latents"]) == 1 for _, pl, _ in seen)
+
+
+def test_neighbour_keyframe_both_uses_previous_step_cache_and_resets_between_runs(monkeypatch):
+    import fake_minimax
+    from types import SimpleNamespace
+
+    fake_minimax.install(monkeypatch)
+    total_t, window, overlap, audio_t = 202, 85, 21, 1140
+    video = torch.zeros(1, 4, total_t, 4, 4)
+    audio = torch.zeros(1, 2, 2, audio_t)
+    context = torch.zeros(1, 6, 8)
+    sigmas = torch.tensor([1.0, 0.6, 0.2, 0.0])
+
+    step_tag = [1]
+    seen = []
+
+    class Executor:
+        class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+        def __call__(self, local_x, timestep, local_ctx, opts, **kwargs):
+            pl = kwargs["minimax_payload"]
+            v0 = pl["layout"]._h3forge_video_offset
+            # Encode (step_tag, window_start) directly into velocity so x0 = -sigma * v is unique.
+            val = float(step_tag[0] * 1000 + v0)
+            v_pred = torch.full_like(local_x[0], val)
+            seen.append((v0, pl.get("keyframes") or []))
+            return [v_pred, local_x[1]]
+
+    policy = ContextPolicy(window, overlap, True, "pyramid", neighbour_keyframe="both", neighbour_keyframe_until=0.3)
+    wrapper = make_context_wrapper(policy)
+
+    # Step 0 (sigma=1.0): no prior step, so only forward (first) keyframes on windows 1 and 2.
+    wrapper(Executor(), [video, audio], torch.tensor([1000.0]), context,
+            {"sample_sigmas": sigmas, "sigmas": torch.tensor([1.0])})
+    assert [len(kfs) for _, kfs in seen] == [0, 1, 1]
+
+    # Step 1 (sigma=0.6): window 0 gets trailing keyframe from step 0 window 1 (anchor 80);
+    # window 1 gets BOTH leading (step 1 window 0, anchor 60) and trailing (step 0 window 2, anchor 140);
+    # window 2 gets leading (step 1 window 1, anchor 120).
+    seen.clear()
+    step_tag[0] = 2
+    wrapper(Executor(), [video, audio], torch.tensor([600.0]), context,
+            {"sample_sigmas": sigmas, "sigmas": torch.tensor([0.6])})
+    assert [len(kfs) for _, kfs in seen] == [1, 2, 1]
+    # Window 0 trailing keyframe: anchor 80 from step 0 window 1 (val=1060, sigma=1.0 -> x0=-1060).
+    assert seen[0][1][0]["resolved_frame_index"] == (80 // 5) * 17
+    assert torch.allclose(seen[0][1][0]["latent"], torch.full((1, 4, 1, 4, 4), -1060.0))
+    # Window 1 leading: anchor 60 from step 1 window 0 (val=2000, sigma=0.6 -> x0=-1200).
+    # Window 1 trailing: anchor 140 from step 0 window 2 (val=1117, sigma=1.0 -> x0=-1117).
+    assert [kf["resolved_frame_index"] for kf in seen[1][1]] == [(60 // 5) * 17, (140 // 5) * 17]
+    assert torch.allclose(seen[1][1][0]["latent"], torch.full((1, 4, 1, 4, 4), -1200.0))
+    assert torch.allclose(seen[1][1][1]["latent"], torch.full((1, 4, 1, 4, 4), -1117.0))
+    # Window 2 leading: anchor 120 from step 1 window 1 (val=2060, sigma=0.6 -> x0=-1236).
+    assert seen[2][1][0]["resolved_frame_index"] == (120 // 5) * 17
+    assert torch.allclose(seen[2][1][0]["latent"], torch.full((1, 4, 1, 4, 4), -1236.0))
+
+    # Starting a new run (step 0 again) clears the previous-step cache.
+    seen.clear()
+    step_tag[0] = 3
+    wrapper(Executor(), [video, audio], torch.tensor([1000.0]), context,
+            {"sample_sigmas": sigmas, "sigmas": torch.tensor([1.0])})
+    assert [len(kfs) for _, kfs in seen] == [0, 1, 1]
+
+
+def test_cadence_only_stagger_keeps_interior_starts_on_5_latent_grid():
+    for total, window, overlap in [(202, 85, 21), (252, 85, 25), (322, 95, 15)]:
+        mp = max_stagger_phase(window, overlap, cadence_only=True)
+        assert mp % 5 == 0
+        for step in range(30):
+            phase = stagger_phase(step, window, overlap, cadence_only=True)
+            assert phase % 5 == 0 and 0 <= phase <= mp
+            starts = window_starts(total, window, overlap, phase, mp, cadence_only=True)
+            # Every non-final start is strictly on H3's 5-latent cadence.
+            assert all(s % 5 == 0 for s in starts[:-1])
+
+
+def test_neighbour_keyframe_freenoise_uses_cadence_starts_and_both_survives_stagger_shift(monkeypatch, capsys):
+    import fake_minimax
+    from types import SimpleNamespace
+    from h3forge.context import make_freenoise_wrapper
+
+    fake_minimax.install(monkeypatch)
+    # 202 / 85 / 21: default stagger picks off-cadence anchor [0, 58, 117];
+    # neighbour_keyframe restricts FreeNoise to cadence-aligned [0, 60, 117].
+    shapes = [(1, 2, 202, 2, 2), (1, 2, 2, 20)]
+    guider = SimpleNamespace(inner_model=SimpleNamespace(latent_shapes=shapes))
+    packed = torch.randn(1, 1, 2 * 202 * 4 + 2 * 2 * 20)
+    make_freenoise_wrapper(ContextPolicy(85, 21, True, "pyramid", neighbour_keyframe="first"))(
+        lambda *args, **kwargs: args[-1], guider, None, {"seed": 42}, None, packed
+    )
+    assert "starts=[0, 60, 117]" in capsys.readouterr().out
+
+    # 252 / 85 / 25: cadence-restricted stagger moves interior starts across steps
+    # (step 0 -> [0, 55, 110, 167], step 1 -> [0, 60, 120, 167]); mode `both` must
+    # still supply valid trailing keyframes from the previous-step cache.
+    total_t, window, overlap, audio_t = 252, 85, 25, 1422
+    video = torch.zeros(1, 4, total_t, 4, 4)
+    audio = torch.zeros(1, 2, 2, audio_t)
+    context = torch.zeros(1, 6, 8)
+    sigmas = torch.tensor([1.0, 0.7, 0.4, 0.0])
+    seen = []
+
+    class Executor:
+        class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+        def __call__(self, local_x, timestep, local_ctx, opts, **kwargs):
+            pl = kwargs["minimax_payload"]
+            seen.append((pl["layout"]._h3forge_video_offset, [kf["resolved_frame_index"] for kf in pl.get("keyframes") or []]))
+            return [torch.ones_like(local_x[0]), local_x[1]]
+
+    wrapper = make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", neighbour_keyframe="both", neighbour_keyframe_until=0.3)
+    )
+    wrapper(Executor(), [video, audio], torch.tensor([1000.0]), context,
+            {"sample_sigmas": sigmas, "sigmas": torch.tensor([1.0])})
+    seen.clear()
+    wrapper(Executor(), [video, audio], torch.tensor([700.0]), context,
+            {"sample_sigmas": sigmas, "sigmas": torch.tensor([0.7])})
+    assert [v0 for v0, _ in seen] == [0, 60, 120, 167]
+    # Window 0 has 1 trailing, windows 1 & 2 have leading + trailing, window 3 has 1 leading.
+    assert [len(frames) for _, frames in seen] == [1, 2, 2, 1]
+    assert all(frames[0] < frames[1] for _, frames in seen if len(frames) == 2)
+
+
+def test_neighbour_keyframe_packs_against_real_comfy_core():
+    import math
+    import torch.nn as nn
+    from core_source import definitions
+
+    env = definitions(
+        "comfy/ldm/minimax/model.py",
+        [
+            "_axis_from_sqrt_area",
+            "_frame_grid",
+            "_video_t_spans",
+            "_video_t_grid",
+            "_ref_t_span",
+            "_audio_grid",
+            "_video_grid",
+            "PackedLayout",
+            "patchify_video",
+        ],
+        {"torch": torch, "nn": nn, "math": math, "FRAME_PER_TOKEN": (1, 4, 4, 4, 4), "FRAME_RESCALE": 5.0 / 3.0},
+    )
+    PackedLayout = env["PackedLayout"]
+    patchify_video = env["patchify_video"]
+
+    # Build a full layout and clone a window with one neighbour keyframe using real PackedLayout.
+    import sys
+    import types
+    from h3forge.layout import clone_window_layout
+    from h3forge.context import _inject_neighbour_keyframes, _latent_pixel_frame
+
+    mod = types.ModuleType("comfy.ldm.minimax.model")
+    mod.PackedLayout = PackedLayout
+    mod._video_t_spans = env["_video_t_spans"]
+    old = {k: sys.modules.get(k) for k in ("comfy", "comfy.ldm", "comfy.ldm.minimax", "comfy.ldm.minimax.model")}
+    try:
+        sys.modules["comfy.ldm.minimax.model"] = mod
+        full = PackedLayout(8, 202, 4, 4, 1140)
+        kf_latent = torch.randn(1, 24, 1, 4, 4)
+        extra = [({"resolved_frame_index": _latent_pixel_frame(60), "latent": kf_latent}, 60)]
+        local = clone_window_layout(
+            full_layout=full, text_len=8, video_shape=(85, 4, 4), audio_t=1140,
+            video_range=(60, 145), audio_range=(0, 1140), extra_keyframes=extra,
+        )
+        local_payload = _inject_neighbour_keyframes({}, extra, sigma=0.8)
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    # Verify real PackedLayout's img_update / cond_video_latents row counts match _embed_and_pack.
+    cond_rows = patchify_video(local_payload["cond_video_latents"][0].to(torch.float32), (1, 2, 2))
+    video_rows = patchify_video(torch.zeros(1, 24, 85, 4, 4), (1, 2, 2))
+    assert int((~local.img_update).sum()) == cond_rows.shape[0]
+    assert int(local.img_update.sum()) == video_rows.shape[0]
+    # And the cond row's RoPE coordinates equal target video frame 0's (global latent 60) coordinates!
+    cond_seg = next(s for s in local.segments if s[2] == "cond")
+    vid_seg = next(s for s in local.segments if s[2] == "video")
+    frame_rows = cond_seg[1] - cond_seg[0]
+    assert torch.equal(
+        local.position_ids[cond_seg[0]:cond_seg[1]],
+        local.position_ids[vid_seg[0]:vid_seg[0] + frame_rows],
+    )
+    assert 0.5 <= local_payload["visual_cond_noise_aug"] <= 0.999

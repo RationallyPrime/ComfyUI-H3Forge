@@ -447,3 +447,50 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     with pytest.raises(ValueError, match="AV latent"):
         nodes.H3ForgeTimelineContextWindows().patch(
             MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})
+
+
+def test_context_nodes_expose_and_forward_neighbour_keyframe_options(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    for cls in (nodes.H3ForgeContextWindows, nodes.H3ForgeTimelineContextWindows):
+        optional = cls.INPUT_TYPES()["optional"]
+        assert optional["neighbour_keyframe"][0] == ["off", "first", "both"]
+        assert optional["neighbour_keyframe"][1]["default"] == "off"
+        assert optional["neighbour_keyframe_until"][0] == "FLOAT"
+        assert optional["neighbour_keyframe_until"][1]["default"] == 0.3
+
+    policies = []
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy) or "ctx")
+    monkeypatch.setattr(nodes, "make_freenoise_wrapper", lambda policy: "noise")
+
+    class MinimalPatcher:
+        model = object()
+
+        def clone(self):
+            return self
+
+        def get_model_object(self, name):
+            return lambda **kwargs: {}
+
+        def add_object_patch(self, name, value):
+            pass
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            pass
+
+    nodes.H3ForgeContextWindows().patch(
+        MinimalPatcher(), 85, 21, True, "pyramid",
+        neighbour_keyframe="first", neighbour_keyframe_until=0.25,
+    )
+    video, audio = torch.zeros(1, 24, 142, 4, 4), torch.zeros(1, 32, 2, 802)
+    supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
+    nodes.H3ForgeTimelineContextWindows().patch(
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied,
+        neighbour_keyframe="both", neighbour_keyframe_until=0.4,
+    )
+    assert [(p.neighbour_keyframe, p.neighbour_keyframe_until) for p in policies] == [
+        ("first", 0.25),
+        ("both", 0.4),
+    ]
