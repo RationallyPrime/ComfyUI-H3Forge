@@ -442,3 +442,87 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
     assert prepared == [67] and seen[0] == 0 and seen[-1] > 0
     assert patch.control_latent_shape == tuple(x[0].shape)
     assert patch.control_stream is None
+
+
+def test_overlap_probe_measures_known_velocity_difference_without_changing_fusion(monkeypatch, tmp_path, capsys):
+    import json
+    import math
+    from dataclasses import replace
+
+    import fake_minimax
+    from safetensors.torch import load_file
+
+    fake_minimax.install(monkeypatch)
+    video = torch.arange(9, dtype=torch.bfloat16).view(1, 1, 9, 1, 1).expand(1, 2, 9, 5, 3)
+    audio = torch.arange(round(sum(fake_minimax._video_t_spans(9))), dtype=torch.bfloat16).view(1, 1, 1, -1)
+    calls = []
+
+    def predict(x, timestep, context, options, minimax_payload, **kwargs):
+        start = minimax_payload["layout"]._h3forge_video_offset
+        calls.append(start)
+        if start == 0:
+            return torch.ones_like(x[0]), x[1]
+        return (2 * (x[0] - start) + 1), x[1]
+
+    def run(policy, sigma):
+        return make_context_wrapper(policy)(_executor(predict), [video, audio], torch.tensor([1000 * sigma]),
+                                            torch.zeros(1, 3, 2), {"sigmas": torch.tensor([sigma]),
+                                                                   "sample_sigmas": torch.tensor([0.75, 0.5, 0])})
+
+    off = ContextPolicy(window_frames=6, overlap_frames=2, stagger=False)
+    baseline = run(off, 0.75)
+    expected = video.new_tensor([1, 1, 1, 1, 2, 4, 7, 9, 11]).view(1, 1, -1, 1, 1).expand_as(video)
+    assert torch.equal(baseline[0], expected) and torch.equal(baseline[1], audio)
+    directory = tmp_path / "take"
+    on = replace(off, overlap_probe=str(directory))
+    for sigma in (0.75, 0.5):
+        observed = run(on, sigma)
+        for result, original in zip(observed, baseline):
+            assert result.dtype == original.dtype and torch.equal(result.view(torch.uint8), original.view(torch.uint8))
+    assert calls == [0, 3] * 3
+    assert f"overlap_probe={str(directory)!r}" in capsys.readouterr().out
+
+    first, second = map(json.loads, (directory / "probe.jsonl").read_text().splitlines())
+    assert [first["step"], second["step"]] == [0, 1]
+    assert (first["sigma"], first["phase"], first["overlap_index"]) == (0.75, 0, 0)
+    assert first["window_starts"] == [0, 3] and first["overlap_range"] == [3, 6]
+    assert first["rel_l2"] == pytest.approx(math.sqrt(20 / 14))
+    assert first["low"] == pytest.approx(first["rel_l2"])
+    assert first["mid"] == first["high"] == 0
+    assert first["per_latent_rel_l2"] == pytest.approx([0, 1, 4 / 3])
+    assert first["rel_l2_a_fused"] == pytest.approx(math.sqrt(10 / 9.5))
+    assert first["rel_l2_b_fused"] == pytest.approx(math.sqrt(2 / 27.5))
+    assert second["sigma"] == 0.5 and "snapshot" not in second
+    assert list(directory.glob("*.safetensors")) == [directory / first["snapshot"]]
+    saved = load_file(str(directory / first["snapshot"]))
+    rows = video[:, :, 3:6].float()
+    assert set(saved) == {"x0_a", "x0_b", "x0_fused"}
+    assert torch.equal(saved["x0_a"], rows - 0.75)
+    assert torch.equal(saved["x0_b"], rows - 0.75 * (2 * (rows - 3) + 1))
+    assert torch.equal(saved["x0_fused"], rows - 0.75 * expected[:, :, 3:6].float())
+
+
+def test_overlap_probe_tracks_stagger_and_fused_velocity_with_three_contributors(monkeypatch, tmp_path):
+    import json
+
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    x = [torch.zeros(1, 1, 16, 4, 4), torch.zeros(1, 1, 1, round(sum(fake_minimax._video_t_spans(16))))]
+    wrapper = make_context_wrapper(ContextPolicy(10, 6, True, "flat", overlap_probe=str(tmp_path),
+                                                 overlap_probe_steps=""))
+
+    def predict(local_x, timestep, context, options, minimax_payload, **kwargs):
+        start = minimax_payload["layout"]._h3forge_video_offset
+        return torch.full_like(local_x[0], start + 1), local_x[1]
+
+    for sigma in (1.0, 0.5):
+        wrapper(_executor(predict), x, torch.tensor([sigma * 1000]), torch.zeros(1, 3, 4),
+                {"sample_sigmas": torch.tensor([1, 0.5, 0]), "sigmas": torch.tensor([sigma])})
+    rows = [json.loads(line) for line in (tmp_path / "probe.jsonl").read_text().splitlines()]
+    assert [(r["step"], r["phase"], r["overlap_index"], r["overlap_range"]) for r in rows] == [
+        (0, 0, 0, [3, 10]), (0, 0, 1, [6, 13]), (1, 2, 0, [4, 10]), (1, 2, 1, [6, 14])]
+    # Three windows vote 1, 4, 7 at [6,10); the returned velocity there is 4.
+    fused = torch.tensor([2.5] * 3 + [4.] * 4)
+    assert rows[0]["rel_l2_b_fused"] == pytest.approx(float((4 - fused).norm() / ((4 + fused) / 2).norm()))
+    assert not list(tmp_path.glob("*.safetensors"))

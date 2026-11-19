@@ -710,3 +710,33 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+def test_overlap_probe_spatial_bands_separate_two_texture_scales():
+    from h3forge.probe import _bands
+
+    grid = torch.arange(8)
+    fine = (-1.) ** (grid[:, None] + grid)
+    coarse = (-1.) ** (grid[:, None] // 2 + grid // 2)
+    for planes, expected in [(fine, (False, False, True)), (coarse, (False, True, False))]:
+        bands = _bands(planes.view(1, 1, 1, 8, 8))
+        assert tuple(bool(band.any()) for band in bands) == expected
+
+
+def test_probe_report_groups_moving_overlaps_and_finds_first_non_decrease(tmp_path):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    path = tmp_path / "probe.jsonl"
+    records = [dict(step=step, overlap_index=pair, overlap_range=[5 + step, 12], low=low, mid=0.5, high=0.25,
+                    rel_l2=0.75) for step, pair, low in [(2, 0, 1), (0, 0, 2), (1, 0, 1), (1, 1, 1), (0, 1, 2)]]
+    path.write_text("".join(json.dumps(row) + "\n" for row in records))
+    tool = Path(__file__).resolve().parents[1] / "tools/probe_report.py"
+    output = subprocess.check_output([sys.executable, str(tool), str(path)], text=True)
+    first, second = output.strip().split("\n\n")
+    assert first.startswith("Overlap 0") and second.startswith("Overlap 1")
+    assert [line.split()[0] for line in first.splitlines()[2:5]] == ["0", "1", "2"]
+    assert first.splitlines()[2].split()[1:5] == ["2.00000", "0.50000", "0.25000", "0.75000"]
+    assert first.endswith("stopped falling: 2") and second.endswith("stopped falling: none observed")
