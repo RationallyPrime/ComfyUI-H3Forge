@@ -21,7 +21,8 @@ class SeamState:
 
     def video(self, packed):
         # H3 packs the whole video in channel-major order, followed by audio.
-        return packed[..., :self.video_shape.numel()].view(self.video_shape)
+        sample = self.video_shape[1:]
+        return packed[..., :sample.numel()].view(packed.shape[0], *sample)
 
 
 class OverlapScores:

@@ -226,3 +226,13 @@ def test_fresh_ramp_residual_matches_the_sigma_given_to_h3():
         assert float(residual.std()) == pytest.approx(float(row_sigma), abs=.01)
         assert float(residual.mean()) == pytest.approx(0, abs=.01)
     torch.testing.assert_close(trial, fresh)
+
+
+def test_seam_state_unpacks_video_per_sample_for_a_batch():
+    from h3forge.seam_euler import SeamState
+
+    video = torch.arange(2 * 2 * 3 * 2 * 2, dtype=torch.float32).view(2, 2, 3, 2, 2)
+    packed = torch.cat([video.flatten(1), torch.full((2, 7), -1.0)], dim=1)
+    state = SeamState(video_shape=video[:1].shape)
+    assert torch.equal(state.video(packed), video)
+    assert torch.equal(SeamState(video_shape=video.shape).video(packed), video)
