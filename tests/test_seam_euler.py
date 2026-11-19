@@ -156,7 +156,7 @@ def test_fresh_noise_reproducible_and_private(monkeypatch, core_euler):
     assert torch.equal(a, b) and not torch.equal(a, c)
     assert len(calls) == 3 and not torch.equal(calls[1][1], calls[2][1])
     draws = [_fresh_noise(a, 2**64 - 1, i, j) for i, j in [(0, 0), (0, 1), (1, 0)]]
-    assert len({v.numpy().tobytes() for v in draws}) == 3
+    assert len({bytes(v.contiguous().flatten().view(torch.uint8).tolist()) for v in draws}) == 3
     assert torch.equal(before, torch.random.get_rng_state())
 
 
@@ -193,7 +193,7 @@ def test_context_fusion_matches_main_bytes(monkeypatch, enabled):
     outputs = make_context_wrapper(policy)(_executor(predict), [video, audio], None, torch.zeros(1, 1, 8),
                                            {SEAM_STATE: state})
     # Recorded from the same inputs on untouched 05792b7, video then audio.
-    assert [hashlib.sha256(t.numpy().tobytes()).hexdigest() for t in outputs] == [
+    assert [hashlib.sha256(bytes(t.contiguous().flatten().view(torch.uint8).tolist())).hexdigest() for t in outputs] == [
         "059239e9a5cebc30544ff1056f47653919e0a808589dab3ba45a86a9945a0cd0",
         "11ac54d7474f5f66e9b6551c077074a587d2f5ebbe006106be6d0d1d98e9bd7f",
     ]
