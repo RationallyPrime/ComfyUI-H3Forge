@@ -19,6 +19,7 @@ from .prompt import (
     parse_segment_durations,
     split_pipe_prompt,
 )
+from .seam_euler import sample_seam_euler
 from .state import AttentionPolicy, RuntimeState, require_eager_allocations, resolve_sigma, resolve_step
 from .timeline import (
     DEFAULT_DURATION_SECONDS,
@@ -327,6 +328,10 @@ def _context_behaviour_inputs():
 def _context_optional_inputs():
     """Optional context behavior inputs kept out of required so saved API graphs stay valid."""
     return {
+            "seam_repair": ("BOOLEAN", {
+                "default": False,
+                "tooltip": "Measure video overlap disagreement for H3Forge Seam Euler.",
+            }),
             "audio_context": (list(AUDIO_CONTEXT_MODES), {
                 "default": "auto",
                 "tooltip": (
@@ -341,7 +346,7 @@ def _context_optional_inputs():
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", seam_repair=False):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +357,7 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context, seam_repair=seam_repair)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -365,6 +370,28 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
     patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
     patched.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, CTX_KEY, make_freenoise_wrapper(policy))
     return patched
+
+
+class H3ForgeSeamEuler:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "repairs": ("INT", {"default": 0, "min": 0, "max": 4}),
+            "repair_threshold": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1000.0}),
+            "repair_until": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0}),
+            "repair_ramp": ("INT", {"default": 4, "min": 0, "max": 512}),
+            "repair_budget": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 4.0}),
+        }, "optional": {"repair_noise": (["fresh", "original"], {"default": "fresh"})}}
+
+    RETURN_TYPES = ("SAMPLER",)
+    FUNCTION = "get_sampler"
+    CATEGORY = "sampling/custom_sampling/samplers"
+    DESCRIPTION = "Euler with local video retries. Enable seam_repair on the H3Forge context node."
+
+    def get_sampler(self, **options):
+        from comfy.samplers import KSAMPLER
+
+        return (KSAMPLER(sample_seam_euler, extra_options=options),)
 
 
 class H3ForgeContextWindows:
@@ -383,9 +410,9 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto", seam_repair=False):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context, seam_repair),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +465,7 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto", seam_repair=False):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +496,7 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context, seam_repair)
         return (patched, latent)
 
 
@@ -753,6 +780,7 @@ class H3ForgeRenoiseStitch:
 
 
 NODE_CLASS_MAPPINGS = {
+    "H3ForgeSeamEuler": H3ForgeSeamEuler,
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
     "H3ForgeTimelineContextWindows": H3ForgeTimelineContextWindows,
@@ -763,6 +791,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "H3ForgeSeamEuler": "H3Forge Seam Euler",
     "H3ForgeAttention": "H3 Forge — Sliding Attention + FETA",
     "H3ForgeContextWindows": "H3 Forge — Chained A/V Context Windows",
     "H3ForgeTimelineContextWindows": "H3 Forge — Timeline Context Windows",
