@@ -442,3 +442,103 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
     assert prepared == [67] and seen[0] == 0 and seen[-1] > 0
     assert patch.control_latent_shape == tuple(x[0].shape)
     assert patch.control_stream is None
+
+
+def _handoff_inputs(monkeypatch):
+    import fake_minimax
+    fake_minimax.install(monkeypatch)
+    video = torch.arange(202 * 4, dtype=torch.float32).view(1, 1, 202, 2, 2) / 128
+    audio = torch.arange(2 * 1142, dtype=torch.float32).view(1, 1, 2, 1142) / 128
+    return [video, audio], torch.ones(1, 3, 1)
+
+
+@pytest.mark.parametrize("handoff", [{}, {"handoff": "off"}, {"handoff": "earlier"}, {"handoff": "later"}])
+def test_handoff_against_main_bytes(monkeypatch, handoff):
+    import hashlib
+    from h3forge.context import max_stagger_phase, stagger_phase, window_starts
+
+    x, text = _handoff_inputs(monkeypatch)
+    calls = []
+
+    def predict(local_x, *args, **kwargs):
+        calls.append(local_x[0])
+        return [v + len(calls) for v in local_x]
+
+    policy = ContextPolicy(85, 21, **handoff)
+    video, audio = make_context_wrapper(policy)(_executor(predict), x, torch.tensor([750.]), text,
+        {"sigmas": torch.tensor([.75]), "sample_sigmas": torch.tensor([1., .75, 0.])})
+    # Captured from this deterministic CPU forward on unchanged origin/main 05792b7.
+    assert hashlib.sha256(bytes(audio.contiguous().flatten().view(torch.uint8).tolist())).hexdigest() == (
+        "14e2314040460ac9c945b53e916aeac439b3cff1d15bee5b49b325858b28718b")
+    if policy.handoff == "off":
+        assert hashlib.sha256(bytes(video.contiguous().flatten().view(torch.uint8).tolist())).hexdigest() == (
+            "53d47776d60cfc6b6fd7e593f747a183703b6528e45bec3535e30ff06c30526f")
+    else:
+        starts = window_starts(202, 85, 21, stagger_phase(1, 85, 21), max_stagger_phase(85, 21))
+        assert len(calls) == len(starts) == 3
+        for view, start in zip(calls, starts):
+            assert torch.equal(view, x[0][:, :, start:start + 85])
+        for t in range(202):
+            visible = [i + 1 for i, start in enumerate(starts) if start <= t < start + 85]
+            owner = min(visible) if policy.handoff == "earlier" else max(visible)
+            assert torch.equal(video[:, :, t], x[0][:, :, t] + owner)
+
+
+@pytest.mark.parametrize("lead,masked,sigma", [(0., False, 1.), (.5, False, .75), (.5, True, .125), (1., True, 1.)])
+def test_lead_records_cleaner_owner_context_and_discards_reader_velocity(monkeypatch, capsys, lead, masked, sigma):
+    from h3forge.context import window_starts
+
+    x, text = _handoff_inputs(monkeypatch)
+    original = x[0].clone()
+    mask = (torch.arange(202) % 3 / 2).view(1, 1, 202, 1, 1).expand_as(original).clone() if masked else None
+    original_mask = mask.clone() if masked else torch.ones_like(original)
+    starts = window_starts(202, 85, 21)
+    calls = []
+    predictions = []
+    expected_video = torch.empty_like(original)
+
+    def predict(local_x, timestep, context, options, denoise_mask, **kwargs):
+        i = len(calls)
+        calls.append((local_x[0].clone(), denoise_mask.clone() if denoise_mask is not None else None))
+        # Owned output depends on what the model saw. Poison its discarded rows.
+        velocity = local_x[0] + local_x[0][:, :, :1] + i
+        overlap = starts[i - 1] + 85 - starts[i] if i else 0
+        velocity[:, :, :overlap] = torch.nan
+        predictions.append(velocity.clone())
+        return [velocity, local_x[1] + i + 1]
+
+    options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.])}
+    video, audio = make_context_wrapper(ContextPolicy(85, 21, False, handoff="lead", lead=lead))(
+        _executor(predict), x, torch.tensor([1000 * sigma]), text, options, denoise_mask=mask)
+    (plan_log,) = capsys.readouterr().out.splitlines()
+    assert "[H3Forge] context plan" in plan_log and f"handoff=lead lead={lead:g}" in plan_log
+    assert len(calls) == len(starts) == 3
+    for i, (seen, seen_mask) in enumerate(calls):
+        start = starts[i]
+        src = original[:, :, start:start + 85]
+        strength = original_mask[:, :, start:start + 85].clone()
+        shared = starts[i - 1] + 85 - start if i else 0
+        if shared:
+            v = predictions[i - 1][:, :, -shared:]
+            row_sigma = sigma * strength[:, :, :shared]
+            x0 = src[:, :, :shared] - row_sigma * v
+            noise = src[:, :, :shared] + (1 - row_sigma) * v
+            assert torch.equal(seen[:, :, :shared], (1 - lead * row_sigma) * x0 + lead * row_sigma * noise)
+            strength[:, :, :shared] *= lead
+        assert torch.equal(seen[:, :, shared:], src[:, :, shared:])
+        assert torch.equal(torch.ones_like(src) if seen_mask is None else seen_mask, strength)
+        expected_video[:, :, start + shared:start + 85] = predictions[i][:, :, shared:]
+    assert torch.equal(video, expected_video) and video.isfinite().all()
+    assert torch.equal(x[0], original)
+    assert not masked or torch.equal(mask, original_mask)
+    # Audio still gets the same pyramid fusion for the same per-window predictions.
+    count = 0
+
+    def control(local_x, *args, **kwargs):
+        nonlocal count
+        count += 1
+        return [local_x[0], local_x[1] + count]
+
+    _, baseline_audio = make_context_wrapper(ContextPolicy(85, 21, False))(
+        _executor(control), x, torch.tensor([1000 * sigma]), text, options, denoise_mask=mask)
+    assert torch.equal(audio, baseline_audio)

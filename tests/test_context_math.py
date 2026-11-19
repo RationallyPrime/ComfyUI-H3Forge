@@ -710,3 +710,21 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+@pytest.mark.parametrize("mode", ["earlier", "later", "lead"])
+@pytest.mark.parametrize("total,window,overlap", [(202, 85, 21), (22, 16, 14)])
+def test_handoff_has_one_unit_writer_per_latent_at_every_phase(total, window, overlap, mode):
+    from h3forge.context import _video_fusion_spans
+
+    for max_phase in (0, max_stagger_phase(window, overlap)):
+        for phase in range(max_phase + 1):
+            starts = window_starts(total, window, overlap, phase, max_phase)
+            plan = [(0, v0, v0 + window, v0, v0 + window, False, ()) for v0 in starts]
+            writes, reads = _video_fusion_spans(plan, [], total, mode)
+            for t in range(total):
+                visible = [i for i, start in enumerate(starts) if start <= t < start + window]
+                owner = visible[-1] if mode == "later" else visible[0]
+                assert [i for i, spans in enumerate(writes) for lo, hi in spans if lo <= t < hi] == [owner]
+                assert [i for i, spans in enumerate(reads) for lo, hi in spans if lo <= t < hi] == (
+                    visible[1:] if mode == "lead" else [])

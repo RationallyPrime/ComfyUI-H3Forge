@@ -101,6 +101,11 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
     timeline_optional = nodes.H3ForgeTimelineContextWindows.INPUT_TYPES()["optional"]
     assert timeline_optional["audio_context"][0] == ["auto", "window", "full"]
     assert timeline_optional["audio_context"][1]["default"] == "auto"
+    for inputs in (optional, timeline_optional):
+        assert inputs["handoff"][0] == ["off", "earlier", "later", "lead"]
+        assert inputs["handoff"][1]["default"] == "off"
+        kind, bounds = inputs["lead"]
+        assert (kind, bounds["default"], bounds["min"], bounds["max"]) == ("FLOAT", .5, 0., 1.)
 
 
 def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(monkeypatch):
@@ -125,11 +130,17 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
         def add_wrapper_with_key(self, kind, key, wrapper):
             self.wrappers.append((kind, key))
 
-    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid")
+    policies = []
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy))
+    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", handoff="later", lead=.25)
+    assert (policies[0].handoff, policies[0].lead) == ("later", .25)
     assert ("sampler_sample", nodes.CTX_KEY) in patched.wrappers
     assert ("diffusion", nodes.CTX_KEY) in patched.wrappers
     with pytest.raises(ValueError, match="segment_seams"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
+    for invalid in ({"handoff": "bad"}, {"lead": -.01}, {"lead": 1.01}):
+        with pytest.raises(ValueError, match=next(iter(invalid))):
+            nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", **invalid)
     with pytest.raises(ValueError, match="audio_context"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", audio_context="bad")
 
@@ -436,11 +447,11 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     video, audio = torch.zeros(1, 24, 142, 48, 84), torch.zeros(1, 32, 2, 802)
     supplied = {"samples": NS(tensors=[video, audio], is_nested=True)}
     _patched, latent = nodes.H3ForgeTimelineContextWindows().patch(
-        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window")
+        MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent=supplied, audio_context="window", handoff="lead", lead=.75)
     assert latent is supplied  # passed through untouched, keyframe anchors stay valid
     policy, = policies
     assert (policy.window_frames, policy.overlap_frames, policy.stagger) == (80, 13, True)
-    assert policy.audio_context == "window"
+    assert (policy.audio_context, policy.handoff, policy.lead) == ("window", "lead", .75)
     log = capsys.readouterr().out
     assert "connected latent: 481 frames" in log and "2 windows of 80/13" in log
 
