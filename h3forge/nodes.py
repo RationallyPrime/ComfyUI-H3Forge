@@ -337,11 +337,20 @@ def _context_optional_inputs():
                     "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
+            "overlap_probe": ("STRING", {
+                "default": ContextPolicy.overlap_probe,
+                "tooltip": "Directory for video overlap measurements. Empty disables the probe.",
+            }),
+            "overlap_probe_steps": ("STRING", {
+                "default": ContextPolicy.overlap_probe_steps,
+                "tooltip": "Comma-separated steps to save overlap x0 tensors. Empty saves metrics only.",
+            }),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto",
+                     overlap_probe=ContextPolicy.overlap_probe, overlap_probe_steps=ContextPolicy.overlap_probe_steps):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +361,8 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context, overlap_probe=overlap_probe,
+                               overlap_probe_steps=overlap_probe_steps)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +393,10 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto",
+              overlap_probe=ContextPolicy.overlap_probe, overlap_probe_steps=ContextPolicy.overlap_probe_steps):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context, overlap_probe, overlap_probe_steps),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +449,8 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto",
+              overlap_probe=ContextPolicy.overlap_probe, overlap_probe_steps=ContextPolicy.overlap_probe_steps):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +481,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context,
+                                   overlap_probe, overlap_probe_steps)
         return (patched, latent)
 
 

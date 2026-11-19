@@ -8,8 +8,9 @@ import torch
 
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
+from .probe import WindowOverlap, snapshot_steps, write_probe
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -26,6 +27,8 @@ class ContextPolicy:
     segment_seams: str = "blend"
     freenoise: bool = True
     audio_context: str = "auto"
+    overlap_probe: str = ""
+    overlap_probe_steps: str = "0,3,7,15,29"
 
     def __post_init__(self):
         if self.segment_seams not in SEGMENT_SEAMS:
@@ -391,6 +394,9 @@ def make_freenoise_wrapper(policy: ContextPolicy):
 
 def make_context_wrapper(policy: ContextPolicy):
     """Window video with full-timeline or synchronized windowed audio context."""
+    save_steps = snapshot_steps(policy.overlap_probe_steps) if policy.overlap_probe else set()
+    probe_log = f" overlap_probe={policy.overlap_probe!r} overlap_probe_steps={sorted(save_steps)}"
+
     def wrapper(executor, x, timestep, context, transformer_options, **kwargs):
         require_eager_allocations(executor.class_obj)
         video_x, audio_x = x
@@ -399,13 +405,14 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options) if policy.overlap_probe else None
+        step, _ = resolve_step(transformer_options, sigma)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
-                      phase=0, blend=policy.blend, audio_t=audio_t), flush=True)
+                      phase=0, blend=policy.blend, audio_t=audio_t) + probe_log, flush=True)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -459,14 +466,16 @@ def make_context_wrapper(policy: ContextPolicy):
             print(f"{LOG} context plan " + context_plan_summary(total_t, [p[1] for p in plan], window, overlap,
                   phase=phase, blend=policy.blend, stagger=stagger, max_phase=max_phase if stagger else None,
                   assignments=[p[0] for p in plan] if segmented else None, frame_cuts=frame_cuts, audio_t=audio_t,
-                  audio_window=audio_win, seams=policy.segment_seams if segmented else None),
+                  audio_window=audio_win, seams=policy.segment_seams if segmented else None) + probe_log,
                   flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
-        for index, v0, v1, write_v0, write_v1, owned, excluded in plan:
+        overlaps = [WindowOverlap((a[1], b[1]), max(a[1], b[1]), min(a[2], b[2]))
+                    for a, b in pairwise(plan)] if policy.overlap_probe else []
+        for ordinal, (index, v0, v1, write_v0, write_v1, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
@@ -504,6 +513,10 @@ def make_context_wrapper(policy: ContextPolicy):
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
 
+            if overlaps:
+                for pair in overlaps[max(0, ordinal - 1):ordinal + 1]:
+                    pair.capture(v0, v_out)
+
             vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
             for w0, w1 in _subtract_intervals(write_v0, write_v1, [ranges[b] for b in excluded]):
@@ -525,7 +538,11 @@ def make_context_wrapper(policy: ContextPolicy):
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
         assert_full_coverage(video_den, audio_den)
-        return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
-                (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
+        video = (video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype)
+        if overlaps:
+            if sigma is None and timestep is not None:
+                sigma = float(timestep.flatten()[0]) / 1000.0
+            write_probe(policy.overlap_probe, overlaps, step, sigma, phase, video_x, video, save_steps)
+        return [video, (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 
     return wrapper

@@ -14,11 +14,13 @@
 ./h3forge/layout.py
 ./h3forge/nag.py
 ./h3forge/nodes.py
+./h3forge/probe.py
 ./h3forge/prompt.py
 ./h3forge/renoise.py
 ./h3forge/state.py
 ./h3forge/timeline.py
 ./pyproject.toml
+./tools/probe_report.py
 ./tests/fake_minimax.py
 ./tests/core_source.py
 ./tests/test_audit_repairs.py
