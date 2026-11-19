@@ -442,3 +442,29 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
     assert prepared == [67] and seen[0] == 0 and seen[-1] > 0
     assert patch.control_latent_shape == tuple(x[0].shape)
     assert patch.control_stream is None
+
+
+@pytest.mark.parametrize("seams", ["blend", "exclusive"])
+def test_band_fusion_preserves_segmented_beats_and_audio(seams):
+    total, window, overlap = 427, 80, 10
+    x, context, payload = _context_inputs(total, text_lengths=(3, 19, 5))
+    payload["h3forge_prompt_segment_durations"] = (2, 18, 40)
+    options = {"sigmas": torch.tensor([0.5]), "sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
+
+    def run(local_x, timestep, text, opts, **kwargs):
+        val = float(text[0, 0, 0])
+        return [torch.full_like(local_x[0], val), torch.full_like(local_x[1], val)]
+
+    plain = make_context_wrapper(ContextPolicy(window, overlap, True, "pyramid", segment_seams=seams, band_fusion=0))(
+        _executor(run), x, torch.tensor([500.0]), context, options, minimax_payload=payload
+    )
+    banded = make_context_wrapper(
+        ContextPolicy(window, overlap, True, "pyramid", segment_seams=seams, band_fusion=3, band_crossfade=2)
+    )(_executor(run), x, torch.tensor([500.0]), context, options, minimax_payload=payload)
+
+    # Audio is strictly untouched and spatially constant video beats match plain blending.
+    assert torch.equal(banded[1], plain[1])
+    assert torch.allclose(banded[0], plain[0], atol=1e-5)
+    ranges, _ = segment_ranges(total, 3, (2, 18, 40))
+    lo, hi = ranges[0]
+    assert torch.all(banded[0][:, :, lo:hi] == 1.0)

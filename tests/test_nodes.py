@@ -447,3 +447,60 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     with pytest.raises(ValueError, match="AV latent"):
         nodes.H3ForgeTimelineContextWindows().patch(
             MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})
+
+
+def test_context_nodes_expose_and_forward_band_fusion_options(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    nodes = _import_nodes(monkeypatch)
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+
+    for cls in (nodes.H3ForgeContextWindows, nodes.H3ForgeTimelineContextWindows):
+        inputs = cls.INPUT_TYPES()
+        required, optional = inputs["required"], inputs["optional"]
+        for key in ("band_fusion", "band_crossfade", "band_adaptive", "band_stagger_hold"):
+            assert key not in required
+            assert key in optional
+        assert optional["band_fusion"][1]["default"] == 0
+        assert optional["band_crossfade"][1]["default"] == 2
+        assert optional["band_adaptive"][1]["default"] is False
+        assert optional["band_stagger_hold"][1]["default"] is True
+
+    policies = []
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy) or "ctx")
+    monkeypatch.setattr(nodes, "make_freenoise_wrapper", lambda policy: "noise")
+
+    class MinimalPatcher:
+        model = object()
+
+        def clone(self):
+            return self
+
+        def get_model_object(self, name):
+            return lambda **kwargs: {}
+
+        def add_object_patch(self, name, value):
+            pass
+
+        def add_wrapper_with_key(self, kind, key, wrapper):
+            pass
+
+    nodes.H3ForgeContextWindows().patch(
+        MinimalPatcher(), 25, 8, True, "pyramid",
+        band_fusion=3, band_crossfade=4, band_adaptive=True, band_stagger_hold=False,
+    )
+    supplied = {"samples": NS(tensors=[torch.zeros(1, 24, 142, 4, 4), torch.zeros(1, 32, 2, 802)], is_nested=True)}
+    nodes.H3ForgeTimelineContextWindows().patch(
+        MinimalPatcher(), 32, 32, 20.0, 15.5, True, "pyramid", latent=supplied,
+        band_fusion=2, band_crossfade=1, band_adaptive=True, band_stagger_hold=False,
+    )
+    assert len(policies) == 2
+    assert (policies[0].band_fusion, policies[0].band_crossfade,
+            policies[0].band_adaptive, policies[0].band_stagger_hold) == (3, 4, True, False)
+    assert (policies[1].band_fusion, policies[1].band_crossfade,
+            policies[1].band_adaptive, policies[1].band_stagger_hold) == (2, 1, True, False)
+
+    with pytest.raises(ValueError, match="band_fusion"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", band_fusion=1)
+    with pytest.raises(ValueError, match="band_crossfade"):
+        nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", band_crossfade=-1)

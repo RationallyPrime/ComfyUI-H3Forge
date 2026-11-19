@@ -337,11 +337,45 @@ def _context_optional_inputs():
                     "window: always slice audio to the window. full: always pass the full clip audio."
                 ),
             }),
+            "band_fusion": ("INT", {
+                "default": 0,
+                "min": 0,
+                "max": 6,
+                "tooltip": (
+                    "Spatial Laplacian-pyramid band-split fusion in video overlaps. 0: off (bit-identical to plain "
+                    "blending). 2 or 3: number of pyramid levels; the lowest band keeps the regular blend weights "
+                    "while higher bands switch over a narrower crossfade. Audio fusion is unchanged."
+                ),
+            }),
+            "band_crossfade": ("INT", {
+                "default": 2,
+                "min": 0,
+                "max": 64,
+                "tooltip": (
+                    "Transition width in video latents for the highest spatial band, centred on the overlap middle "
+                    "(0 is a hard switch). Only used when band_fusion >= 2."
+                ),
+            }),
+            "band_adaptive": ("BOOLEAN", {
+                "default": False,
+                "tooltip": (
+                    "Adaptively gate the narrow high-band transition by local spatial disagreement between "
+                    "overlapping windows: keep the plain blend where windows agree and narrow it where they disagree."
+                ),
+            }),
+            "band_stagger_hold": ("BOOLEAN", {
+                "default": True,
+                "tooltip": (
+                    "Hold the high-band transition centre fixed once sigma <= 0.8 when stagger is enabled, so the "
+                    "high-band owner does not alternate across steps while the low band continues to stagger."
+                ),
+            }),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto"):
+                     audio_context="auto", band_fusion=0, band_crossfade=2, band_adaptive=False,
+                     band_stagger_hold=True):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -352,7 +386,9 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context)
+                               audio_context=audio_context,
+                               band_fusion=band_fusion, band_crossfade=band_crossfade,
+                               band_adaptive=band_adaptive, band_stagger_hold=band_stagger_hold)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -383,9 +419,11 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto"):
+              segment_seams="blend", freenoise=True, audio_context="auto",
+              band_fusion=0, band_crossfade=2, band_adaptive=False, band_stagger_hold=True):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context),)
+                                 segment_seams, freenoise, audio_context,
+                                 band_fusion, band_crossfade, band_adaptive, band_stagger_hold),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -438,7 +476,8 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto"):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto",
+              band_fusion=0, band_crossfade=2, band_adaptive=False, band_stagger_hold=True):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -469,7 +508,8 @@ class H3ForgeTimelineContextWindows:
             summary = "unwindowed"
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
-        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise, audio_context)
+        patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
+                                   audio_context, band_fusion, band_crossfade, band_adaptive, band_stagger_hold)
         return (patched, latent)
 
 

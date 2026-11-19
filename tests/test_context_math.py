@@ -7,8 +7,10 @@ from h3forge.context import (
     ContextPolicy,
     assert_full_coverage,
     audio_overlap_frames,
+    band_overlap_weights,
     blend_weights,
     context_plan_summary,
+    laplacian_pyramid,
     make_context_wrapper,
     max_stagger_phase,
     ordered_halving,
@@ -710,3 +712,445 @@ def test_frames_for_latents_inverts_the_grid_and_rejects_off_grid_lengths():
     assert av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2), torch.zeros(1, 32, 2, 10)])}) == 67
     with pytest.raises(ValueError):
         av_latent_length({"samples": NS(tensors=[torch.zeros(1, 24, 67, 2, 2)])})
+
+
+def _band_test_inputs(total, h, w, *, channels=4, dtype=torch.float32):
+    from fake_minimax import PackedLayout, _video_t_spans
+
+    audio_t = max(1, round(sum(_video_t_spans(total))))
+    video = torch.zeros(1, channels, total, h, w, dtype=dtype)
+    audio = torch.zeros(1, 2, 2, audio_t, dtype=dtype)
+    context = torch.ones(1, 3, 8, dtype=dtype)
+    payload = {"layout": PackedLayout(3, total, h + (h % 2), w + (w % 2), audio_t)}
+    return [video, audio], context, payload
+
+
+def _band_executor(fn):
+    from types import SimpleNamespace
+
+    class Executor:
+        class_obj = SimpleNamespace(patch_size=(1, 2, 2))
+
+        def __call__(self, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+    return Executor()
+
+
+def _checkerboard(h, w, *, dtype=torch.float32):
+    ys = torch.arange(h, dtype=torch.long).view(h, 1)
+    xs = torch.arange(w, dtype=torch.long).view(1, w)
+    return torch.where(((ys + xs) % 2) == 0, 1.0, -1.0).to(dtype)
+
+
+def test_context_policy_validates_band_fusion_options():
+    default = ContextPolicy()
+    assert default.band_fusion == 0
+    assert default.band_crossfade == 2
+    assert default.band_adaptive is False
+    assert default.band_stagger_hold is True
+    for levels in (0, 2, 3, 4):
+        assert ContextPolicy(band_fusion=levels).band_fusion == levels
+    for bad in (-1, 1, True, 2.5):
+        with pytest.raises(ValueError, match="band_fusion"):
+            ContextPolicy(band_fusion=bad)
+    for bad in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="band_crossfade"):
+            ContextPolicy(band_crossfade=bad)
+
+
+@pytest.mark.parametrize("levels", [1, 2, 3, 4])
+@pytest.mark.parametrize("shape", [(1, 1), (2, 2), (5, 7), (16, 20), (34, 60)])
+def test_laplacian_pyramid_reconstructs_exactly_and_separates_frequencies(levels, shape):
+    h, w = shape
+    gen = torch.Generator().manual_seed(17 + levels * 31 + h * 7 + w)
+    x = torch.randn(1, 3, 4, h, w, generator=gen)
+    bands = laplacian_pyramid(x, levels)
+    assert len(bands) == levels
+    assert all(band.shape == x.shape and band.dtype == torch.float32 for band in bands)
+    reconstructed = sum(bands)
+    assert torch.allclose(reconstructed, x, atol=1e-5, rtol=1e-5)
+
+    # Spatially constant input stays entirely in the lowest band.
+    const = torch.full_like(x, 3.25)
+    const_bands = laplacian_pyramid(const, levels)
+    assert torch.allclose(const_bands[0], const, atol=1e-5)
+    for high in const_bands[1:]:
+        assert torch.allclose(high, torch.zeros_like(high), atol=1e-5)
+
+
+def test_laplacian_pyramid_puts_nyquist_checkerboard_in_highest_band():
+    cb = _checkerboard(20, 20).view(1, 1, 1, 20, 20)
+    bands = laplacian_pyramid(cb, 3)
+    assert torch.allclose(sum(bands), cb, atol=1e-5)
+    # Away from the replicate-padded border (radius 2 at level 1 + radius 4 at level 2 = 6),
+    # [1, 4, 6, 4, 1] / 16 annihilates Nyquist exactly.
+    assert torch.allclose(bands[0][..., 6:-6, 6:-6], torch.zeros(1, 1, 1, 8, 8), atol=1e-5)
+    assert torch.allclose(bands[1][..., 6:-6, 6:-6], torch.zeros(1, 1, 1, 8, 8), atol=1e-5)
+    assert torch.allclose(bands[2][..., 6:-6, 6:-6], cb[..., 6:-6, 6:-6], atol=1e-5)
+    for bad in (0, -2, True):
+        with pytest.raises(ValueError, match="levels"):
+            laplacian_pyramid(cb, bad)
+
+
+@pytest.mark.parametrize("levels", [2, 3, 4])
+@pytest.mark.parametrize("crossfade", [0, 1, 2, 5, 40])
+@pytest.mark.parametrize("ov_len", [8, 21, 24, 25])
+@pytest.mark.parametrize("blend_mode", ["pyramid", "overlap-linear", "flat"])
+def test_band_overlap_weights_sum_to_one_and_narrow_with_band(levels, crossfade, ov_len, blend_mode):
+    seg_start = 60
+    seg_end = seg_start + ov_len
+    w_a = blend_weights(85, ov_len, device="cpu", dtype=torch.float32, mode=blend_mode)[-ov_len:]
+    w_b = blend_weights(85, ov_len, device="cpu", dtype=torch.float32, mode=blend_mode)[:ov_len]
+    pair_bounds = [(float(seg_start), float(seg_end), 0.5 * (seg_start + seg_end), float(ov_len))]
+    weights = band_overlap_weights(seg_start, seg_end, [w_a, w_b], levels, crossfade, pair_bounds)
+    assert len(weights) == levels
+    for band_w in weights:
+        assert len(band_w) == 2
+        total = band_w[0] + band_w[1]
+        assert torch.allclose(total, torch.ones(ov_len), atol=1e-6)
+        assert torch.all(band_w[0] >= 0.0) and torch.all(band_w[1] >= 0.0)
+        assert torch.all(band_w[0] <= 1.0) and torch.all(band_w[1] <= 1.0)
+
+    # Band 0 matches the normalized existing blend weights exactly.
+    expected_0_a = w_a / (w_a + w_b)
+    assert torch.allclose(weights[0][0], expected_0_a, atol=1e-6)
+
+    # Higher bands transition at least as narrowly as lower bands.
+    if crossfade < ov_len:
+        mixed_counts = [int(((w[1] > 1e-6) & (w[1] < 1.0 - 1e-6)).sum()) for w in weights[1:]]
+        assert mixed_counts == sorted(mixed_counts, reverse=True)
+        # Highest band equals pure window A on the far left and pure window B on the far right.
+        if crossfade <= ov_len - 4:
+            assert float(weights[-1][0][0]) == 1.0 and float(weights[-1][1][0]) == 0.0
+            assert float(weights[-1][0][-1]) == 0.0 and float(weights[-1][1][-1]) == 1.0
+
+
+def test_band_overlap_weights_sum_to_one_on_three_way_overlap():
+    seg_start, seg_end = 14, 21
+    base = [torch.full((7,), 1.0), torch.full((7,), 2.0), torch.full((7,), 1.0)]
+    pair_bounds = [
+        (7.0, 25.0, 16.0, 18.0),
+        (14.0, 32.0, 23.0, 18.0),
+    ]
+    weights = band_overlap_weights(seg_start, seg_end, base, 3, 2, pair_bounds)
+    for band_w in weights:
+        assert torch.allclose(sum(band_w), torch.ones(7), atol=1e-6)
+        for w in band_w:
+            assert torch.all((w >= 0.0) & (w <= 1.0))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("blend", ["pyramid", "overlap-linear", "flat"])
+def test_band_fusion_level_zero_is_bit_identical_to_plain_overlap_add(monkeypatch, dtype, blend):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    total, window, overlap = 40, 25, 10
+    x, context, payload = _band_test_inputs(total, 12, 12, channels=3, dtype=dtype)
+    gen = torch.Generator().manual_seed(123)
+    win_videos = [torch.randn(1, 3, window, 12, 12, generator=gen, dtype=dtype) for _ in range(2)]
+    win_audios = [torch.randn(x[1].shape, generator=gen, dtype=dtype) for _ in range(2)]
+    options = {"sigmas": torch.tensor([0.5]), "sample_sigmas": torch.tensor([1.0, 0.5, 0.0])}
+
+    def make_runner():
+        call = 0
+
+        def run(local_x, timestep, text, opts, **kwargs):
+            nonlocal call
+            idx = call
+            call += 1
+            return [win_videos[idx], win_audios[idx]]
+
+        return run
+
+    plain = make_context_wrapper(ContextPolicy(window, overlap, True, blend, band_fusion=0))(
+        _band_executor(make_runner()), x, torch.tensor([500.0]), context, options, minimax_payload=payload
+    )
+    # Non-default auxiliary band options must have zero effect when band_fusion=0.
+    also_off = make_context_wrapper(
+        ContextPolicy(window, overlap, True, blend, band_fusion=0, band_crossfade=0,
+                      band_adaptive=True, band_stagger_hold=False)
+    )(_band_executor(make_runner()), x, torch.tensor([500.0]), context, options, minimax_payload=payload)
+    assert torch.equal(plain[0], also_off[0])
+    assert torch.equal(plain[1], also_off[1])
+
+    # Verify directly against manual plain overlap-add.
+    acc = torch.zeros_like(x[0], dtype=torch.float32)
+    den = torch.zeros((1, 1, total, 1, 1), dtype=torch.float32)
+    starts = window_starts(total, window, overlap, stagger_phase(1, window, overlap), max_stagger_phase(window, overlap))
+    for v0, v_out in zip(starts, win_videos):
+        vw = blend_weights(window, overlap, device="cpu", dtype=torch.float32, mode=blend,
+                           ramp_start=v0 > 0, ramp_end=v0 + window < total).view(1, 1, -1, 1, 1)
+        acc[:, :, v0:v0 + window].add_(v_out.float() * vw)
+        den[:, :, v0:v0 + window].add_(vw)
+    expected_video = (acc / den.clamp_min(1e-6)).to(dtype)
+    assert torch.equal(plain[0], expected_video)
+
+
+@pytest.mark.parametrize("levels", [2, 3])
+def test_band_fusion_splits_high_band_away_from_crossfade(monkeypatch, levels):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    # Windows [0, 25) and [15, 40) -> overlap [15, 25), midpoint = 20.0.
+    total, window, overlap = 40, 25, 10
+    x, context, payload = _band_test_inputs(total, 20, 20, channels=2)
+    low = torch.full((1, 2, window, 20, 20), 2.5)
+    cb = _checkerboard(20, 20).view(1, 1, 1, 20, 20).expand(1, 2, window, 20, 20)
+    win_a = low + 1.5 * cb
+    win_b = low - 1.5 * cb
+    audio_a = torch.full_like(x[1], 1.0)
+    audio_b = torch.full_like(x[1], 3.0)
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.0])}
+
+    def make_runner():
+        outputs = [(win_a, audio_a), (win_b, audio_b)]
+        idx = 0
+
+        def run(local_x, timestep, text, opts, **kwargs):
+            nonlocal idx
+            out = outputs[idx]
+            idx += 1
+            return [out[0], out[1]]
+
+        return run
+
+    plain = make_context_wrapper(ContextPolicy(window, overlap, False, "pyramid", band_fusion=0))(
+        _band_executor(make_runner()), x, torch.tensor([1000.0]), context, options, minimax_payload=payload
+    )
+    banded = make_context_wrapper(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=levels, band_crossfade=2)
+    )(_band_executor(make_runner()), x, torch.tensor([1000.0]), context, options, minimax_payload=payload)
+
+    # Audio and solo video spans are strictly untouched.
+    assert torch.equal(banded[1], plain[1])
+    assert torch.equal(banded[0][:, :, :15], plain[0][:, :, :15])
+    assert torch.equal(banded[0][:, :, 25:], plain[0][:, :, 25:])
+
+    # With crossfade=2 centred at 20.0, transition spans [19.0, 21.0] (latents 19 and 20).
+    # Away from the crossfade (and replicate border), latents 15..18 equal window A and
+    # latents 21..24 equal window B in both the high band and the reconstructed frame.
+    interior = (slice(None), slice(None), slice(None), slice(6, -6), slice(6, -6))
+    fused_high = laplacian_pyramid(banded[0][:, :, 15:25], levels)[-1][interior]
+    high_a = laplacian_pyramid(win_a[:, :, 15:25], levels)[-1][interior]
+    high_b = laplacian_pyramid(win_b[:, :, :10], levels)[-1][interior]
+    assert torch.allclose(fused_high[:, :, :4], high_a[:, :, :4], atol=1e-5)
+    assert torch.allclose(fused_high[:, :, 6:], high_b[:, :, 6:], atol=1e-5)
+    assert torch.allclose(banded[0][:, :, 15:19, 6:-6, 6:-6], win_a[:, :, 15:19, 6:-6, 6:-6], atol=1e-5)
+    assert torch.allclose(banded[0][:, :, 21:25, 6:-6, 6:-6], win_b[:, :, 6:10, 6:-6, 6:-6], atol=1e-5)
+    # Inside the 2-latent crossfade (19 and 20), weights are 0.75/0.25 and 0.25/0.75.
+    assert torch.allclose(
+        banded[0][:, :, 19, 6:-6, 6:-6],
+        0.75 * win_a[:, :, 19, 6:-6, 6:-6] + 0.25 * win_b[:, :, 4, 6:-6, 6:-6],
+        atol=1e-5,
+    )
+    assert torch.allclose(
+        banded[0][:, :, 20, 6:-6, 6:-6],
+        0.25 * win_a[:, :, 20, 6:-6, 6:-6] + 0.75 * win_b[:, :, 5, 6:-6, 6:-6],
+        atol=1e-5,
+    )
+
+
+def test_band_fusion_keeps_low_band_blended_while_switching_high_band(monkeypatch):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    total, window, overlap = 40, 25, 10
+    x, context, payload = _band_test_inputs(total, 16, 16, channels=2)
+    cb = _checkerboard(16, 16).view(1, 1, 1, 16, 16).expand(1, 2, window, 16, 16)
+    win_a = torch.full((1, 2, window, 16, 16), 1.0) + 1.0 * cb
+    win_b = torch.full((1, 2, window, 16, 16), 5.0) - 1.0 * cb
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.0])}
+
+    def make_runner():
+        outputs = [win_a, win_b]
+        idx = 0
+
+        def run(local_x, timestep, text, opts, **kwargs):
+            nonlocal idx
+            v = outputs[idx]
+            idx += 1
+            return [v, local_x[1]]
+
+        return run
+
+    plain = make_context_wrapper(ContextPolicy(window, overlap, False, "pyramid", band_fusion=0))(
+        _band_executor(make_runner()), x, torch.tensor([1000.0]), context, options, minimax_payload=payload
+    )
+    banded = make_context_wrapper(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=2, band_crossfade=2)
+    )(_band_executor(make_runner()), x, torch.tensor([1000.0]), context, options, minimax_payload=payload)
+
+    # Interior low band (mean over 2x2 blocks cancels checkerboard) matches plain pyramid blend.
+    plain_low = laplacian_pyramid(plain[0][:, :, 15:25], 2)[0][..., 4:-4, 4:-4]
+    banded_low = laplacian_pyramid(banded[0][:, :, 15:25], 2)[0][..., 4:-4, 4:-4]
+    assert torch.allclose(banded_low, plain_low, atol=1e-5)
+
+    # Interior high band switches cleanly to window A on 15..18 and window B on 21..24.
+    banded_high = laplacian_pyramid(banded[0][:, :, 15:25], 2)[1][..., 4:-4, 4:-4]
+    plain_high = laplacian_pyramid(plain[0][:, :, 15:25], 2)[1][..., 4:-4, 4:-4]
+    assert torch.allclose(banded_high[:, :, :4], cb[:, :, :4, 4:-4, 4:-4], atol=1e-5)
+    assert torch.allclose(banded_high[:, :, 6:], -cb[:, :, :4, 4:-4, 4:-4], atol=1e-5)
+    # Plain averaging damps the high band in the overlap; band fusion keeps full amplitude.
+    assert banded_high[:, :, 3].abs().mean() > plain_high[:, :, 3].abs().mean() * 1.5
+
+
+def test_band_fusion_adaptive_gates_narrow_transition_by_local_disagreement(monkeypatch):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    total, window, overlap = 40, 25, 10
+    x, context, payload = _band_test_inputs(total, 16, 32, channels=2)
+    cb = _checkerboard(16, 32).view(1, 1, 1, 16, 32).expand(1, 2, window, 16, 32)
+    win_a = torch.ones(1, 2, window, 16, 32) + cb
+    win_b = win_a.clone()
+    # Left half (x < 16): windows nearly agree (small 5% amplitude difference -> ratio ~ 0.025 < 0.15).
+    win_b[..., :16] = 1.0 + 0.95 * cb[..., :16]
+    # Right half (x >= 16): windows maximally disagree (opposite sign -> ratio = 1.0 > 0.50).
+    win_b[..., 16:] = 1.0 - 1.0 * cb[..., 16:]
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.0])}
+
+    def run_policy(policy, scale=1.0):
+        outputs = [win_a * scale, win_b * scale]
+        idx = 0
+
+        def run(local_x, timestep, text, opts, **kwargs):
+            nonlocal idx
+            v = outputs[idx]
+            idx += 1
+            return [v, local_x[1]]
+
+        return make_context_wrapper(policy)(
+            _band_executor(run), x, torch.tensor([1000.0]), context, options, minimax_payload=payload
+        )
+
+    plain = run_policy(ContextPolicy(window, overlap, False, "pyramid", band_fusion=0))
+    adaptive = run_policy(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=2, band_crossfade=2, band_adaptive=True)
+    )
+    non_adaptive = run_policy(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=2, band_crossfade=2, band_adaptive=False)
+    )
+
+    # Agreeing region (deep inside left half): adaptive keeps the plain blend.
+    assert torch.allclose(adaptive[0][:, :, 15:25, 4:-4, 4:12], plain[0][:, :, 15:25, 4:-4, 4:12], atol=1e-5)
+    assert not torch.allclose(non_adaptive[0][:, :, 18, 4:-4, 4:12], plain[0][:, :, 18, 4:-4, 4:12], atol=1e-4)
+
+    # Disagreeing region (deep inside right half), away from the crossfade: adaptive snaps like non-adaptive.
+    assert torch.allclose(adaptive[0][:, :, 15:19, 4:-4, 20:28], win_a[:, :, 15:19, 4:-4, 20:28], atol=1e-5)
+    assert torch.allclose(adaptive[0][:, :, 21:25, 4:-4, 20:28], win_b[:, :, 6:10, 4:-4, 20:28], atol=1e-5)
+
+    # Scale invariance: scaling both windows by 100 scales the adaptive output by 100.
+    scaled = run_policy(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=2, band_crossfade=2, band_adaptive=True),
+        scale=100.0,
+    )
+    assert torch.allclose(scaled[0], adaptive[0] * 100.0, atol=1e-3, rtol=1e-5)
+
+
+def test_band_fusion_stagger_hold_locks_high_band_owner_at_or_below_sigma_0_8(monkeypatch):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    # Baseline geometry: 202 video latents, window 85, overlap 21 (3 windows).
+    # Phase-0 starts: [0, 58, 117]; max-phase starts: [0, 64, 117].
+    # Held intersection for overlap 0-1 is [64, 85), midpoint = 74.5 (latents <=73 win 0, >=75 win 1).
+    total, window, overlap = 202, 85, 21
+    x, context, payload = _band_test_inputs(total, 12, 12, channels=1)
+    cb = _checkerboard(12, 12).view(1, 1, 1, 12, 12)
+    # Schedule with 5 steps so steps 0..3 hit distinct stagger phases and sigmas above & below 0.8.
+    sample_sigmas = torch.tensor([1.0, 0.9, 0.8, 0.5, 0.2, 0.0])
+
+    def run_step(policy, step_idx):
+        sigma = float(sample_sigmas[step_idx])
+        opts = {"sigmas": torch.tensor([sigma]), "sample_sigmas": sample_sigmas}
+        call = 0
+
+        def run(local_x, timestep, text, options, **kwargs):
+            nonlocal call
+            win_idx = call
+            call += 1
+            t_len = local_x[0].shape[2]
+            sign = 1.0 if win_idx % 2 == 0 else -1.0
+            # Distinct low band (win_idx + 1) AND opposite high-band checkerboard per window.
+            v = torch.full((1, 1, t_len, 12, 12), float(win_idx + 1)) + sign * cb
+            a = torch.full_like(local_x[1], float(win_idx + 1))
+            return [v, a]
+
+        return make_context_wrapper(policy)(
+            _band_executor(run), x, torch.tensor([sigma * 1000.0]), context, opts, minimax_payload=payload
+        )
+
+    held = ContextPolicy(window, overlap, True, "pyramid", band_fusion=2, band_crossfade=2, band_stagger_hold=True)
+    unheld = ContextPolicy(window, overlap, True, "pyramid", band_fusion=2, band_crossfade=2, band_stagger_hold=False)
+    plain = ContextPolicy(window, overlap, True, "pyramid", band_fusion=0)
+
+    # At sigma = 0.9 (> 0.8, step 1): hold is NOT active yet, so held == unheld.
+    assert torch.equal(run_step(held, 1)[0], run_step(unheld, 1)[0])
+
+    # At sigma <= 0.8 (steps 2, 3, 4 -> distinct stagger phases):
+    # Held keeps the high-band owner identical at every non-crossfade latent around overlap 0-1 (latents 60..84).
+    held_highs = []
+    held_lows = []
+    for step_idx in (2, 3, 4):
+        out_held = run_step(held, step_idx)
+        out_plain = run_step(plain, step_idx)
+        # Audio is always bit-identical to plain (staggered) main.
+        assert torch.equal(out_held[1], out_plain[1])
+        pyr = laplacian_pyramid(out_held[0], 2)
+        held_lows.append(pyr[0][:, :, 60:85, 4:-4, 4:-4])
+        held_highs.append(pyr[1][:, :, 60:85, 4:-4, 4:-4])
+
+    # Every step at sigma <= 0.8 produces the EXACT same high band across the overlap!
+    assert torch.allclose(held_highs[0], held_highs[1], atol=1e-5)
+    assert torch.allclose(held_highs[0], held_highs[2], atol=1e-5)
+    # Meanwhile, the low band STILL staggers across steps 2 and 3 (different stagger phases).
+    assert not torch.allclose(held_lows[0], held_lows[1], atol=1e-4)
+
+    # Without hold, the high-band midpoint moves between step 2 and step 3.
+    unheld_2 = laplacian_pyramid(run_step(unheld, 2)[0], 2)[1][:, :, 60:85, 4:-4, 4:-4]
+    unheld_3 = laplacian_pyramid(run_step(unheld, 3)[0], 2)[1][:, :, 60:85, 4:-4, 4:-4]
+    assert not torch.allclose(unheld_2, unheld_3, atol=1e-4)
+
+
+def test_band_fusion_three_way_overlap_and_step_zero_logging(monkeypatch, capsys):
+    import fake_minimax
+
+    fake_minimax.install(monkeypatch)
+    # 35 latents, window 25, overlap 18 -> starts [0, 5, 10], 3-way overlap on [10, 25).
+    total, window, overlap = 35, 25, 18
+    assert window_starts(total, window, overlap) == [0, 5, 10]
+    x, context, payload = _band_test_inputs(total, 8, 8, channels=2)
+    options = {"sigmas": torch.tensor([1.0]), "sample_sigmas": torch.tensor([1.0, 0.0])}
+
+    def run(local_x, timestep, text, opts, **kwargs):
+        return [torch.randn_like(local_x[0]), torch.ones_like(local_x[1])]
+
+    torch.manual_seed(7)
+    plain = make_context_wrapper(ContextPolicy(window, overlap, False, "pyramid", band_fusion=0))(
+        _band_executor(run), x, torch.tensor([1000.0]), context, options, minimax_payload=payload
+    )
+    off_log = capsys.readouterr().out
+    assert "[H3Forge] context plan" in off_log and "band_fusion=off" in off_log
+
+    torch.manual_seed(7)
+    banded = make_context_wrapper(
+        ContextPolicy(window, overlap, False, "pyramid", band_fusion=3, band_crossfade=2, band_adaptive=True)
+    )(_band_executor(run), x, torch.tensor([1000.0]), context, options, minimax_payload=payload)
+    on_log = capsys.readouterr().out
+    assert "[H3Forge] context plan" in on_log
+    assert "band_fusion=3 band_crossfade=2 band_adaptive=on band_stagger_hold=off band_overlap_latents=25" in on_log
+    assert torch.isfinite(banded[0]).all()
+    assert torch.equal(banded[1], plain[1])
+    # Solo latents [0, 5) and [30, 35) are bit-identical.
+    assert torch.equal(banded[0][:, :, :5], plain[0][:, :, :5])
+    assert torch.equal(banded[0][:, :, 30:], plain[0][:, :, 30:])
+
+    # Single-window clip logs inactive status clearly.
+    small_x, small_ctx, small_payload = _band_test_inputs(10, 8, 8, channels=2)
+    make_context_wrapper(ContextPolicy(25, 8, True, "pyramid", band_fusion=2))(
+        _band_executor(lambda lx, *a, **kw: lx), small_x, None, small_ctx, options, minimax_payload=small_payload
+    )
+    single_log = capsys.readouterr().out
+    assert "band_fusion=2(inactive:single-window)" in single_log
