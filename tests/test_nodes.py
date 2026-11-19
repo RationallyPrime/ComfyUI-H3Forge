@@ -447,3 +447,28 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     with pytest.raises(ValueError, match="AV latent"):
         nodes.H3ForgeTimelineContextWindows().patch(
             MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})
+
+
+@pytest.mark.parametrize("timeline", [False, True])
+def test_context_nodes_forward_optional_consensus_settings(monkeypatch, timeline):
+    nodes = _import_nodes(monkeypatch)
+    node = nodes.H3ForgeTimelineContextWindows() if timeline else nodes.H3ForgeContextWindows()
+    expected = {"consensus": ("BOOLEAN", False), "consensus_threshold": ("FLOAT", .15),
+                "consensus_lead": ("FLOAT", .6), "consensus_until": ("FLOAT", .5),
+                "consensus_max_fraction": ("FLOAT", .4)}
+    optional = node.INPUT_TYPES()["optional"]
+    assert {k: (optional[k][0], optional[k][1]["default"]) for k in expected} == expected
+    policies = []
+    monkeypatch.setattr(nodes, "_require_h3", lambda model: object())
+    monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy))
+    settings = dict(consensus=True, consensus_threshold=.3, consensus_lead=.25, consensus_until=.75,
+                    consensus_max_fraction=.1)
+    monkeypatch.setattr(FakePatcher, "get_model_object", lambda self, name: None, raising=False)
+    monkeypatch.setattr(FakePatcher, "add_object_patch", lambda self, name, value: None, raising=False)
+    model = FakePatcher()
+    if timeline:
+        latent = {"samples": SimpleNamespace(tensors=[torch.zeros(1, 1, 37, 2, 2), torch.zeros(1, 1, 2, 200)])}
+        node.patch(model, 32, 32, 5, 15.5, True, "pyramid", latent=latent, **settings)
+    else:
+        node.patch(model, 8, 4, True, "pyramid", **settings)
+    assert {k: getattr(policies[0], k) for k in settings} == settings
