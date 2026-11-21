@@ -7,6 +7,7 @@ import torch
 from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
+from .beat_refs import BEAT_REFS_KEY, parse_beat_refs
 from .context import AUDIO_CONTEXT_MODES, HANDOFF_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
@@ -761,6 +762,42 @@ class H3ForgeRenoiseStitch:
         return (images, full)
 
 
+class H3ForgeBeatRefMods:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {"tooltip": "The model line after the Continuum RefMod Bridge."}),
+            "mods": ("H3_REF_MODS", {"tooltip": "The same loaded mods the RefMod bridge uses (its 'mods' output)."}),
+            "beats": ("STRING", {"default": "", "multiline": True, "tooltip": (
+                "Which RefMods each beat of the pipe prompt sees. One group per beat, separated by | or a new "
+                "line; names separated by commas. A name matches a loaded mod by its name or file name, in full "
+                "or in part. * = every mod, none = no mod. Example: tairn, sgaeyl, lake | tairn, sgaeyl, hall. "
+                "Empty = every beat sees every mod.")}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/context"
+    EXPERIMENTAL = True
+    DESCRIPTION = (
+        "Gives each beat of a pipe-prompt take its own set of RefMods, so a long take can change location "
+        "(or cast) between beats while shared references stay in every beat. Place it on the model line after "
+        "the Continuum RefMod Bridge, with the bridge's scramble_seed at -1. Needs H3 Forge context windows; "
+        "without them the take sees every mod, as before."
+    )
+
+    def patch(self, model, mods, beats):
+        spec = parse_beat_refs(beats, mods)
+        patched = model.clone()
+        opts = patched.model_options.setdefault("transformer_options", {})
+        if spec is None:
+            opts.pop(BEAT_REFS_KEY, None)
+        else:
+            opts[BEAT_REFS_KEY] = spec
+            print(f"{LOG} per-beat RefMods set: {spec.describe()}", flush=True)
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
@@ -768,6 +805,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgePipePrompt": H3ForgePipePrompt,
     "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
+    "H3ForgeBeatRefMods": H3ForgeBeatRefMods,
     "H3ForgeRenoiseWindow": H3ForgeRenoiseWindow,
     "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
@@ -778,6 +816,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgePipePrompt": "H3 Forge — Pipe Timeline Prompt",
     "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
+    "H3ForgeBeatRefMods": "H3 Forge — RefMods Per Beat",
     "H3ForgeRenoiseWindow": "H3 Forge — Masked Interval Renoise",
     "H3ForgeRenoiseStitch": "H3 Forge — Renoise Stitch",
 }

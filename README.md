@@ -9,6 +9,7 @@ Experimental MiniMax-H3 inference surgery for native ComfyUI:
 5. **Image/video/voice reference prompting** that prepares shared native Ref2VA references once.
 6. **Experimental H3 NAG-Lite** — Normalized Attention Guidance adapted to H3's packed single stream via a negative-text sidecar.
 7. **Masked interval renoise** — re-denoise one region over one stretch of an existing clip and paste it back, leaving the rest of the clip untouched.
+8. **RefMods per beat** — give each beat of a pipe-prompt take its own set of RefMods, so one long take can change location or cast between beats.
 
 The project is deliberately a custom-node patch layer. It does **not** fork or modify files under `ComfyUI/comfy/`.
 
@@ -136,6 +137,24 @@ At sampler step zero, the context node prints one compact plan containing the ac
 This node uses native Ref2VA preparation once and independently encodes every prompt against the same prepared presentation. It supports up to nine images, three reference videos, three paired video soundtracks, and three standalone audio references. Video soundtracks pair with the same-numbered video. Connect the video VAE for visual references and the audio VAE for voice/soundtrack references; image-only work does not require an audio VAE. A single segment is valid, and there is no arbitrary eight-segment ceiling.
 
 Use full Ref2VA grammar inside each segment (`subject_definitions`, `summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`, `non_diegetic_music`) with stable `<Picture i>`, `<Video i>`, and `<Audio i>` labels. All segments share one reference payload. Native `MiniMaxH3AddGuide` can add image, clip, or audio anchors at specific frames when that is the desired control.
+
+### H3 Forge — RefMods Per Beat (experimental)
+
+A RefMod (ComfyUI-MiniMaxH3Mod) is conditioning, not a weight patch: its Continuum RefMod Bridge appends one reference block per loaded mod to `minimax_refs`, and H3 packs each block's rows between the text and the targets. Every context window is its own forward pass, so a window can be handed a subset of those blocks. This node says which mods each beat of a pipe prompt sees.
+
+Wiring: `Load H3 RefMods` → `Continuum RefMod Bridge` → **RefMods Per Beat** → the rest of the model line. Connect the bridge's `mods` output (or the loader's) to `mods`. Load every mod any beat needs in the one loader.
+
+`beats` holds one group per beat, separated by `|` or a new line, with names separated by commas:
+
+```text
+tairn, sgaeyl, moon_lake | tairn, sgaeyl, aretia_hall
+```
+
+A name matches a loaded mod whose name or file name equals it or, failing that, contains it, ignoring case; a bundle's members share its file name, so one word selects all of them. `*` keeps every mod, `none` keeps none, and an empty field leaves every beat seeing every mod. The number of groups must equal the number of beats; a mismatch, an unknown name, or a count that differs from what the sampler receives stops the run before the first window.
+
+What it does per window: the window's beat picks the reference blocks, and the node passes that subset as `refs`, filters `cond_video_latents` / `cond_audio_latents` in step, and packs a window layout holding only those rows. A kept reference stays at the coordinates it has when every mod is loaded, so a reference shared by two beats sits at one position in both. Only blocks the bridge marked as RefMods are ever dropped; native Ref2VA references and keyframes stay in every window. The log prints the selection once per run as `per-beat RefMods: beat 1 = …; beat 2 = …`.
+
+Limits. Leave the bridge's `scramble_seed` at `-1` (a shuffle reorders blocks and the names would no longer line up; a count or shape mismatch is caught, a shuffle among equally shaped mods is not) and its `retention` above 0. The selection applies per window, so the overlap between two beats is denoised by each beat with its own references and then handed over as usual: write the passage between two places as one move the picture can make (a door, a turn, a cut to black), exactly as for any change between beats. The CPU tests prove the packing and the bookkeeping, including against ComfyUI's own `PackedLayout`; what a location change looks like on screen is a GPU question and is not yet measured.
 
 ### H3 Forge — Normalized Attention Guidance (experimental)
 

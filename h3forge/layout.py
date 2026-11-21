@@ -56,11 +56,16 @@ def clone_window_layout(
     audio_range: tuple[int, int],
     keyframes=None,
     refs=None,
+    ref_keep=None,
 ):
     """Build a local H3 PackedLayout, then transplant global target positions.
 
     This preserves absolute multimodal RoPE coordinates while allowing the model
     to process a smaller synchronized A/V window.
+
+    ``ref_keep`` (ascending positions in ``refs``) packs only those references
+    into the window. Each kept reference stays at the coordinates it has in the
+    full layout, so a reference shared by two beats sits at one position in both.
     """
     from comfy.ldm.minimax.model import PackedLayout
 
@@ -71,8 +76,13 @@ def clone_window_layout(
         raise ValueError(f"local video shape T={local_t} does not match window {video_range}")
     if not (0 <= a0 < a1 <= int(audio_t)):
         raise ValueError(f"invalid audio range {audio_range} for T={audio_t}")
+    full_segments = list(full_layout.segments)
+    local_refs = refs
+    if ref_keep is not None:
+        full_segments = _segments_without_dropped_refs(full_segments, refs or (), ref_keep)
+        local_refs = [refs[i] for i in ref_keep]
     local = PackedLayout(text_len, local_t, latent_h, latent_w, a1 - a0,
-                         keyframes=keyframes, refs=refs)
+                         keyframes=keyframes, refs=local_refs)
     expected_signature = (int(text_len), local_t, latent_h, latent_w, a1 - a0)
     if local.signature != expected_signature:
         raise ValueError(f"local PackedLayout signature {local.signature} != expected {expected_signature}")
@@ -81,7 +91,9 @@ def clone_window_layout(
     # Independently refined text has native per-segment lengths. Preserve the
     # shared refs/keyframes at the template's origin without inserting fake
     # text rows in the local stream.
-    for (fa, fb, fk), (la, lb, lk) in zip(full_layout.segments, local.segments):
+    if len(full_segments) != len(local.segments):
+        raise ValueError("window reference structure differs from the full layout")
+    for (fa, fb, fk), (la, lb, lk) in zip(full_segments, local.segments):
         if fk != lk:
             raise ValueError("window reference structure differs from the full layout")
         if fk not in ("text", "audio", "video"):
@@ -108,6 +120,32 @@ def clone_window_layout(
     local._h3forge_video_offset = int(v0)
     local._h3forge_audio_offset = int(a0)
     return local
+
+
+def _ref_segment_count(block) -> int:
+    """How many packed segments one reference block contributes (PackedLayout's rules)."""
+    kind = block["kind"]
+    if kind == "image":
+        return 1
+    audio = 1 if int(block.get("ref_audio_t") or 0) > 0 else 0
+    return audio if kind == "audio" else audio + 1
+
+
+def _segments_without_dropped_refs(segments, refs, ref_keep):
+    """``segments`` of a layout packed with ``refs``, minus the references not in ``ref_keep``."""
+    keep = [int(i) for i in ref_keep]
+    if keep != sorted(set(keep)) or any(not 0 <= i < len(refs) for i in keep):
+        raise ValueError(f"ref_keep must be ascending positions inside {len(refs)} references, got {ref_keep}")
+    counts = [_ref_segment_count(block) for block in refs]
+    ref_rows = [n for n, segment in enumerate(segments) if segment[2] in ("ref_img", "ref_audio")]
+    if sum(counts) != len(ref_rows):
+        raise ValueError("full layout reference segments do not match the reference blocks")
+    dropped, cursor, kept = set(), 0, set(keep)
+    for index, count in enumerate(counts):
+        if index not in kept:
+            dropped.update(ref_rows[cursor:cursor + count])
+        cursor += count
+    return [segment for n, segment in enumerate(segments) if n not in dropped]
 
 
 def audio_range_for_video_window(full_layout, v0: int, v1: int) -> tuple[int, int]:

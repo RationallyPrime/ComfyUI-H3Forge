@@ -6,6 +6,7 @@ from itertools import groupby, pairwise
 
 import torch
 
+from .beat_refs import BEAT_REFS_KEY, beat_ref_keeps, filter_payload
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
@@ -455,10 +456,17 @@ def make_context_wrapper(policy: ContextPolicy):
         step, _ = resolve_step(transformer_options)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
+        beat_refs = transformer_options.get(BEAT_REFS_KEY)
+        ref_keeps = beat_ref_keeps(payload.get("refs"), beat_refs, len(prompts))
+        if ref_keeps is not None and step == 0:
+            print(f"{LOG} per-beat RefMods: {beat_refs.describe()}", flush=True)
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
                       phase=0, blend=policy.blend, audio_t=audio_t), handoff_log, flush=True)
+            if ref_keeps is not None:
+                # The forward rebuilds the layout from the filtered references.
+                kwargs = {**kwargs, "minimax_payload": filter_payload(payload, ref_keeps[0])}
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -528,11 +536,13 @@ def make_context_wrapper(policy: ContextPolicy):
             else:
                 in_a0, in_a1 = 0, audio_t
             local_context = prompts[index]
+            ref_keep = ref_keeps[index] if ref_keeps is not None else None
             local_layout = clone_window_layout(full_layout=full_layout, text_len=local_context.shape[1],
                 video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
                 video_range=(v0, v1), audio_range=(in_a0, in_a1),
-                keyframes=payload.get("keyframes"), refs=payload.get("refs"))
-            local_payload = {**payload, "layout": local_layout}
+                keyframes=payload.get("keyframes"), refs=payload.get("refs"), ref_keep=ref_keep)
+            local_payload = {**(payload if ref_keep is None else filter_payload(payload, ref_keep)),
+                             "layout": local_layout}
             if tags is not None:
                 local_payload["text_token_tags"] = tags[index]
             local_kwargs = {**kwargs, "minimax_payload": local_payload,
