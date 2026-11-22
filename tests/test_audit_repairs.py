@@ -399,6 +399,10 @@ def test_strict_sparse_contracts_raise_but_declared_dense_schedule_runs():
     state.layout.seq_len = 5
     state.block_index = 0
     assert override(lambda *args, **kwargs: q, q, q, q, 2, skip_reshape=True) is q
+    state.block_index = 3
+    state.layout = SimpleNamespace(seq_len=5, _h3forge_video_indices=(0, 5, 9))
+    assert override(lambda *args, **kwargs: q, q, q, q, 2, skip_reshape=True) is q
+    assert state.declines["sparse-layout-guide"] == 1
 
 
 def test_different_shared_reference_values_are_rejected():
@@ -408,7 +412,8 @@ def test_different_shared_reference_values_are_rejected():
 
 
 @pytest.mark.parametrize("control_first", [True, False])
-def test_native_control_wrappers_receive_global_control_slices(control_first):
+@pytest.mark.parametrize("guide_strength", [0, .5])
+def test_native_control_wrappers_receive_global_control_slices(control_first, guide_strength):
     cls = definitions("comfy_extras/nodes_minimax_h3.py", ["MiniMaxH3FunControlPatch"],
                       {"torch": torch})["MiniMaxH3FunControlPatch"]
     executor = definitions("comfy/patcher_extension.py", ["WrapperExecutor"],
@@ -431,14 +436,20 @@ def test_native_control_wrappers_receive_global_control_slices(control_first):
         start = layout._h3forge_video_offset
         assert patch.active
         assert patch.control_latent_shape == tuple(local_x[0].shape)
-        assert torch.equal(patch.control_latent[0, 0, :, 0, 0], torch.arange(start, start + local_x[0].shape[2]))
-        seen.append(start)
+        indices = getattr(layout, "_h3forge_video_indices", None)
+        expected = torch.tensor(indices) if indices is not None else torch.arange(start, start + local_x[0].shape[2])
+        assert torch.equal(patch.control_latent[0, 0, :, 0, 0], expected)
+        seen.append(indices if indices is not None else start)
         return local_x
 
-    window = make_context_wrapper(ContextPolicy(25, 8, False, "pyramid"))
+    window = make_context_wrapper(ContextPolicy(25, 8, False, "pyramid", layout_guide=guide_strength,
+                                                layout_guide_until=.6))
     wrappers = [patch.diffusion_model_wrapper, window] if control_first else [window, patch.diffusion_model_wrapper]
     executor.new_class_executor(forward, SimpleNamespace(patch_size=(1, 2, 2)), wrappers).execute(
         x, torch.tensor([700.]), context, {"sigmas": torch.tensor([.7])}, minimax_payload=payload)
+    if guide_strength:
+        from h3forge.layout_guide import sparse_video_indices
+        assert seen.pop(0) == tuple(sparse_video_indices(67, 25))
     assert prepared == [67] and seen[0] == 0 and seen[-1] > 0
     assert patch.control_latent_shape == tuple(x[0].shape)
     assert patch.control_stream is None

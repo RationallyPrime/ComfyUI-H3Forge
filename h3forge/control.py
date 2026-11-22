@@ -1,9 +1,11 @@
 """Synchronize native H3 Fun ControlNet with a Forge video window."""
 from contextlib import contextmanager
 
+import torch
+
 
 @contextmanager
-def control_window(executor, full_shape, video_range, timestep, options):
+def control_window(executor, full_shape, video_range, timestep, options, *, video_indices=None):
     """Keep the native cache in full-clip coordinates between local forwards.
 
     Core exposes its controls as bound DIFFUSION_MODEL wrappers. Looking through
@@ -25,9 +27,14 @@ def control_window(executor, full_shape, video_range, timestep, options):
                 continue
             patch.prepare_control_latent(full_shape)
             saved.append((patch, patch.control_latent, patch.control_latent_shape))
-            v0, v1 = video_range
-            patch.control_latent = patch.control_latent[:, :, v0:v1]
-            patch.control_latent_shape = (*full_shape[:2], v1 - v0, *full_shape[3:])
+            if video_indices is not None:
+                idx = torch.tensor(video_indices, dtype=torch.long, device=patch.control_latent.device)
+                patch.control_latent = patch.control_latent.index_select(2, idx)
+                patch.control_latent_shape = (*full_shape[:2], len(video_indices), *full_shape[3:])
+            else:
+                v0, v1 = video_range
+                patch.control_latent = patch.control_latent[:, :, v0:v1]
+                patch.control_latent_shape = (*full_shape[:2], v1 - v0, *full_shape[3:])
             patch.control_stream = patch.pristine_stream = None
         yield
     finally:

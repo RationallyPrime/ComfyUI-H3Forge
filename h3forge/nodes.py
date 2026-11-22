@@ -16,6 +16,7 @@ from .prompt import (
     combine_conditioning_segments,
     compose_segment_prompts,
     encode_pipe_prompt,
+    layout_setting_text,
     make_segmented_extra_conds,
     parse_segment_durations,
     split_pipe_prompt,
@@ -46,6 +47,9 @@ REFERENCE_INPUTS = (
     ("ref_video_audios", "ref_video_audio", "AUDIO", 3),
     ("ref_audios", "ref_audio", "AUDIO", 3),
 )
+PREPARE_LAYOUT_GUIDE = ("BOOLEAN", {
+    "default": False, "tooltip": "Also encode global_prompt alone for a shared layout guide on a segmented take."
+})
 
 
 def _require_h3(model):
@@ -346,11 +350,18 @@ def _context_optional_inputs():
             "lead": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01,
                                "tooltip": "Fraction of overlap noise retained in lead mode. Zero feeds the "
                                           "clean estimate. One keeps the original noisy input."}),
+            "layout_guide": ("FLOAT", {"default": ContextPolicy.layout_guide, "min": 0.0, "max": 1.0, "step": 0.01,
+                "tooltip": "Shared coarse video velocity strength. Zero disables the wide pass. On a pipe timeline, "
+                           "enable prepare_layout_guide and supply the shared setting in global_prompt."}),
+            "layout_guide_until": ("FLOAT", {"default": ContextPolicy.layout_guide_until, "min": 0.0, "max": 1.0,
+                "step": 0.001, "tooltip": "Run the whole-take pass only above this absolute video sigma. "
+                                          "0.92 covers steps 0–15 for simple, shift 12, 30 Euler steps."}),
     }
 
 
 def _install_context(model, window_frames, overlap_frames, stagger, blend, segment_seams, freenoise,
-                     audio_context="auto", handoff="off", lead=0.5):
+                     audio_context="auto", handoff="off", lead=0.5, layout_guide=ContextPolicy.layout_guide,
+                     layout_guide_until=ContextPolicy.layout_guide_until):
     """Validate a context policy and return the model clone carrying its wrappers."""
     diffusion = _require_h3(model)
     if overlap_frames >= window_frames:
@@ -361,7 +372,8 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
         policy = ContextPolicy(window_frames=window_frames, overlap_frames=overlap_frames,
                                stagger=stagger, blend=blend,
                                segment_seams=segment_seams, freenoise=freenoise,
-                               audio_context=audio_context, handoff=handoff, lead=lead)
+                               audio_context=audio_context, handoff=handoff, lead=lead, layout_guide=layout_guide,
+                               layout_guide_until=layout_guide_until)
     except ValueError as exc:
         raise ValueError(f"{LOG} {exc}") from exc
     patched = model.clone()
@@ -369,7 +381,7 @@ def _install_context(model, window_frames, overlap_frames, stagger, blend, segme
     base_extra_conds = patched.get_model_object("extra_conds")
     patched.add_object_patch(
         "extra_conds",
-        make_segmented_extra_conds(base_extra_conds, base_model, diffusion),
+        make_segmented_extra_conds(base_extra_conds, base_model, diffusion, layout_guide=layout_guide > 0),
     )
     patched.add_wrapper_with_key(WrappersMP.DIFFUSION_MODEL, CTX_KEY, make_context_wrapper(policy))
     patched.add_wrapper_with_key(WrappersMP.SAMPLER_SAMPLE, CTX_KEY, make_freenoise_wrapper(policy))
@@ -392,9 +404,10 @@ class H3ForgeContextWindows:
     DESCRIPTION = "Synchronized MiniMax-H3 audio/video overlap-add context windows with absolute RoPE preservation."
 
     def patch(self, model, window_frames, overlap_frames, stagger, blend,
-              segment_seams="blend", freenoise=True, audio_context="auto", handoff="off", lead=0.5):
+              segment_seams="blend", freenoise=True, audio_context="auto", handoff="off", lead=0.5,
+              layout_guide=ContextPolicy.layout_guide, layout_guide_until=ContextPolicy.layout_guide_until):
         return (_install_context(model, window_frames, overlap_frames, stagger, blend,
-                                 segment_seams, freenoise, audio_context, handoff, lead),)
+                                 segment_seams, freenoise, audio_context, handoff, lead, layout_guide, layout_guide_until),)
 
 
 class H3ForgeTimelineContextWindows:
@@ -447,7 +460,8 @@ class H3ForgeTimelineContextWindows:
     )
 
     def patch(self, model, width, height, duration_seconds, max_window_seconds, stagger, blend,
-              segment_seams="blend", freenoise=True, latent=None, audio_context="auto", handoff="off", lead=0.5):
+              segment_seams="blend", freenoise=True, latent=None, audio_context="auto", handoff="off", lead=0.5,
+              layout_guide=ContextPolicy.layout_guide, layout_guide_until=ContextPolicy.layout_guide_until):
         _require_h3(model)  # before allocating anything on a wrong model
         try:
             if latent is not None:
@@ -479,7 +493,7 @@ class H3ForgeTimelineContextWindows:
         print(f"{LOG} timeline {source}: {frame_count} frames ({frame_count / 24:.2f}s) -> {plan.latent_t} latents; "
               f"cap {cap_latents_for_seconds(max_window_seconds)} latents -> {summary}", flush=True)
         patched = _install_context(model, window, overlap, stagger, blend, segment_seams, freenoise,
-                                   audio_context, handoff, lead)
+                                   audio_context, handoff, lead, layout_guide, layout_guide_until)
         return (patched, latent)
 
 
@@ -510,6 +524,7 @@ class H3ForgePipePrompt:
                         "inside <|...|> is never split whatever you choose."
                     ),
                 }),
+                "prepare_layout_guide": PREPARE_LAYOUT_GUIDE,
             },
         }
 
@@ -525,9 +540,9 @@ class H3ForgePipePrompt:
         "MiniMax's own <|cutoff|>-style tokens are never split."
     )
 
-    def encode(self, clip, prompt, global_prompt="", segment_durations="", delimiter="|"):
+    def encode(self, clip, prompt, global_prompt="", segment_durations="", delimiter="|", prepare_layout_guide=False):
         try:
-            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations, delimiter),)
+            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations, delimiter, prepare_layout_guide),)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
 
@@ -544,6 +559,7 @@ class H3ForgeReferencePipePrompt:
         }
         for _, prefix, kind, count in REFERENCE_INPUTS:
             optional.update({f"{prefix}_{i}": (kind,) for i in range(1, count + 1)})
+        optional["prepare_layout_guide"] = PREPARE_LAYOUT_GUIDE
         return {"required": {
             "clip": ("CLIP",),
             "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
@@ -564,11 +580,12 @@ class H3ForgeReferencePipePrompt:
     )
 
     def encode(self, clip, prompt, width, height, length, ref_image_size="match", vae=None, audio_vae=None,
-               global_prompt="", segment_durations="", delimiter="|", **references):
+               global_prompt="", segment_durations="", delimiter="|", prepare_layout_guide=False, **references):
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
         texts = split_pipe_prompt(prompt, delimiter)
         durations = parse_segment_durations(segment_durations, len(texts))
+        setting = layout_setting_text(global_prompt, prepare_layout_guide, len(texts))
         texts = compose_segment_prompts(texts, global_prompt)
         groups = {}
         for name, prefix, _, count in REFERENCE_INPUTS:
@@ -594,14 +611,17 @@ class H3ForgeReferencePipePrompt:
             clip=SimpleNamespace(tokenize=tokenize, encode_from_tokens_scheduled=clip.encode_from_tokens_scheduled),
             vae=vae, audio_vae=audio_vae, prompt=texts[0], width=width, height=height,
             length=length, ref_image_size=ref_image_size, **groups)
-        conditionings = [first]
         shared_refs = first[0][1].get("minimax_refs")
-        for text in texts[1:]:
+
+        def encode(text):
             conditioning = clip.encode_from_tokens_scheduled(clip.tokenize(text, **presentation))
             if shared_refs is not None:
                 conditioning = [[c, {**meta, "minimax_refs": shared_refs}] for c, meta in conditioning]
-            conditionings.append(conditioning)
-        return combine_conditioning_segments(conditionings, durations), latent
+            return conditioning
+
+        conditionings = [first, *(encode(text) for text in texts[1:])]
+        packed = combine_conditioning_segments(conditionings, durations, layout_conditioning=encode(setting) if setting else None)
+        return packed, latent
 
 
 RENOISE_PLAN = "H3FORGE_RENOISE"

@@ -9,8 +9,9 @@ import torch
 from .beat_refs import BEAT_REFS_KEY, beat_ref_keeps, filter_payload
 from .control import control_window
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
+from .layout_guide import shared_layout_prediction, spatial_lowpass
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -30,12 +31,16 @@ class ContextPolicy:
     audio_context: str = "auto"
     handoff: str = "off"
     lead: float = 0.5
+    layout_guide: float = 0.0
+    layout_guide_until: float = 0.92
 
     def __post_init__(self):
         if self.handoff not in HANDOFF_MODES:
             raise ValueError(f"handoff must be one of {HANDOFF_MODES}, got {self.handoff!r}")
         if not 0.0 <= self.lead <= 1.0:
             raise ValueError(f"lead must be in [0, 1], got {self.lead!r}")
+        if not 0.0 <= self.layout_guide <= 1.0 or not 0.0 <= self.layout_guide_until <= 1.0:
+            raise ValueError("layout_guide and layout_guide_until must both be in [0, 1]")
         if self.segment_seams not in SEGMENT_SEAMS:
             raise ValueError(f"segment_seams must be one of {SEGMENT_SEAMS}, got {self.segment_seams!r}")
         if self.audio_context not in AUDIO_CONTEXT_MODES:
@@ -453,7 +458,8 @@ def make_context_wrapper(policy: ContextPolicy):
         prompts = payload.get("h3forge_prompt_segments") or (context,)
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        sigma = resolve_sigma(transformer_options) if policy.layout_guide else None
+        step, _ = resolve_step(transformer_options, sigma=sigma)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         beat_refs = transformer_options.get(BEAT_REFS_KEY)
@@ -523,11 +529,32 @@ def make_context_wrapper(policy: ContextPolicy):
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None), handoff_log,
                   flush=True)
 
+        guide = None
+        if policy.layout_guide and total_t > window:
+            # An absolute cutoff survives frozen_sample replaying the head and
+            # starting a fresh sampler at local index zero on its low-noise tail.
+            if sigma is None:
+                sigma = float(timestep.flatten()[0]) / 1000.0
+            if sigma > policy.layout_guide_until:
+                guide_text = payload.get("h3forge_layout_conditioning")
+                if segmented and guide_text is None:
+                    raise ValueError("layout_guide on beat prompts requires prepare_layout_guide and global_prompt "
+                                     "on the pipe node, or layout_conditioning in combine_conditioning_segments")
+                text, text_tags = guide_text if segmented else (prompts[0], tags[0] if tags is not None else None)
+                guide = shared_layout_prediction(executor, x, timestep, text, text_tags, transformer_options, kwargs,
+                                                 full_layout, window, padded_h, padded_w, ref_keeps)
+            if step == 0:
+                print(f"{LOG} layout_guide={policy.layout_guide:g} until={policy.layout_guide_until:g} "
+                      f"sigma={sigma:g} active={guide is not None}"
+                      + (f" sparse_video={guide.low_video.shape[2]}/{total_t} sparse_audio={guide.audio_ticks}/{audio_t}"
+                         if guide is not None else ""), flush=True)
+
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
         writes, reads = _video_fusion_spans(plan, ranges, total_t, policy.handoff)
+        delta_squares, delta_values = 0, 0
         for i, (index, v0, v1, _, _, owned, excluded) in enumerate(plan):
             a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
             if window_audio and audio_win < audio_t:
@@ -571,11 +598,21 @@ def make_context_wrapper(policy: ContextPolicy):
                 else:
                     transformer_options["h3forge_active_layout"] = previous_layout
 
+            if guide is not None:
+                delta = (guide.low_for_window(v0, v1) - spatial_lowpass(v_out)) * policy.layout_guide
+                mask = local_kwargs["denoise_mask"]
+                if mask is not None:
+                    delta = delta.masked_fill(mask == 0, 0)
+                v_out = v_out.float() + delta
             if policy.handoff == "off":
                 vw = blend_weights(v1 - v0, overlap, device=v_out.device, dtype=torch.float32, mode=policy.blend,
                                    ramp_start=v0 > 0, ramp_end=v1 < total_t).view(1, 1, -1, 1, 1)
             for w0, w1 in writes[i]:
                 keep = slice(w0 - v0, w1 - v0)
+                if guide is not None and step == 0:
+                    contribution = delta[:, :, keep]
+                    delta_squares += contribution.square().sum()
+                    delta_values += contribution.numel()
                 if policy.handoff == "off":
                     video_acc[:, :, w0:w1].add_(v_out[:, :, keep].float() * vw[:, :, keep])
                     video_den[:, :, w0:w1].add_(vw[:, :, keep])
@@ -597,6 +634,9 @@ def make_context_wrapper(policy: ContextPolicy):
         # Unconditional: a zero-weight latent would otherwise divide by the clamp
         # floor and decode as a silent black smear. The check is one comparison.
         assert_full_coverage(video_den, audio_den)
+        if delta_values:
+            print(f"{LOG} layout guide writable low-band delta_rms={(delta_squares / delta_values).sqrt().item():.6g}",
+                  flush=True)
         return [(video_acc / video_den.clamp_min(1e-6)).to(video_x.dtype),
                 (audio_acc / audio_den.clamp_min(1e-6)).to(audio_x.dtype)]
 

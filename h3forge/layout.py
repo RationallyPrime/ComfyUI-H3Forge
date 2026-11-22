@@ -46,17 +46,25 @@ def video_shape_from_layout(layout) -> tuple[int, int]:
     return latent_t, int(times.numel() // latent_t)
 
 
+def video_frame_positions(layout):
+    """Absolute H3 time of each physical video latent."""
+    seg = target_segments(layout)
+    latent_t, rows = video_shape_from_layout(layout)
+    return layout.position_ids[seg.video_start:seg.video_stop, 0].reshape(latent_t, rows)[:, 0]
+
+
 def clone_window_layout(
     *,
     full_layout,
     text_len: int,
     video_shape: tuple[int, int, int],
     audio_t: int,
-    video_range: tuple[int, int],
-    audio_range: tuple[int, int],
+    video_range: tuple[int, int] | None = None,
+    audio_range: tuple[int, int] | None = None,
     keyframes=None,
     refs=None,
     ref_keep=None,
+    sparse_indices=None,
 ):
     """Build a local H3 PackedLayout, then transplant global target positions.
 
@@ -66,13 +74,23 @@ def clone_window_layout(
     ``ref_keep`` (ascending positions in ``refs``) packs only those references
     into the window. Each kept reference stays at the coordinates it has in the
     full layout, so a reference shared by two beats sits at one position in both.
+    The layout guide supplies two physical index lists in sparse_indices for
+    non-contiguous video and stereo audio.
     """
     from comfy.ldm.minimax.model import PackedLayout
 
-    v0, v1 = video_range
-    a0, a1 = audio_range
+    if sparse_indices is None:
+        v0, v1 = video_range
+        a0, a1 = audio_range
+        video_selection, audio_selection = slice(v0, v1), slice(a0, a1)
+        video_count, audio_count = v1 - v0, a1 - a0
+    else:
+        video_selection, audio_selection = sparse_indices
+        v0, v1 = video_selection[0], video_selection[-1] + 1
+        a0, a1 = audio_selection[0], audio_selection[-1] + 1
+        video_count, audio_count = len(video_selection), len(audio_selection)
     local_t, latent_h, latent_w = map(int, video_shape)
-    if local_t != v1 - v0:
+    if local_t != video_count:
         raise ValueError(f"local video shape T={local_t} does not match window {video_range}")
     if not (0 <= a0 < a1 <= int(audio_t)):
         raise ValueError(f"invalid audio range {audio_range} for T={audio_t}")
@@ -81,9 +99,9 @@ def clone_window_layout(
     if ref_keep is not None:
         full_segments = _segments_without_dropped_refs(full_segments, refs or (), ref_keep)
         local_refs = [refs[i] for i in ref_keep]
-    local = PackedLayout(text_len, local_t, latent_h, latent_w, a1 - a0,
+    local = PackedLayout(text_len, local_t, latent_h, latent_w, audio_count,
                          keyframes=keyframes, refs=local_refs)
-    expected_signature = (int(text_len), local_t, latent_h, latent_w, a1 - a0)
+    expected_signature = (int(text_len), local_t, latent_h, latent_w, audio_count)
     if local.signature != expected_signature:
         raise ValueError(f"local PackedLayout signature {local.signature} != expected {expected_signature}")
     src = target_segments(full_layout)
@@ -102,20 +120,18 @@ def clone_window_layout(
             local.position_ids[la:lb] = full_layout.position_ids[fa:fb]
 
     full_t, frame_rows = video_shape_from_layout(full_layout)
-    if v1 > full_t:
+    if not 0 <= v0 < v1 <= full_t:
         raise ValueError(f"video window {video_range} exceeds full latent length {full_t}")
 
-    # Video rows are frame-major and therefore a contiguous slice.
-    src_v0 = src.video_start + v0 * frame_rows
-    src_v1 = src.video_start + v1 * frame_rows
-    local.position_ids[dst.video_start:dst.video_stop] = full_layout.position_ids[src_v0:src_v1]
-
-    # Audio rows are channel-major: [L0..Lt-1, R0..Rt-1].
+    # Video rows are frame-major and stereo audio rows are channel-major.
     full_audio_t = (src.audio_stop - src.audio_start) // 2
-    left = full_layout.position_ids[src.audio_start + a0:src.audio_start + a1]
-    right = full_layout.position_ids[src.audio_start + full_audio_t + a0:
-                                     src.audio_start + full_audio_t + a1]
-    local.position_ids[dst.audio_start:dst.audio_stop] = torch.cat([left, right], dim=0)
+    positions = full_layout.position_ids
+    video = positions[src.video_start:src.video_stop].reshape(full_t, frame_rows, -1)
+    audio = positions[src.audio_start:src.audio_stop].reshape(2, full_audio_t, -1)
+    local.position_ids[dst.video_start:dst.video_stop] = video[video_selection].flatten(0, 1)
+    local.position_ids[dst.audio_start:dst.audio_stop] = audio[:, audio_selection].flatten(0, 1)
+    if sparse_indices is not None:
+        local._h3forge_video_indices = tuple(video_selection)
     # Runtime-only metadata for compiler-friendly sparse mask arithmetic.
     local._h3forge_video_offset = int(v0)
     local._h3forge_audio_offset = int(a0)
