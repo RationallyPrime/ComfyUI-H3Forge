@@ -542,3 +542,100 @@ def test_lead_records_cleaner_owner_context_and_discards_reader_velocity(monkeyp
     _, baseline_audio = make_context_wrapper(ContextPolicy(85, 21, False))(
         _executor(control), x, torch.tensor([1000 * sigma]), text, options, denoise_mask=mask)
     assert torch.equal(audio, baseline_audio)
+
+
+@pytest.mark.parametrize("audio_context", ["full", "window"])
+@pytest.mark.parametrize("lead,masked", [(0.5, False), (0.5, True), (0.0, False), (1.0, False)])
+def test_audio_lead_gives_the_overlap_to_the_earlier_window(monkeypatch, capsys, audio_context, lead, masked):
+    from h3forge.context import AUDIO_HANDOFF_KEY, window_starts
+    from h3forge.layout import audio_range_for_video_window, audio_window_length
+
+    x, text = _handoff_inputs(monkeypatch)
+    sigma = 0.75
+    original = x[1].clone()
+    audio_t = original.shape[-1]
+    mask = (torch.arange(audio_t) % 3 / 2).view(1, 1, 1, audio_t).expand(1, 1, 2, audio_t).clone() if masked else None
+    full_mask = mask.clone() if masked else torch.ones(1, 1, 2, audio_t)
+    starts = window_starts(202, 85, 21)
+    calls, predictions = [], []
+
+    def predict(local_x, timestep, context, options, **kwargs):
+        i = len(calls)
+        layout = kwargs["minimax_payload"]["layout"]
+        seen_mask = kwargs.get("audio_denoise_mask")
+        calls.append((local_x[1].clone(), None if seen_mask is None else seen_mask.clone(),
+                      layout._h3forge_audio_offset))
+        velocity = local_x[1] * 2 + i + 1
+        predictions.append(velocity.clone())
+        return [local_x[0], velocity]
+
+    options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.]),
+               AUDIO_HANDOFF_KEY: "lead"}
+    kwargs = {"audio_denoise_mask": mask} if masked else {}
+    policy = ContextPolicy(85, 21, False, handoff="lead", lead=lead, audio_context=audio_context)
+    _, audio = make_context_wrapper(policy)(
+        _executor(predict), x, torch.tensor([1000 * sigma]), text, options, **kwargs)
+    log = capsys.readouterr().out
+    assert "audio hand-over: lead" in log
+    assert len(calls) == len(starts) == 3
+
+    import fake_minimax
+    reference = fake_minimax.PackedLayout(3, 202, 2, 2, audio_t)
+    ranges = [audio_range_for_video_window(reference, s, s + 85) for s in starts]
+    win = audio_window_length(reference, 85) if audio_context == "window" else audio_t
+    expected = torch.empty_like(original)
+    owned_until = 0
+    for i, (seen, seen_mask, offset) in enumerate(calls):
+        a0, a1 = ranges[i]
+        in_a0 = min(a0, audio_t - win) if win < audio_t else 0
+        assert offset == in_a0 and seen.shape[-1] == win
+        src = original[..., in_a0:in_a0 + win]
+        strength = full_mask[..., in_a0:in_a0 + win].clone()
+        read = (a0, min(owned_until, a1)) if i else (a0, a0)
+        if read[1] > read[0] and lead < 1.0:
+            local = slice(read[0] - in_a0, read[1] - in_a0)
+            v = expected[..., read[0]:read[1]]
+            want = src[..., local] + (lead - 1.0) * sigma * strength[..., local] * v
+            assert torch.allclose(seen[..., local], want, atol=1e-5)
+            strength[..., local] *= lead
+            untouched = torch.ones(win, dtype=torch.bool)
+            untouched[local] = False
+            assert torch.equal(seen[..., untouched], src[..., untouched])
+            assert torch.allclose(seen_mask, strength)
+        else:
+            assert torch.equal(seen, src)
+            assert (seen_mask is None) if not masked else torch.equal(seen_mask, strength)
+        write0 = max(a0, owned_until)
+        expected[..., write0:a1] = predictions[i][..., write0 - in_a0:a1 - in_a0]
+        owned_until = max(owned_until, a1)
+    assert owned_until == audio_t
+    assert torch.equal(audio, expected) and audio.isfinite().all()
+    assert torch.equal(x[1], original)
+    assert not masked or torch.equal(mask, full_mask)
+
+
+def test_audio_lead_is_off_unless_asked_and_rejects_unknown_modes(monkeypatch, capsys):
+    from h3forge.context import AUDIO_HANDOFF_KEY
+
+    x, text = _handoff_inputs(monkeypatch)
+    count = 0
+
+    def predict(local_x, *args, **kwargs):
+        nonlocal count
+        count += 1
+        assert kwargs.get("audio_denoise_mask") is None
+        return [local_x[0], local_x[1] + count]
+
+    def run(extra):
+        nonlocal count
+        count = 0
+        options = {"sigmas": torch.tensor([.75]), "sample_sigmas": torch.tensor([.75, 0.]), **extra}
+        return make_context_wrapper(ContextPolicy(85, 21, False, handoff="lead"))(
+            _executor(predict), x, torch.tensor([750.]), text, options)[1]
+
+    baseline = run({})
+    assert "audio hand-over" not in capsys.readouterr().out
+    assert torch.equal(run({AUDIO_HANDOFF_KEY: "blend"}), baseline)
+    with pytest.raises(ValueError, match="audio hand-over must be one of"):
+        run({AUDIO_HANDOFF_KEY: "later"})
+

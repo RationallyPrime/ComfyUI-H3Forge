@@ -458,3 +458,16 @@ def test_timeline_node_plans_from_a_connected_latent_and_passes_it_through(monke
     with pytest.raises(ValueError, match="AV latent"):
         nodes.H3ForgeTimelineContextWindows().patch(
             MinimalPatcher(), 32, 32, 3.0, 15.5, True, "pyramid", latent={"samples": torch.zeros(1, 24, 142, 4, 4)})
+
+
+def test_audio_handoff_node_sets_the_option_on_a_clone_and_clears_it(monkeypatch):
+    from h3forge.context import AUDIO_HANDOFF_KEY
+
+    nodes = _import_nodes(monkeypatch)
+    base = FakePatcher()
+    led, = nodes.H3ForgeAudioHandoff().patch(base, "lead")
+    assert led.model_options["transformer_options"][AUDIO_HANDOFF_KEY] == "lead"
+    assert base.model_options == {}
+    blended, = nodes.H3ForgeAudioHandoff().patch(led, "blend")
+    assert AUDIO_HANDOFF_KEY not in blended.model_options["transformer_options"]
+    assert "H3ForgeAudioHandoff" in nodes.NODE_CLASS_MAPPINGS and "H3ForgeAudioHandoff" in nodes.NODE_DISPLAY_NAME_MAPPINGS

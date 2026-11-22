@@ -17,6 +17,8 @@ _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
 HANDOFF_MODES = ("off", "earlier", "later", "lead")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
+AUDIO_HANDOFF_KEY = "h3forge_audio_handoff"
+AUDIO_HANDOFF_MODES = ("blend", "lead")
 
 
 @dataclass(frozen=True)
@@ -356,6 +358,60 @@ def _lead_context(video, mask, velocities, spans, start, timestep, lead):
     return video, mask
 
 
+def _audio_lead_spans(audio_ranges, audio_t):
+    """Per window: audio ticks it writes and ticks an earlier window already owns.
+
+    The earliest window covering a tick owns it, as the video rows are owned
+    under ``handoff=lead``.
+    """
+    owners = [-1] * audio_t
+    for i in reversed(range(len(audio_ranges))):
+        a0, a1 = audio_ranges[i]
+        owners[a0:a1] = [i] * (a1 - a0)
+    writes, reads = [], []
+    for i, (a0, a1) in enumerate(audio_ranges):
+        mine, seen = [], []
+        lo = a0
+        for owner, group in groupby(owners[a0:a1]):
+            hi = lo + sum(1 for _ in group)
+            if owner == i:
+                mine.append((lo, hi))
+            elif 0 <= owner < i:
+                seen.append((lo, hi))
+            lo = hi
+        writes.append(mine)
+        reads.append(seen)
+    return writes, reads
+
+
+def _audio_sigma(model, timestep, transformer_options):
+    """The audio stream's own sigma for this step (H3 shifts audio and video apart)."""
+    sigma_v = (timestep.flatten()[0].float() / 1000.0).clamp(min=1e-6)
+    shift_v = transformer_options.get("minimax_h3_sigma_shift_video", getattr(model, "sigma_shift_video", None))
+    shift_a = transformer_options.get("minimax_h3_sigma_shift_audio", getattr(model, "sigma_shift_audio", None))
+    if shift_v is None or shift_a is None or float(shift_v) == float(shift_a):
+        return sigma_v
+    from comfy.ldm.minimax.model import time_shift_sigma
+    return time_shift_sigma(sigma_v, float(shift_v), float(shift_a))
+
+
+def _lead_audio_context(audio, mask, velocities, spans, start, sigma, lead):
+    """Audio twin of ``_lead_context``: show read-only ticks at ``lead`` of their noise.
+
+    ``audio`` is the window's input slice starting at global tick ``start``;
+    ``velocities`` holds the owners' raw audio velocity on the full timeline.
+    """
+    audio = audio.clone()
+    mask = torch.ones_like(audio[:, :1], dtype=torch.float32) if mask is None else mask.float().clone()
+    delta_sigma = sigma * (lead - 1.0)
+    for lo, hi in spans:
+        local = slice(lo - start, hi - start)
+        strength = mask[..., local]
+        audio[..., local] = (audio[..., local].float() + delta_sigma * strength * velocities[..., lo:hi]).to(audio.dtype)
+        strength.mul_(lead)
+    return audio, mask
+
+
 def _segment_windows(total, window, overlap, ranges):
     """Give every beat forwards and exclusive output ownership on the native grid.
 
@@ -523,13 +579,27 @@ def make_context_wrapper(policy: ContextPolicy):
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None), handoff_log,
                   flush=True)
 
+        # Audio lead: the audio twin of handoff=lead. Without it every window writes
+        # its whole audio span and overlaps are averaged, so a line the later window
+        # starts inside the overlap is mixed with the earlier window's sound and lost.
+        audio_handoff = transformer_options.get(AUDIO_HANDOFF_KEY, "blend")
+        if audio_handoff not in AUDIO_HANDOFF_MODES:
+            raise ValueError(f"{LOG} audio hand-over must be one of {AUDIO_HANDOFF_MODES}, got {audio_handoff!r}")
+        audio_ranges = [audio_range_for_video_window(full_layout, p[1], p[2]) for p in plan]
+        # Owned and rescued windows already clip audio to their beat; leave them alone.
+        audio_lead = audio_handoff == "lead" and not any(p[5] or p[6] for p in plan)
+        audio_writes, audio_reads = _audio_lead_spans(audio_ranges, audio_t) if audio_lead else (None, None)
+        if step == 0 and audio_handoff == "lead":
+            print(f"{LOG} audio hand-over: " + (f"lead={policy.lead:g}, earlier window owns each overlap" if audio_lead
+                  else "lead requested but this plan has exclusive beats; audio stays blended"), flush=True)
+
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
         video_den = torch.zeros((1, 1, total_t, 1, 1), device=video_x.device, dtype=torch.float32)
         audio_den = torch.zeros((1, 1, 1, audio_t), device=audio_x.device, dtype=torch.float32)
         writes, reads = _video_fusion_spans(plan, ranges, total_t, policy.handoff)
         for i, (index, v0, v1, _, _, owned, excluded) in enumerate(plan):
-            a0, a1 = audio_range_for_video_window(full_layout, v0, v1)
+            a0, a1 = audio_ranges[i]
             if window_audio and audio_win < audio_t:
                 in_a0 = min(a0, audio_t - audio_win)
                 in_a1 = in_a0 + audio_win
@@ -557,6 +627,13 @@ def make_context_wrapper(policy: ContextPolicy):
             if reads[i] and policy.lead < 1.0:
                 local_x[0], local_kwargs["denoise_mask"] = _lead_context(
                     local_x[0], local_kwargs.get("denoise_mask"), video_acc, reads[i], v0, timestep, policy.lead)
+            if audio_lead and policy.lead < 1.0:
+                spans = [(max(lo, in_a0), min(hi, in_a1)) for lo, hi in audio_reads[i]]
+                spans = [(lo, hi) for lo, hi in spans if lo < hi]
+                if spans:
+                    local_x[1], local_kwargs["audio_denoise_mask"] = _lead_audio_context(
+                        local_x[1], local_kwargs.get("audio_denoise_mask"), audio_acc, spans, in_a0,
+                        _audio_sigma(model, timestep, transformer_options), policy.lead)
             sentinel = object()
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
@@ -583,6 +660,11 @@ def make_context_wrapper(policy: ContextPolicy):
                     video_acc[:, :, w0:w1].copy_(v_out[:, :, keep])
                     video_den[:, :, w0:w1] = 1
 
+            if audio_lead:
+                for w0, w1 in audio_writes[i]:
+                    audio_acc[..., w0:w1].copy_(a_out[..., w0 - in_a0:w1 - in_a0])
+                    audio_den[..., w0:w1] = 1
+                continue
             write_a0, write_a1 = a0, a1
             if owned:
                 write_a0, write_a1 = max(a0, audio_cuts[index]), min(a1, audio_cuts[index + 1])
