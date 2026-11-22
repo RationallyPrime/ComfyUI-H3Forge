@@ -8,7 +8,16 @@ from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
 from .beat_refs import BEAT_REFS_KEY, parse_beat_refs
-from .context import AUDIO_CONTEXT_MODES, HANDOFF_MODES, SEGMENT_SEAMS, ContextPolicy, make_context_wrapper, make_freenoise_wrapper
+from .context import (
+    AUDIO_CONTEXT_MODES,
+    AUDIO_HANDOFF_KEY,
+    AUDIO_HANDOFF_MODES,
+    HANDOFF_MODES,
+    SEGMENT_SEAMS,
+    ContextPolicy,
+    make_context_wrapper,
+    make_freenoise_wrapper,
+)
 from .layout import padded_spatial_shape
 from .nag import NAG_MODES, NAGConfig
 from . import renoise
@@ -798,6 +807,39 @@ class H3ForgeBeatRefMods:
         return (patched,)
 
 
+class H3ForgeAudioHandoff:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {"tooltip": "The model line, before or after the context windows node."}),
+            "audio_handoff": (list(AUDIO_HANDOFF_MODES), {"default": "lead", "tooltip": (
+                "How neighbouring windows share the sound where they overlap. blend: every window writes its "
+                "whole span and overlaps are averaged (the behaviour without this node). lead: the earlier window "
+                "owns the overlap, and the later window hears that sound at the context windows' lead fraction "
+                "and writes only after it, as the picture does under handoff=lead.")}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/context"
+    EXPERIMENTAL = True
+    DESCRIPTION = (
+        "Sets how H3 Forge context windows hand the audio over. With lead, a later window is given the earlier "
+        "window's overlap sound to continue from, so a line is not started inside the overlap and averaged away. "
+        "Needs H3 Forge context windows on the same model; uses their lead value."
+    )
+
+    def patch(self, model, audio_handoff):
+        patched = model.clone()
+        opts = patched.model_options.setdefault("transformer_options", {})
+        if audio_handoff == "blend":
+            opts.pop(AUDIO_HANDOFF_KEY, None)
+        else:
+            opts[AUDIO_HANDOFF_KEY] = audio_handoff
+        print(f"{LOG} audio hand-over set: {audio_handoff}", flush=True)
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
@@ -806,6 +848,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
     "H3ForgeBeatRefMods": H3ForgeBeatRefMods,
+    "H3ForgeAudioHandoff": H3ForgeAudioHandoff,
     "H3ForgeRenoiseWindow": H3ForgeRenoiseWindow,
     "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
@@ -817,6 +860,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
     "H3ForgeBeatRefMods": "H3 Forge — RefMods Per Beat",
+    "H3ForgeAudioHandoff": "H3 Forge — Audio Hand-over",
     "H3ForgeRenoiseWindow": "H3 Forge — Masked Interval Renoise",
     "H3ForgeRenoiseStitch": "H3 Forge — Renoise Stitch",
 }
