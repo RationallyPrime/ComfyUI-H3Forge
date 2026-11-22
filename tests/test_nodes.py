@@ -106,6 +106,10 @@ def test_context_node_exposes_core_parity_defaults(monkeypatch):
         assert inputs["handoff"][1]["default"] == "off"
         kind, bounds = inputs["lead"]
         assert (kind, bounds["default"], bounds["min"], bounds["max"]) == ("FLOAT", .5, 0., 1.)
+        assert inputs["layout_guide"][1]["default"] == 0
+        assert inputs["layout_guide_until"][1]["default"] == .92
+    for node in (nodes.H3ForgePipePrompt, nodes.H3ForgeReferencePipePrompt):
+        assert node.INPUT_TYPES()["optional"]["prepare_layout_guide"][1]["default"] is False
 
 
 def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(monkeypatch):
@@ -132,13 +136,16 @@ def test_context_node_installs_freenoise_sampler_wrapper_and_rejects_bad_seams(m
 
     policies = []
     monkeypatch.setattr(nodes, "make_context_wrapper", lambda policy: policies.append(policy))
-    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", handoff="later", lead=.25)
+    patched, = nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", handoff="later", lead=.25,
+                                                   layout_guide=.4, layout_guide_until=.75)
     assert (policies[0].handoff, policies[0].lead) == ("later", .25)
+    assert (policies[0].layout_guide, policies[0].layout_guide_until) == (.4, .75)
     assert ("sampler_sample", nodes.CTX_KEY) in patched.wrappers
     assert ("diffusion", nodes.CTX_KEY) in patched.wrappers
     with pytest.raises(ValueError, match="segment_seams"):
         nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", segment_seams="soft")
-    for invalid in ({"handoff": "bad"}, {"lead": -.01}, {"lead": 1.01}):
+    for invalid in ({"handoff": "bad"}, {"lead": -.01}, {"lead": 1.01}, {"layout_guide": float("nan")},
+                    {"layout_guide_until": 1.01}):
         with pytest.raises(ValueError, match=next(iter(invalid))):
             nodes.H3ForgeContextWindows().patch(MinimalPatcher(), 25, 8, True, "pyramid", **invalid)
     with pytest.raises(ValueError, match="audio_context"):
@@ -302,7 +309,8 @@ def test_bound_forward_wrapper_survives_runtime_option_reconstruction(monkeypatc
     assert run(nag_only) == ("dense", True)
 
 
-def test_reference_pipe_node_prepares_native_refs_once(monkeypatch):
+@pytest.mark.parametrize("prepare", [False, True])
+def test_reference_pipe_node_prepares_native_refs_once(monkeypatch, prepare):
     nodes = _import_nodes(monkeypatch)
     core = types.ModuleType("comfy_extras.nodes_minimax_h3")
     calls, texts = [], []
@@ -334,15 +342,17 @@ def test_reference_pipe_node_prepares_native_refs_once(monkeypatch):
         clip=Clip(), vae=object(), audio_vae=object(), ref_image_1=image,
         ref_audio_1=voice, ref_video_2=video, ref_video_audio_2=voice,
         prompt="short segment | a deliberately longer segment", width=864, height=480, length=124,
-        global_prompt="same woman and red coat", segment_durations="2,8")
+        global_prompt="same woman and red coat", segment_durations="2,8", prepare_layout_guide=prepare)
     assert len(calls) == 1
     assert calls[0]["ref_images"] == {"ref_image_1": image}
     assert calls[0]["ref_audios"] == {"ref_audio_1": voice}
     assert calls[0]["ref_videos"] == {"ref_video_2": video}
     assert calls[0]["ref_video_audios"] == {"ref_video_audio_2": voice}
-    assert [text for text, _ in texts] == ["same woman and red coat\n\nshort segment",
-                                           "same woman and red coat\n\na deliberately longer segment"]
-    assert texts[0][1] == texts[1][1]
+    expected = ["same woman and red coat\n\nshort segment", "same woman and red coat\n\na deliberately longer segment"]
+    assert [text for text, _ in texts] == expected + (["same woman and red coat"] if prepare else [])
+    assert all(presentation == texts[0][1] for _, presentation in texts)
+    assert ("h3forge_layout_conditioning" in conditioning[0][1]) == prepare
+    assert len(conditioning[0][1]["h3forge_prompt_segments"]) == 2
     assert conditioning[0][1]["minimax_refs"] is shared
     assert conditioning[0][1]["h3forge_prompt_segment_durations"] == (2, 8)
     assert latent == {"samples": "native-latent"}

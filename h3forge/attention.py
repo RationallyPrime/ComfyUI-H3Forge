@@ -103,6 +103,8 @@ def _can_sparse(state, q, kwargs):
         return "not-dit-block"
     if state.layout is None:
         return "no-layout"
+    if getattr(state.layout, "_h3forge_video_indices", None) is not None:
+        return "sparse-layout-guide"
     if q.ndim != 4 or q.shape[0] != 1:
         return "unexpected-q-shape"
     if q.shape[2] != state.layout.seq_len:
@@ -397,6 +399,7 @@ def make_attention_override(state):
         else:
             if state.policy.strict and reason not in {
                 "mode=dense", "not-dit-block", "first-dense-layers", "first-dense-steps",
+                "sparse-layout-guide",
             }:
                 raise RuntimeError(f"{LOG} sparse attention contract declined: {reason}")
             state.note_decline(reason)

@@ -187,6 +187,8 @@ def make_segmented_extra_conds(
     base_extra_conds: Callable,
     base_model,
     diffusion,
+    *,
+    layout_guide=False,
 ):
     """Carry raw pipe contexts through MiniMax's existing constant payload."""
     def extra_conds(**kwargs):
@@ -209,12 +211,18 @@ def make_segmented_extra_conds(
         payload = dict(payload_cond.cond)
         payload["h3forge_prompt_segments"] = tuple(processed)
         payload["h3forge_prompt_segment_tags"] = kwargs["h3forge_prompt_segment_tags"]
+        guide = kwargs.get("h3forge_layout_conditioning")
+        if layout_guide and guide is not None:
+            raw, tags = guide
+            refined = diffusion.preprocess_text_embeds(raw.to(device=device, dtype=dtype))
+            payload["h3forge_layout_conditioning"] = (refined, tags)
         # This full layout is a coordinate template only. Local calls contain
         # each segment's real tokens, with refs/targets at one common origin.
+        layout_text_len = max(c.shape[1] for c in processed)
         layout = payload.get("layout")
-        if layout is not None and max(c.shape[1] for c in processed) != layout.signature[0]:
+        if layout is not None and layout_text_len != layout.signature[0]:
             from comfy.ldm.minimax.model import PackedLayout
-            payload["layout"] = PackedLayout(max(c.shape[1] for c in processed), *layout.signature[1:],
+            payload["layout"] = PackedLayout(layout_text_len, *layout.signature[1:],
                                               keyframes=payload.get("keyframes"), refs=payload.get("refs"))
         durations = kwargs.get("h3forge_prompt_segment_durations")
         if durations is not None:
@@ -230,6 +238,8 @@ def make_segmented_extra_conds(
 def combine_conditioning_segments(
     conditionings: Sequence,
     durations: Sequence[Duration] | None = None,
+    *,
+    layout_conditioning=None,
 ):
     """Combine independently encoded MiniMax conditionings into one timeline.
 
@@ -237,24 +247,28 @@ def combine_conditioning_segments(
     payload metadata. The first entry supplies the shared payload while every
     native-length context remains available for per-window selection.
     """
+    entries = list(conditionings)
+    beat_count = len(entries)
+    if not beat_count:
+        raise ValueError("at least one prompt segment is required")
     encoded = []
     metadata = []
-    for conditioning in conditionings:
+    if layout_conditioning is not None:
+        entries.append(layout_conditioning)
+    for conditioning in entries:
         if len(conditioning) != 1:
             raise ValueError("pipe prompt segments must each encode to one conditioning entry")
         encoded.append(conditioning[0][0])
         metadata.append(conditioning[0][1])
 
-    if not encoded:
-        raise ValueError("at least one prompt segment is required")
     for context in encoded:
         if context.ndim != 3 or context.shape[0] != 1 or context.shape[1] < 1:
             raise ValueError(f"expected segment context [1,T,C], got {tuple(context.shape)}")
         if context.shape[-1] != encoded[0].shape[-1]:
             raise ValueError("all segment contexts must have the same channel width")
-    resolved_durations = tuple(_duration_fraction(v) for v in (durations or (1,) * len(encoded)))
-    if len(resolved_durations) != len(encoded):
-        raise ValueError(f"expected one duration per prompt segment ({len(encoded)} segments)")
+    resolved_durations = tuple(_duration_fraction(v) for v in (durations or (1,) * beat_count))
+    if len(resolved_durations) != beat_count:
+        raise ValueError(f"expected one duration per prompt segment ({beat_count} segments)")
     tags = [meta.get("minimax_token_tags", torch.ones(c.shape[1], dtype=torch.long)).reshape(-1)
             for c, meta in zip(encoded, metadata)]
     for context, tag in zip(encoded, tags):
@@ -272,6 +286,8 @@ def combine_conditioning_segments(
                 raise ValueError(f"pipe prompt segments 1 and {index} produce different MiniMax token tags")
 
     primary_meta = metadata[0].copy()
+    if layout_conditioning is not None:
+        primary_meta["h3forge_layout_conditioning"] = (encoded.pop(), tags.pop())
     primary_meta["minimax_token_tags"] = tags[0]
     primary_meta["h3forge_prompt_segments"] = tuple(encoded)
     primary_meta["h3forge_prompt_segment_tags"] = tuple(tags)
@@ -280,19 +296,32 @@ def combine_conditioning_segments(
     return [[encoded[0], primary_meta]]
 
 
+def layout_setting_text(global_prompt, enabled, beat_count):
+    """Select the authored setting before allocating the encoder or reference latents."""
+    if not enabled or beat_count < 2:
+        return None
+    setting = global_prompt.strip()
+    if not setting:
+        raise ValueError("prepare_layout_guide needs a shared setting in global_prompt")
+    return setting
+
+
 def encode_pipe_prompt(
     clip,
     prompt: str,
     global_prompt: str = "",
     segment_durations: str = "",
     delimiter: str = DEFAULT_SEGMENT_DELIMITER,
+    prepare_layout_guide: bool = False,
 ):
     """Encode each text-only timeline segment and return one annotated conditioning."""
     texts = split_pipe_prompt(prompt, delimiter)
     durations = parse_segment_durations(segment_durations, len(texts))
+    setting = layout_setting_text(global_prompt, prepare_layout_guide, len(texts))
     texts = compose_segment_prompts(texts, global_prompt)
-    conditionings = [
-        clip.encode_from_tokens_scheduled(clip.tokenize(text))
-        for text in texts
-    ]
-    return combine_conditioning_segments(conditionings, durations)
+
+    def encode(text):
+        return clip.encode_from_tokens_scheduled(clip.tokenize(text))
+
+    conditionings = [encode(text) for text in texts]
+    return combine_conditioning_segments(conditionings, durations, layout_conditioning=encode(setting) if setting else None)
