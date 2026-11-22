@@ -510,7 +510,8 @@ def test_lead_records_cleaner_owner_context_and_discards_reader_velocity(monkeyp
     options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.])}
     video, audio = make_context_wrapper(ContextPolicy(85, 21, False, handoff="lead", lead=lead))(
         _executor(predict), x, torch.tensor([1000 * sigma]), text, options, denoise_mask=mask)
-    (plan_log,) = capsys.readouterr().out.splitlines()
+    plan_log, audio_log = capsys.readouterr().out.splitlines()
+    assert "audio hand-over: lead" in audio_log
     assert "[H3Forge] context plan" in plan_log and f"handoff=lead lead={lead:g}" in plan_log
     assert len(calls) == len(starts) == 3
     for i, (seen, seen_mask) in enumerate(calls):
@@ -531,23 +532,14 @@ def test_lead_records_cleaner_owner_context_and_discards_reader_velocity(monkeyp
     assert torch.equal(video, expected_video) and video.isfinite().all()
     assert torch.equal(x[0], original)
     assert not masked or torch.equal(mask, original_mask)
-    # Audio still gets the same pyramid fusion for the same per-window predictions.
-    count = 0
-
-    def control(local_x, *args, **kwargs):
-        nonlocal count
-        count += 1
-        return [local_x[0], local_x[1] + count]
-
-    _, baseline_audio = make_context_wrapper(ContextPolicy(85, 21, False))(
-        _executor(control), x, torch.tensor([1000 * sigma]), text, options, denoise_mask=mask)
-    assert torch.equal(audio, baseline_audio)
+    # The audio side of the same hand-over is covered by the audio lead test below.
+    assert audio.isfinite().all()
 
 
 @pytest.mark.parametrize("audio_context", ["full", "window"])
 @pytest.mark.parametrize("lead,masked", [(0.5, False), (0.5, True), (0.0, False), (1.0, False)])
 def test_audio_lead_gives_the_overlap_to_the_earlier_window(monkeypatch, capsys, audio_context, lead, masked):
-    from h3forge.context import AUDIO_HANDOFF_KEY, window_starts
+    from h3forge.context import window_starts
     from h3forge.layout import audio_range_for_video_window, audio_window_length
 
     x, text = _handoff_inputs(monkeypatch)
@@ -569,8 +561,7 @@ def test_audio_lead_gives_the_overlap_to_the_earlier_window(monkeypatch, capsys,
         predictions.append(velocity.clone())
         return [local_x[0], velocity]
 
-    options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.]),
-               AUDIO_HANDOFF_KEY: "lead"}
+    options = {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.])}
     kwargs = {"audio_denoise_mask": mask} if masked else {}
     policy = ContextPolicy(85, 21, False, handoff="lead", lead=lead, audio_context=audio_context)
     _, audio = make_context_wrapper(policy)(
@@ -614,28 +605,23 @@ def test_audio_lead_gives_the_overlap_to_the_earlier_window(monkeypatch, capsys,
     assert not masked or torch.equal(mask, full_mask)
 
 
-def test_audio_lead_is_off_unless_asked_and_rejects_unknown_modes(monkeypatch, capsys):
-    from h3forge.context import AUDIO_HANDOFF_KEY
-
+def test_audio_leads_only_when_the_picture_leads(monkeypatch, capsys):
     x, text = _handoff_inputs(monkeypatch)
-    count = 0
+    masks = []
 
     def predict(local_x, *args, **kwargs):
-        nonlocal count
-        count += 1
-        assert kwargs.get("audio_denoise_mask") is None
-        return [local_x[0], local_x[1] + count]
+        masks.append(kwargs.get("audio_denoise_mask"))
+        return [local_x[0], local_x[1] + len(masks)]
 
-    def run(extra):
-        nonlocal count
-        count = 0
-        options = {"sigmas": torch.tensor([.75]), "sample_sigmas": torch.tensor([.75, 0.]), **extra}
-        return make_context_wrapper(ContextPolicy(85, 21, False, handoff="lead"))(
-            _executor(predict), x, torch.tensor([750.]), text, options)[1]
+    def run(handoff):
+        masks.clear()
+        options = {"sigmas": torch.tensor([.75]), "sample_sigmas": torch.tensor([.75, 0.])}
+        make_context_wrapper(ContextPolicy(85, 21, False, handoff=handoff))(
+            _executor(predict), x, torch.tensor([750.]), text, options)
+        return capsys.readouterr().out
 
-    baseline = run({})
-    assert "audio hand-over" not in capsys.readouterr().out
-    assert torch.equal(run({AUDIO_HANDOFF_KEY: "blend"}), baseline)
-    with pytest.raises(ValueError, match="audio hand-over must be one of"):
-        run({AUDIO_HANDOFF_KEY: "later"})
-
+    assert "audio hand-over: lead" in run("lead")
+    assert any(mask is not None for mask in masks)
+    for handoff in ("off", "later"):
+        assert "audio hand-over" not in run(handoff)
+        assert all(mask is None for mask in masks)

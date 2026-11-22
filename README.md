@@ -156,15 +156,11 @@ What it does per window: the window's beat picks the reference blocks, and the n
 
 Limits. Leave the bridge's `scramble_seed` at `-1` (a shuffle reorders blocks and the names would no longer line up; a count or shape mismatch is caught, a shuffle among equally shaped mods is not) and its `retention` above 0. The selection applies per window, so the overlap between two beats is denoised by each beat with its own references and then handed over as usual: write the passage between two places as one move the picture can make (a door, a turn, a cut to black), exactly as for any change between beats. The CPU tests prove the packing and the bookkeeping, including against ComfyUI's own `PackedLayout`; what a location change looks like on screen is a GPU question and is not yet measured.
 
-### H3 Forge — Audio Hand-over (experimental)
+### Audio at the hand-over
 
-Context windows hand the picture and the sound over by different rules. Under `handoff=lead` the earlier window owns the overlapping video rows and the later window is shown them at the `lead` fraction of their noise, so it continues from a formed picture. The sound has no such rule: every window writes its whole audio span and overlaps are averaged step by step. A later window starts its line at its own first tick, inside the overlap, where it is averaged against the earlier window's sound and where the picture still belongs to the earlier window. The first words of that line are lost.
+Under `handoff=lead` the sound is handed over by the same rule as the picture: the earliest window covering an audio tick owns it, and a later window receives the owner's overlap sound at the `lead` fraction of its noise (through `audio_denoise_mask`) and writes only after it. Before this, every window wrote its whole audio span and overlaps were averaged step by step, so a line the later window started inside the overlap lost its first words. There is no switch: it follows `handoff`. Plans with exclusive or rescued beats (`segment_seams = exclusive`, or a beat shorter than the stride) already clip audio to the beat and are unchanged; the log says which applies.
 
-This node gives the audio the same hand-over. With `audio_handoff = lead` the earliest window covering an audio tick owns it, and a later window receives the owner's overlap sound at the context windows' `lead` value (through `audio_denoise_mask`) and writes only after it. `blend` is the behaviour without the node.
-
-Wiring: put it anywhere on the model line that also carries the context windows node. It uses that node's `lead` value and does nothing without context windows. Plans with exclusive or rescued beats (`segment_seams = exclusive`, or a beat shorter than the stride) already clip audio to the beat, so audio stays as it is there and the log says so.
-
-Tested on CPU only so far: what each window is shown and what is written. Whether the later window then delays its line until after the overlap is a GPU question.
+Measured on GPU (four windows of 14.2 s overlapping 2.1 s, same seed and text with and without): the first words of the second and fourth window's lines, missing before, are spoken. A later window now starts speaking after the overlap, about 2 s later than before.
 
 ### H3 Forge — Normalized Attention Guidance (experimental)
 
