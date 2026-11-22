@@ -83,6 +83,11 @@ def shared_layout_prediction(executor, x, timestep, text, tags, options, kwargs,
         full_layout=full_layout, text_len=text.shape[1], video_shape=(len(vid), padded_h, padded_w),
         audio_t=audio_t, sparse_indices=(vid, aud), keyframes=payload.get("keyframes"),
         refs=payload.get("refs"), ref_keep=keep)
+    # An explicit setting can be longer than every beat. Keep its tokens contiguous
+    # before the native reference/target origin by translating only the wide text.
+    text_len = text.shape[1]
+    if text_len > full_layout.signature[0]:
+        layout.position_ids[:text_len, 0] -= text_len - full_layout.signature[0]
     wide_payload = {**(payload if keep is None else filter_payload(payload, keep)), "layout": layout}
     if tags is not None:
         wide_payload["text_token_tags"] = tags

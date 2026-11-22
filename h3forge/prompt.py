@@ -211,15 +211,14 @@ def make_segmented_extra_conds(
         payload = dict(payload_cond.cond)
         payload["h3forge_prompt_segments"] = tuple(processed)
         payload["h3forge_prompt_segment_tags"] = kwargs["h3forge_prompt_segment_tags"]
-        layout_text_len = max(c.shape[1] for c in processed)
         guide = kwargs.get("h3forge_layout_conditioning")
         if layout_guide and guide is not None:
             raw, tags = guide
             refined = diffusion.preprocess_text_embeds(raw.to(device=device, dtype=dtype))
             payload["h3forge_layout_conditioning"] = (refined, tags)
-            layout_text_len = max(layout_text_len, refined.shape[1])
         # This full layout is a coordinate template only. Local calls contain
         # each segment's real tokens, with refs/targets at one common origin.
+        layout_text_len = max(c.shape[1] for c in processed)
         layout = payload.get("layout")
         if layout is not None and layout_text_len != layout.signature[0]:
             from comfy.ldm.minimax.model import PackedLayout

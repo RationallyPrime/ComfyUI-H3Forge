@@ -9,7 +9,7 @@ from h3forge.beat_refs import BEAT_REFS_KEY, parse_beat_refs
 from h3forge.context import ContextPolicy, make_context_wrapper
 from h3forge.layout import audio_window_length, target_segments, video_frame_positions
 from h3forge.layout_guide import interpolate_sparse_video, sparse_video_indices, spatial_lowpass
-from h3forge.prompt import encode_pipe_prompt, make_segmented_extra_conds
+from h3forge.prompt import combine_conditioning_segments, encode_pipe_prompt, make_segmented_extra_conds
 from test_audit_repairs import _executor
 from test_beat_refs import _image_ref, _mod
 
@@ -194,6 +194,69 @@ def test_default_off_exact_and_missing_shared_setting_is_actionable(monkeypatch)
         assert all(torch.equal(a, b) for a, b in zip(control, out))
     with pytest.raises(ValueError, match="requires prepare_layout_guide"):
         run(False, ContextPolicy(8, 2, False, layout_guide=.5))
+
+
+@pytest.mark.parametrize("prebuilt", [True, False])
+def test_long_explicit_setting_uses_only_the_wide_text_prefix(monkeypatch, prebuilt):
+    fake_minimax.install(monkeypatch)
+    refs = [_image_ref(1, refmod=False)]
+    keyframes = [{"resolved_frame_index": 2, "latent": torch.ones(1, 1, 1, 2, 2),
+                  "audio_latent": torch.ones(1, 1, 2, 1)}]
+    meta = {"minimax_refs": refs, "minimax_keyframes": keyframes}
+    beats = [[[torch.ones(1, n, 2), meta]] for n in (2, 3)]
+    setting = [[torch.ones(1, 12, 2), meta]]
+    text, metadata = combine_conditioning_segments(beats, layout_conditioning=setting)[0]
+    video = torch.zeros(1, 1, 12, 2, 2)
+    audio = torch.arange(130.).reshape(1, 1, 2, 65)
+    mask = torch.ones_like(video)
+    mask[:, :, :4] = 0
+    shared = {"refs": refs, "keyframes": keyframes}
+    full = fake_minimax.PackedLayout(3, 12, 2, 2, 65, **shared)
+
+    def sample(strength, sigma):
+        native = dict(shared)
+        if prebuilt:
+            native["layout"] = fake_minimax.PackedLayout(2, 12, 2, 2, 65, **shared)
+        build = make_segmented_extra_conds(
+            lambda **_: {"minimax_payload": _Cond(native), "c_crossattn": _Cond(text)},
+            SimpleNamespace(get_dtype_inference=lambda: torch.float32),
+            SimpleNamespace(preprocess_text_embeds=lambda c: c), layout_guide=bool(strength))
+        payload = build(device="cpu", **metadata)["minimax_payload"].cond
+        local, wide = [], []
+
+        def predict(x, t, ctx, opts, **kwargs):
+            layout = kwargs["minimax_payload"]["layout"]
+            if hasattr(layout, "_h3forge_video_indices"):
+                wide.append((layout, x[1][0, 0, 0].long()))
+            else:
+                local.append(layout.position_ids.clone())
+            v = video_frame_positions(layout).float().view(1, 1, -1, 1, 1)
+            seg = target_segments(layout)
+            a = layout.position_ids[seg.audio_start:seg.audio_stop, 0].reshape_as(x[1]).float()
+            return x[0] + v, a
+
+        out = make_context_wrapper(ContextPolicy(8, 3, False, handoff="lead", layout_guide=strength))(
+            _executor(predict), [video, audio], torch.tensor([1000 * sigma]), text,
+            {"sigmas": torch.tensor([sigma]), "sample_sigmas": torch.tensor([sigma, 0.])},
+            minimax_payload=payload, denoise_mask=mask)
+        return local, wide, out
+
+    original, _, control = sample(0, .8)
+    late, no_guide, tail = sample(.5, .8)
+    assert len(late) == len(original) == 2 and not no_guide
+    assert all(torch.equal(a, b) for a, b in zip(late, original))
+    assert all(torch.equal(a, b) for a, b in zip(tail, control))
+    early, wide, _ = sample(.5, 1.)
+    assert all(torch.equal(a, b) for a, b in zip(early, original))
+    (layout, audio_indices), = wide
+    assert torch.equal(layout.position_ids[:12, 0], torch.arange(-9, 3))
+    for (a, b, kind), (c, d, _) in zip(layout.segments, full.segments):
+        if kind in ("cond", "cond_audio", "ref_img"):
+            assert torch.equal(layout.position_ids[a:b], full.position_ids[c:d])
+    src, dst = target_segments(full), target_segments(layout)
+    native_audio = full.position_ids[src.audio_start:src.audio_stop].reshape(2, 65, 3)
+    assert torch.equal(layout.position_ids[dst.audio_start:dst.audio_stop], native_audio[:, audio_indices].flatten(0, 1))
+    assert torch.equal(video_frame_positions(layout), video_frame_positions(full)[list(layout._h3forge_video_indices)])
 
 
 def test_cutoff_uses_pinned_simple_schedule_across_frozen_replays(monkeypatch):
