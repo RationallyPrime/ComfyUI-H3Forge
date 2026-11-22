@@ -17,8 +17,6 @@ _LATENT_CADENCE = 5
 SEGMENT_SEAMS = ("blend", "exclusive")
 HANDOFF_MODES = ("off", "earlier", "later", "lead")
 AUDIO_CONTEXT_MODES = ("auto", "window", "full")
-AUDIO_HANDOFF_KEY = "h3forge_audio_handoff"
-AUDIO_HANDOFF_MODES = ("blend", "lead")
 
 
 @dataclass(frozen=True)
@@ -579,19 +577,15 @@ def make_context_wrapper(policy: ContextPolicy):
                   audio_window=audio_win, seams=policy.segment_seams if segmented else None), handoff_log,
                   flush=True)
 
-        # Audio lead: the audio twin of handoff=lead. Without it every window writes
-        # its whole audio span and overlaps are averaged, so a line the later window
-        # starts inside the overlap is mixed with the earlier window's sound and lost.
-        audio_handoff = transformer_options.get(AUDIO_HANDOFF_KEY, "blend")
-        if audio_handoff not in AUDIO_HANDOFF_MODES:
-            raise ValueError(f"{LOG} audio hand-over must be one of {AUDIO_HANDOFF_MODES}, got {audio_handoff!r}")
+        # Audio lead: under handoff=lead the sound is handed over like the picture.
+        # Averaging the overlap instead loses a line the later window starts there.
         audio_ranges = [audio_range_for_video_window(full_layout, p[1], p[2]) for p in plan]
         # Owned and rescued windows already clip audio to their beat; leave them alone.
-        audio_lead = audio_handoff == "lead" and not any(p[5] or p[6] for p in plan)
+        audio_lead = policy.handoff == "lead" and not any(p[5] or p[6] for p in plan)
         audio_writes, audio_reads = _audio_lead_spans(audio_ranges, audio_t) if audio_lead else (None, None)
-        if step == 0 and audio_handoff == "lead":
+        if step == 0 and policy.handoff == "lead":
             print(f"{LOG} audio hand-over: " + (f"lead={policy.lead:g}, earlier window owns each overlap" if audio_lead
-                  else "lead requested but this plan has exclusive beats; audio stays blended"), flush=True)
+                  else "this plan has exclusive beats, which already clip audio to the beat; no lead"), flush=True)
 
         video_acc = torch.zeros_like(video_x, dtype=torch.float32)
         audio_acc = torch.zeros_like(audio_x, dtype=torch.float32)
