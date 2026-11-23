@@ -1,8 +1,23 @@
 from __future__ import annotations
 
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
+
+
+def _native_recorder_active(diffusion) -> bool:
+    """Whether ComfyUI's model allocation compiler is recording the forward that is running.
+
+    Core has kept the recorder in two places. Up to the build pinned in CI it sits on the diffusion
+    module as ``_comfy_malloc_graph``. From ComfyUI v0.45 it sits in ``comfy.model_prefetch``, keyed
+    by thread, and ``malloc_graph_recording()`` reports it. A check of the first place alone passes
+    silently on the newer core.
+    """
+    if getattr(diffusion, "_comfy_malloc_graph", None) is not None:
+        return True
+    recording = getattr(sys.modules.get("comfy.model_prefetch"), "malloc_graph_recording", None)
+    return bool(recording()) if callable(recording) else False
 
 
 def require_eager_allocations(diffusion):
@@ -12,7 +27,7 @@ def require_eager_allocations(diffusion):
     sparse/guidance buffers can abort the process in cudaFreeAsync. A Python
     exception cannot recover that crash. Use core's explicit compiler opt-out.
     """
-    if getattr(diffusion, "_comfy_malloc_graph", None) is not None:
+    if _native_recorder_active(diffusion):
         raise RuntimeError(
             "[H3Forge] ComfyUI's model allocation compiler is incompatible with Forge. "
             "Restart ComfyUI with --disable-comfy-compiler. Sparse FlexAttention compilation remains enabled."

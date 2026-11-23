@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from typing import Callable
 
@@ -16,6 +17,22 @@ def test_native_allocation_recorder_is_rejected_before_forward():
     require_eager_allocations(SimpleNamespace())
     with pytest.raises(RuntimeError, match="--disable-comfy-compiler"):
         require_eager_allocations(SimpleNamespace(_comfy_malloc_graph=object()))
+
+
+@pytest.mark.parametrize("recording", [True, False])
+def test_recorder_kept_by_thread_in_newer_core_is_rejected_too(monkeypatch, recording):
+    # ComfyUI v0.45 moved the recorder off the diffusion module into comfy.model_prefetch.
+    monkeypatch.setitem(sys.modules, "comfy.model_prefetch", SimpleNamespace(malloc_graph_recording=lambda: recording))
+    if recording:
+        with pytest.raises(RuntimeError, match="--disable-comfy-compiler"):
+            require_eager_allocations(SimpleNamespace())
+    else:
+        require_eager_allocations(SimpleNamespace())
+
+
+def test_core_without_a_recorder_report_is_accepted(monkeypatch):
+    monkeypatch.setitem(sys.modules, "comfy.model_prefetch", SimpleNamespace())
+    require_eager_allocations(SimpleNamespace())
 
 
 @pytest.mark.parametrize("order", [("attention", "nag"), ("nag", "attention")])
