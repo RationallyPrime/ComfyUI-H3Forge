@@ -24,6 +24,7 @@
 ./tests/core_source.py
 ./tests/test_audit_repairs.py
 ./tests/test_attention_math.py
+./tests/test_beat_control.py
 ./tests/test_beat_refs.py
 ./tests/test_context_math.py
 ./tests/test_layout_windows.py

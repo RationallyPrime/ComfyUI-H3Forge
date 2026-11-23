@@ -156,6 +156,22 @@ What it does per window: the window's beat picks the reference blocks, and the n
 
 Limits. Leave the bridge's `scramble_seed` at `-1` (a shuffle reorders blocks and the names would no longer line up; a count or shape mismatch is caught, a shuffle among equally shaped mods is not) and its `retention` above 0. The selection applies per window, so the overlap between two beats is denoised by each beat with its own references and then handed over as usual: write the passage between two places as one move the picture can make (a door, a turn, a cut to black), exactly as for any change between beats. The CPU tests prove the packing and the bookkeeping, including against ComfyUI's own `PackedLayout`; what a location change looks like on screen is a GPU question and is not yet measured.
 
+### H3 Forge — Control Per Beat (experimental)
+
+The native `MiniMaxH3FunControlNetApply` steers the whole take with one strength. This node sets that strength per beat of a pipe prompt, so a control video can steer some beats and leave others to their prompts. Place it anywhere on the model line, before or after the control node.
+
+`beats` holds one value per beat, separated by `|` or a new line:
+
+```text
+1 | 1 | 0
+```
+
+A value multiplies the strength set on the control node: `1` (or `on`) leaves it as set, `0` (or `off`) runs that beat without the control, `0.5` halves it. An empty field changes nothing. The number of values must equal the number of beats; a mismatch stops the run before the first window. The log prints the setting once per run as `control per beat: beat 1 = …, beat 2 = …`.
+
+What it does per window: each context window takes the value of its beat for its whole span, the overlap with its neighbours included, and the control's own strength is restored after the window's forward. At `0` the control network still runs for that window and its output is added with weight 0, so the window costs the same.
+
+Why it exists. A pose track (stick figures) fixes size, pose and place but carries no facing. Measured on GPU on one take (544x960, 217 latents in three windows of 90, one seed): the third beat asks for the figure seen from the front while the camera draws away; with the pose track on every beat she is drawn from behind from that beat on, and with the control at 0 for the third window she faces the camera to the end. That measurement used a test switch that set the strength to 0 for the third window; this node gives the same assignment by beat (one window per beat in that take) but has itself only CPU tests so far.
+
 ### Audio at the hand-over
 
 Under `handoff=lead` the sound is handed over by the same rule as the picture: the earliest window covering an audio tick owns it, and a later window receives the owner's overlap sound at the `lead` fraction of its noise (through `audio_denoise_mask`) and writes only after it. Before this, every window wrote its whole audio span and overlaps were averaged step by step, so a line the later window started inside the overlap lost its first words. There is no switch: it follows `handoff`. Plans with exclusive or rescued beats (`segment_seams = exclusive`, or a beat shorter than the stride) already clip audio to the beat and are unchanged; the log says which applies.

@@ -8,6 +8,7 @@ from comfy.patcher_extension import WrappersMP
 
 from .attention import LOG, make_attention_override, prune_run_caches
 from .beat_refs import BEAT_REFS_KEY, parse_beat_refs
+from .control import BEAT_CONTROL_KEY, describe_beat_control, parse_beat_control
 from .context import (
     AUDIO_CONTEXT_MODES,
     HANDOFF_MODES,
@@ -805,6 +806,41 @@ class H3ForgeBeatRefMods:
         return (patched,)
 
 
+class H3ForgeBeatControl:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "model": ("MODEL", {"tooltip": "The model line, before or after the MiniMax H3 Fun ControlNet."}),
+            "beats": ("STRING", {"default": "", "multiline": True, "tooltip": (
+                "How strongly the control network steers each beat of the pipe prompt. One value per beat, "
+                "separated by | or a new line. A value multiplies the strength set on the control node: 1 or on "
+                "= as set, 0 or off = that beat follows its prompt alone, 0.5 = half. Example: 1 | 1 | 0. "
+                "Empty = every beat as the control node says.")}),
+        }}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches/context"
+    EXPERIMENTAL = True
+    DESCRIPTION = (
+        "Sets the MiniMax H3 Fun ControlNet's strength for each beat of a pipe-prompt take, so a control video "
+        "(a pose track, say) can steer some beats and leave others to the prompt. A pose track carries no "
+        "facing, so a beat where the figure must face the camera while it recedes is better left to its prompt. "
+        "Needs H3 Forge context windows; each window takes the value of its beat."
+    )
+
+    def patch(self, model, beats):
+        scales = parse_beat_control(beats)
+        patched = model.clone()
+        opts = patched.model_options.setdefault("transformer_options", {})
+        if scales is None:
+            opts.pop(BEAT_CONTROL_KEY, None)
+        else:
+            opts[BEAT_CONTROL_KEY] = scales
+            print(f"{LOG} control per beat set: {describe_beat_control(scales)}", flush=True)
+        return (patched,)
+
+
 NODE_CLASS_MAPPINGS = {
     "H3ForgeAttention": H3ForgeAttention,
     "H3ForgeContextWindows": H3ForgeContextWindows,
@@ -813,6 +849,7 @@ NODE_CLASS_MAPPINGS = {
     "H3ForgeReferencePipePrompt": H3ForgeReferencePipePrompt,
     "H3ForgeNAG": H3ForgeNAG,
     "H3ForgeBeatRefMods": H3ForgeBeatRefMods,
+    "H3ForgeBeatControl": H3ForgeBeatControl,
     "H3ForgeRenoiseWindow": H3ForgeRenoiseWindow,
     "H3ForgeRenoiseStitch": H3ForgeRenoiseStitch,
 }
@@ -824,6 +861,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "H3ForgeReferencePipePrompt": "H3 Forge — Reference Pipe Timeline Prompt",
     "H3ForgeNAG": "H3 Forge — Normalized Attention Guidance",
     "H3ForgeBeatRefMods": "H3 Forge — RefMods Per Beat",
+    "H3ForgeBeatControl": "H3 Forge — Control Per Beat",
     "H3ForgeRenoiseWindow": "H3 Forge — Masked Interval Renoise",
     "H3ForgeRenoiseStitch": "H3 Forge — Renoise Stitch",
 }
