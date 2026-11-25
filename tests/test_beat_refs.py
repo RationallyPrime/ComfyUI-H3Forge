@@ -5,10 +5,11 @@ import pytest
 import torch
 
 import fake_minimax
-from core_source import native_h3
+from core_source import definitions, native_h3
 from fake_minimax import PackedLayout
 from h3forge.beat_refs import BEAT_REFS_KEY, BeatRefs, beat_ref_keeps, filter_payload, parse_beat_refs
 from h3forge.context import ContextPolicy, make_context_wrapper
+from h3forge.prompt import make_segmented_extra_conds
 from test_nodes import FakePatcher, _import_nodes
 
 
@@ -75,9 +76,9 @@ def test_keeps_drop_only_marked_refmods_and_leave_native_references():
     refs = [native, _image_ref(1), _image_ref(2), _image_ref(3)]
     spec = parse_beat_refs("a, b | a, c | *", [(_mod("a"), 1), (_mod("b"), 1), (_mod("c"), 1)])
     assert beat_ref_keeps(refs, spec, 3) == [(0, 1, 2), (0, 1, 3), None]
-    # Nothing to select from: no refs at all, or none the bridge injected.
-    assert beat_ref_keeps(None, spec, 3) is None
-    assert beat_ref_keeps([native], spec, 3) is None
+    # Nothing to select from on a negative pass: no refs at all, or none the bridge injected.
+    assert beat_ref_keeps(None, spec, 3, positive=False) is None
+    assert beat_ref_keeps([native], spec, 3, positive=False) is None
     assert beat_ref_keeps(refs, None, 3) is None
     assert beat_ref_keeps(refs, parse_beat_refs("* | * | a, b, c", [(_mod(n), 1) for n in "abc"]), 3) is None
 
@@ -316,3 +317,73 @@ def test_node_stores_the_spec_on_a_clone_and_clears_it_when_empty(monkeypatch):
     cleared, = nodes.H3ForgeBeatRefMods().patch(patched, MODS, "")
     assert BEAT_REFS_KEY not in cleared.model_options["transformer_options"]
     assert "H3ForgeBeatRefMods" in nodes.NODE_CLASS_MAPPINGS and "H3ForgeBeatRefMods" in nodes.NODE_DISPLAY_NAME_MAPPINGS
+
+
+@pytest.mark.parametrize("arrived", [2, 1, 0])
+@pytest.mark.parametrize("positive", [True, False])
+def test_reference_arrivals_on_positive_and_negative_passes(arrived, positive):
+    spec = parse_beat_refs("a | b", [(_mod("a"), 1), (_mod("b"), 1)])
+    refs = [_image_ref(1), _image_ref(2)][:arrived] or None
+    if arrived == 2:
+        assert beat_ref_keeps(refs, spec, 2, positive=positive) == [(0,), (1,)]
+    elif arrived == 1:
+        with pytest.raises(ValueError, match="set up for 2 reference\\(s\\) but the sampler received 1"):
+            beat_ref_keeps(refs, spec, 2, positive=positive)
+    elif positive:
+        with pytest.raises(ValueError, match="received 0.*reference-free baseline"):
+            beat_ref_keeps(refs, spec, 2, positive=positive)
+    else:
+        assert beat_ref_keeps(refs, spec, 2, positive=positive) is None
+
+
+def test_a_positive_window_pass_without_references_stops_before_any_window_runs(monkeypatch):
+    x, context, payload = _take(monkeypatch)
+    payload = {**payload, "refs": None}
+    spec = parse_beat_refs("dragons | lake", MODS)
+
+    def run(*args, **kwargs):
+        raise AssertionError("no window may run")
+
+    with pytest.raises(ValueError, match="received 0"):
+        make_context_wrapper(ContextPolicy(25, 8, False))(
+            _executor(run), x, torch.tensor([1000]), context, _options(spec), minimax_payload=payload)
+
+
+@pytest.mark.parametrize("beats", [1, 2])
+@pytest.mark.parametrize("group,conditioning,slots,negative", [
+    ("negative", {}, [1], True),                         # ordinary CFG
+    ("negative", {}, [0], True),                         # negative-only forward, DualCFG
+    ("middle", {"prompt_type": "negative"}, [1], True),  # DualCFG tags its middle conditioning
+    ("positive", {}, [2], False),                        # DualCFG positive
+    ("positive", {}, [0, 1], False),                     # slot lists cannot establish polarity
+])
+def test_missing_refs_follow_the_encoded_prompt_role(monkeypatch, beats, group, conditioning, slots, negative):
+    x, context, payload = _take(monkeypatch, beats=beats, with_layout=False)
+    prompts = payload.get("h3forge_prompt_segments")
+    constants = definitions("comfy/conds.py", ["CONDRegular", "CONDConstant"])["CONDConstant"]
+    encode = definitions("comfy/samplers.py", ["encode_model_conds"])["encode_model_conds"]
+    def native(**kw):
+        return {"minimax_payload": constants({}), "c_crossattn": constants(context)}
+
+    prepare = make_segmented_extra_conds(native, SimpleNamespace(get_dtype_inference=lambda: context.dtype),
+                                         SimpleNamespace(preprocess_text_embeds=lambda text: text))
+    row = {"model_conds": {}, **conditioning}
+    if prompts:
+        row.update(h3forge_prompt_segments=prompts, h3forge_prompt_segment_tags=(None,) * beats)
+    prepared = encode(prepare, [row], x[0], "cpu", group)[0]["model_conds"]["minimax_payload"].cond
+    spec = parse_beat_refs(" | ".join(["dragons"] * beats), MODS)
+    options = {**_options(spec), "cond_or_uncond": slots}
+    calls = []
+
+    def run(local_x, *args, **kw):
+        calls.append(True)
+        return local_x
+
+    forward = make_context_wrapper(ContextPolicy(25, 8, False))
+    if negative:
+        forward(_executor(run), x, torch.tensor([1000]), context, options, minimax_payload=prepared)
+        assert calls
+    else:
+        with pytest.raises(ValueError, match="received 0"):
+            forward(_executor(run), x, torch.tensor([1000]), context, options, minimax_payload=prepared)
+        assert not calls
