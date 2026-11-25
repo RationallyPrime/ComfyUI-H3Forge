@@ -192,12 +192,22 @@ def make_segmented_extra_conds(
     def extra_conds(**kwargs):
         out = base_extra_conds(**kwargs)
         segments = kwargs.get("h3forge_prompt_segments")
-        if not segments:
+        # ComfyUI supplies the role while preparing each conditioning, before a guider
+        # can reorder it or evaluate the negative conditioning in a separate forward.
+        negative = kwargs.get("prompt_type") == "negative"
+        if not segments and not negative:
             return out
 
         payload_cond = out.get("minimax_payload")
         if payload_cond is None or not isinstance(getattr(payload_cond, "cond", None), dict):
             raise ValueError("H3Forge pipe prompts require MiniMax-H3 conditioning")
+
+        payload = dict(payload_cond.cond)
+        if negative:
+            payload["h3forge_negative_prompt"] = True
+        if not segments:
+            out["minimax_payload"] = payload_cond._copy_with(payload)
+            return out
 
         device = kwargs["device"]
         dtype = base_model.get_dtype_inference()
@@ -206,7 +216,6 @@ def make_segmented_extra_conds(
         processed.extend(diffusion.preprocess_text_embeds(segment.to(device=device, dtype=dtype))
                          for segment in segments[1:])
 
-        payload = dict(payload_cond.cond)
         payload["h3forge_prompt_segments"] = tuple(processed)
         payload["h3forge_prompt_segment_tags"] = kwargs["h3forge_prompt_segment_tags"]
         # This full layout is a coordinate template only. Local calls contain

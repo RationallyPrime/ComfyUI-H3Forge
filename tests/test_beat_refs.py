@@ -5,10 +5,11 @@ import pytest
 import torch
 
 import fake_minimax
-from core_source import native_h3
+from core_source import definitions, native_h3
 from fake_minimax import PackedLayout
 from h3forge.beat_refs import BEAT_REFS_KEY, BeatRefs, beat_ref_keeps, filter_payload, parse_beat_refs
 from h3forge.context import ContextPolicy, make_context_wrapper
+from h3forge.prompt import make_segmented_extra_conds
 from test_nodes import FakePatcher, _import_nodes
 
 
@@ -348,18 +349,41 @@ def test_a_positive_window_pass_without_references_stops_before_any_window_runs(
             _executor(run), x, torch.tensor([1000]), context, _options(spec), minimax_payload=payload)
 
 
-def test_a_negative_window_pass_without_references_still_runs(monkeypatch):
-    x, context, payload = _take(monkeypatch)
-    payload = {**payload, "refs": None, "cond_video_latents": []}
-    payload.pop("layout")
-    spec = parse_beat_refs("dragons | lake", MODS)
-    options = {**_options(spec), "cond_or_uncond": [1]}
-    ran = []
+@pytest.mark.parametrize("beats", [1, 2])
+@pytest.mark.parametrize("group,conditioning,slots,negative", [
+    ("negative", {}, [1], True),                         # ordinary CFG
+    ("negative", {}, [0], True),                         # negative-only forward, DualCFG
+    ("middle", {"prompt_type": "negative"}, [1], True),  # DualCFG tags its middle conditioning
+    ("positive", {}, [2], False),                        # DualCFG positive
+    ("positive", {}, [0, 1], False),                     # slot lists cannot establish polarity
+])
+def test_missing_refs_follow_the_encoded_prompt_role(monkeypatch, beats, group, conditioning, slots, negative):
+    x, context, payload = _take(monkeypatch, beats=beats, with_layout=False)
+    prompts = payload.get("h3forge_prompt_segments")
+    constants = definitions("comfy/conds.py", ["CONDRegular", "CONDConstant"])["CONDConstant"]
+    encode = definitions("comfy/samplers.py", ["encode_model_conds"])["encode_model_conds"]
+    def native(**kw):
+        return {"minimax_payload": constants({}), "c_crossattn": constants(context)}
 
-    def run(local_x, timestep, text, opts, **kwargs):
-        ran.append(1)
+    prepare = make_segmented_extra_conds(native, SimpleNamespace(get_dtype_inference=lambda: context.dtype),
+                                         SimpleNamespace(preprocess_text_embeds=lambda text: text))
+    row = {"model_conds": {}, **conditioning}
+    if prompts:
+        row.update(h3forge_prompt_segments=prompts, h3forge_prompt_segment_tags=(None,) * beats)
+    prepared = encode(prepare, [row], x[0], "cpu", group)[0]["model_conds"]["minimax_payload"].cond
+    spec = parse_beat_refs(" | ".join(["dragons"] * beats), MODS)
+    options = {**_options(spec), "cond_or_uncond": slots}
+    calls = []
+
+    def run(local_x, *args, **kw):
+        calls.append(True)
         return local_x
 
-    make_context_wrapper(ContextPolicy(25, 8, False))(
-        _executor(run), x, torch.tensor([1000]), context, options, minimax_payload=payload)
-    assert ran
+    forward = make_context_wrapper(ContextPolicy(25, 8, False))
+    if negative:
+        forward(_executor(run), x, torch.tensor([1000]), context, options, minimax_payload=prepared)
+        assert calls
+    else:
+        with pytest.raises(ValueError, match="received 0"):
+            forward(_executor(run), x, torch.tensor([1000]), context, options, minimax_payload=prepared)
+        assert not calls
