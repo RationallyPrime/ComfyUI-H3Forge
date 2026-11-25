@@ -7,7 +7,7 @@ from itertools import groupby, pairwise
 import torch
 
 from .beat_refs import BEAT_REFS_KEY, beat_ref_keeps, filter_payload
-from .control import control_window
+from .control import BEAT_CONTROL_KEY, beat_control_scales, control_window, describe_beat_control
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
 from .state import require_eager_allocations, resolve_step
@@ -515,6 +515,9 @@ def make_context_wrapper(policy: ContextPolicy):
         ref_keeps = beat_ref_keeps(payload.get("refs"), beat_refs, len(prompts), positive=positive)
         if ref_keeps is not None and step == 0:
             print(f"{LOG} per-beat RefMods: {beat_refs.describe()}", flush=True)
+        control_scales = beat_control_scales(transformer_options.get(BEAT_CONTROL_KEY), len(prompts))
+        if control_scales is not None and step == 0:
+            print(f"{LOG} control per beat: {describe_beat_control(control_scales)}", flush=True)
         if total_t <= window and not segmented:
             if step == 0:
                 print(f"{LOG} context plan " + context_plan_summary(total_t, [0], window, 0,
@@ -522,6 +525,10 @@ def make_context_wrapper(policy: ContextPolicy):
             if ref_keeps is not None:
                 # The forward rebuilds the layout from the filtered references.
                 kwargs = {**kwargs, "minimax_payload": filter_payload(payload, ref_keeps[0])}
+            if control_scales is not None:
+                with control_window(executor, video_x.shape, (0, total_t), timestep, transformer_options,
+                                    scale=control_scales[0]):
+                    return executor(x, timestep, context, transformer_options, **kwargs)
             return executor(x, timestep, context, transformer_options, **kwargs)
 
         model = executor.class_obj
@@ -633,7 +640,8 @@ def make_context_wrapper(policy: ContextPolicy):
             previous_layout = transformer_options.get("h3forge_active_layout", sentinel)
             transformer_options["h3forge_active_layout"] = local_layout
             try:
-                with control_window(executor, video_x.shape, (v0, v1), timestep, transformer_options):
+                with control_window(executor, video_x.shape, (v0, v1), timestep, transformer_options,
+                                    scale=control_scales[index] if control_scales is not None else 1.0):
                     v_out, a_out = executor(local_x, timestep, local_context, transformer_options, **local_kwargs)
             except Exception as exc:
                 raise RuntimeError(f"{LOG} window [{v0},{v1}) prompt {index + 1} failed: {exc}") from exc
