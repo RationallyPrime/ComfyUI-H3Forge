@@ -126,6 +126,19 @@ This controls conditioning on the native latent grid. A frame-perfect editorial 
 
 Shared reference/keyframe payload **values** must match across segments. Per-segment text lengths and their text tags are retained; differing reference payloads fail visibly.
 
+#### Early text hand-over
+
+On `H3ForgePipePrompt` or `H3ForgeReferencePipePrompt`, choose `text_handover=reencode` or `token_reuse` and connect the conditioning to a model patched by either Forge context-window node. The default is `off`. `handover_steps` defaults to 16. On a 30-step schedule the incoming windows use their alternate context at steps 0–15 and their native context from step 16. A zero step count and a single beat both use the ordinary encoding.
+
+The source is the last sentence of the outgoing beat's `integrated_multimodal_description` or `detailed_description`, or its plain prose. No author marker is needed. Shared sections and trailing sound or music fields stay outside the selection. A period, question mark or exclamation mark followed by whitespace starts the next sentence. The corresponding full-width punctuation also works without a space. Native `<d>…</d>` dialogue stays together. For an unambiguous cue, end the description with a simple sentence and spell out abbreviations that contain a period followed by a space.
+
+- `reencode` inserts the sentence at the start of the incoming description, after its leading `[Shot N]` label if present. Qwen encodes the full edited incoming beat with the same shared sections and reference presentation.
+- `token_reuse` appends the selected raw, contextual Qwen rows to the incoming native caption sequence. Forge checks that the selected IDs decode to the authored sentence, allowing surrounding whitespace carried by a boundary token. A token that also contains a neighbour's words raises an error. The incoming caption and appended rows go through H3's text refiner together.
+
+Reference images, videos and voice inputs are prepared once. Each window keeps the RefMods and audio interval of its assigned beat. Both audio and video predictions see the selected joint text conditioning, including inline dialogue if it is the ending. The early variants keep the native positions of references and targets. Extra incoming text beyond the native prompt budget extends left along the temporal RoPE axis.
+
+For a single sampling call, Forge reads the sampler's sigma schedule. For cockpit frozen replay or a split sampler, connect the original, unsplit `SIGMAS` to `handover_sigmas` on the prompt node. The switch uses the original boundary sigma, including when a tail starts at local step zero. Both modes add one true-length refiner call per later beat per conditioning preparation. Re-encoding also adds one Qwen forward per later beat. Window denoiser call counts stay the same, with more caption rows in early incoming calls.
+
 Use it with `H3 Forge — Chained A/V Context Windows` and an `Empty MiniMax H3 AV Latent`. A single segment is valid and behaves like ordinary global conditioning. Escape a literal pipe as `\|`.
 
 Every segment is encoded independently. Write each local segment as a self-contained, valid H3 prompt in MiniMax's official structured format (`integrated_multimodal_description` / `overall_soundscape` / `non_diegetic_music`). Put concrete identity, wardrobe, location, lighting, voice, and style anchors in `global_prompt`, or repeat them manually when they change between segments. Do not rely on cross-segment shorthand such as “same person”, “continues”, or “remains unchanged”; the local segment encoder cannot see a previous segment. For ordinary 5–15 second work, MiniMax's native `[Shot N] At ...` timing syntax inside one prompt may make pipe prompting unnecessary; pipe scheduling earns its keep on the long-form context-window path where separate local forwards really do need different prompt contexts.

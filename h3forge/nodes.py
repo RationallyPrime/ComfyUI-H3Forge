@@ -17,6 +17,7 @@ from .context import (
     make_freenoise_wrapper,
 )
 from .layout import padded_spatial_shape
+from .handover import DEFAULT_HANDOVER_STEPS, TEXT_HANDOVER_MODES, prepare_text_handover
 from .nag import NAG_MODES, NAGConfig
 from . import renoise
 from .prompt import (
@@ -490,6 +491,18 @@ class H3ForgeTimelineContextWindows:
         return (patched, latent)
 
 
+def _text_handover_inputs():
+    return {
+        "text_handover": (list(TEXT_HANDOVER_MODES), {"default": "off", "tooltip":
+            "Early incoming conditioning from the previous beat's final visual sentence. Re-encode it "
+            "with the incoming beat, or append its original contextual Qwen rows."}),
+        "handover_steps": ("INT", {"default": DEFAULT_HANDOVER_STEPS, "min": 0, "max": 10000,
+                                  "tooltip": "Number of early sampler steps. Zero disables the hand-over."}),
+        "handover_sigmas": ("SIGMAS", {"tooltip": "Full original schedule before frozen or split sampling. "
+                                                  "A single sampler call uses its own schedule."}),
+    }
+
+
 class H3ForgePipePrompt:
     @classmethod
     def INPUT_TYPES(cls):
@@ -517,6 +530,7 @@ class H3ForgePipePrompt:
                         "inside <|...|> is never split whatever you choose."
                     ),
                 }),
+                **_text_handover_inputs(),
             },
         }
 
@@ -532,9 +546,11 @@ class H3ForgePipePrompt:
         "MiniMax's own <|cutoff|>-style tokens are never split."
     )
 
-    def encode(self, clip, prompt, global_prompt="", segment_durations="", delimiter="|"):
+    def encode(self, clip, prompt, global_prompt="", segment_durations="", delimiter="|", text_handover="off",
+               handover_steps=DEFAULT_HANDOVER_STEPS, handover_sigmas=None):
         try:
-            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations, delimiter),)
+            return (encode_pipe_prompt(clip, prompt, global_prompt, segment_durations, delimiter,
+                                       text_handover, handover_steps, handover_sigmas),)
         except ValueError as exc:
             raise ValueError(f"{LOG} {exc}") from exc
 
@@ -551,6 +567,7 @@ class H3ForgeReferencePipePrompt:
         }
         for _, prefix, kind, count in REFERENCE_INPUTS:
             optional.update({f"{prefix}_{i}": (kind,) for i in range(1, count + 1)})
+        optional.update(_text_handover_inputs())
         return {"required": {
             "clip": ("CLIP",),
             "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
@@ -571,12 +588,13 @@ class H3ForgeReferencePipePrompt:
     )
 
     def encode(self, clip, prompt, width, height, length, ref_image_size="match", vae=None, audio_vae=None,
-               global_prompt="", segment_durations="", delimiter="|", **references):
+               global_prompt="", segment_durations="", delimiter="|", text_handover="off",
+               handover_steps=DEFAULT_HANDOVER_STEPS, handover_sigmas=None, **references):
         from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
-        texts = split_pipe_prompt(prompt, delimiter)
-        durations = parse_segment_durations(segment_durations, len(texts))
-        texts = compose_segment_prompts(texts, global_prompt)
+        beats = split_pipe_prompt(prompt, delimiter)
+        durations = parse_segment_durations(segment_durations, len(beats))
+        texts = compose_segment_prompts(beats, global_prompt)
         groups = {}
         for name, prefix, _, count in REFERENCE_INPUTS:
             groups[name] = {f"{prefix}_{i}": references[f"{prefix}_{i}"] for i in range(1, count + 1)
@@ -608,7 +626,10 @@ class H3ForgeReferencePipePrompt:
             if shared_refs is not None:
                 conditioning = [[c, {**meta, "minimax_refs": shared_refs}] for c, meta in conditioning]
             conditionings.append(conditioning)
-        return combine_conditioning_segments(conditionings, durations), latent
+        conditioning = prepare_text_handover(
+            clip, beats, texts, combine_conditioning_segments(conditionings, durations),
+            lambda text: clip.tokenize(text, **presentation), text_handover, handover_steps, handover_sigmas)
+        return conditioning, latent
 
 
 RENOISE_PLAN = "H3FORGE_RENOISE"

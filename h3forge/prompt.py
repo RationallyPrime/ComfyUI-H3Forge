@@ -8,6 +8,8 @@ from fractions import Fraction
 
 import torch
 
+from .handover import DEFAULT_HANDOVER_STEPS, HANDOVER_KEY, prepare_text_handover
+
 
 DEFAULT_SEGMENT_DELIMITER = "|"
 _TOKEN_OPEN = "<|"
@@ -213,11 +215,15 @@ def make_segmented_extra_conds(
         dtype = base_model.get_dtype_inference()
         # Native extra_conds already refined the primary, at its real length.
         processed = [out["c_crossattn"].cond]
-        processed.extend(diffusion.preprocess_text_embeds(segment.to(device=device, dtype=dtype))
-                         for segment in segments[1:])
+
+        def refine(segment):
+            return diffusion.preprocess_text_embeds(segment.to(device=device, dtype=dtype))
+
+        processed.extend(refine(segment) for segment in segments[1:])
 
         payload["h3forge_prompt_segments"] = tuple(processed)
         payload["h3forge_prompt_segment_tags"] = kwargs["h3forge_prompt_segment_tags"]
+
         # This full layout is a coordinate template only. Local calls contain
         # each segment's real tokens, with refs/targets at one common origin.
         layout = payload.get("layout")
@@ -225,6 +231,14 @@ def make_segmented_extra_conds(
             from comfy.ldm.minimax.model import PackedLayout
             payload["layout"] = PackedLayout(max(c.shape[1] for c in processed), *layout.signature[1:],
                                               keyframes=payload.get("keyframes"), refs=payload.get("refs"))
+        handover = kwargs.get(HANDOVER_KEY)
+        if handover is not None:
+            early = (processed[0], *(refine(segment) for segment in handover["segments"]))
+            payload[HANDOVER_KEY] = {**handover, "segments": early,
+                                     "tags": (payload["h3forge_prompt_segment_tags"][0], *handover["tags"])}
+            print(f"[H3Forge] text_handover={handover['mode']} incoming raw_rows="
+                  f"{[s.shape[1] for s in handover['segments']]} refined_rows={[s.shape[1] for s in early[1:]]}",
+                  flush=True)
         durations = kwargs.get("h3forge_prompt_segment_durations")
         if durations is not None:
             payload["h3forge_prompt_segment_durations"] = tuple(
@@ -295,13 +309,17 @@ def encode_pipe_prompt(
     global_prompt: str = "",
     segment_durations: str = "",
     delimiter: str = DEFAULT_SEGMENT_DELIMITER,
+    text_handover: str = "off",
+    handover_steps: int = DEFAULT_HANDOVER_STEPS,
+    handover_sigmas=None,
 ):
     """Encode each text-only timeline segment and return one annotated conditioning."""
-    texts = split_pipe_prompt(prompt, delimiter)
-    durations = parse_segment_durations(segment_durations, len(texts))
-    texts = compose_segment_prompts(texts, global_prompt)
+    beats = split_pipe_prompt(prompt, delimiter)
+    durations = parse_segment_durations(segment_durations, len(beats))
+    texts = compose_segment_prompts(beats, global_prompt)
     conditionings = [
         clip.encode_from_tokens_scheduled(clip.tokenize(text))
         for text in texts
     ]
-    return combine_conditioning_segments(conditionings, durations)
+    return prepare_text_handover(clip, beats, texts, combine_conditioning_segments(conditionings, durations),
+                                 clip.tokenize, text_handover, handover_steps, handover_sigmas)

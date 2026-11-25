@@ -8,9 +8,10 @@ import torch
 
 from .beat_refs import BEAT_REFS_KEY, beat_ref_keeps, filter_payload
 from .control import control_window
+from .handover import HANDOVER_KEY, handover_cutoff
 from .layout import audio_range_for_video_window, audio_window_length, clone_window_layout, padded_spatial_shape
 from .prompt import segment_ranges
-from .state import require_eager_allocations, resolve_step
+from .state import require_eager_allocations, resolve_sigma, resolve_step
 
 LOG = "[H3Forge]"
 _LATENT_CADENCE = 5
@@ -504,10 +505,24 @@ def make_context_wrapper(policy: ContextPolicy):
         video_x, audio_x = x
         total_t, audio_t = int(video_x.shape[2]), int(audio_x.shape[-1])
         payload = kwargs.get("minimax_payload") or {}
-        prompts = payload.get("h3forge_prompt_segments") or (context,)
+        native_prompts = payload.get("h3forge_prompt_segments") or (context,)
+        prompts = native_prompts
         tags = payload.get("h3forge_prompt_segment_tags")
         segmented = len(prompts) > 1
-        step, _ = resolve_step(transformer_options)
+        handover = payload.get(HANDOVER_KEY)
+        sigma = resolve_sigma(transformer_options) if handover is not None else None
+        step, _ = resolve_step(transformer_options, sigma)
+        if handover is not None:
+            if sigma is None:
+                raise ValueError("text hand-over needs the current sampler sigma in transformer_options")
+            cutoff = handover_cutoff(handover, transformer_options)
+            early = sigma > cutoff
+            if early:
+                prompts, tags = handover["segments"], handover["tags"]
+            if step == 0 or sigma == cutoff:
+                print(f"{LOG} text_handover={handover['mode']} phase={'early' if early else 'native'} "
+                      f"steps={handover['steps']} sigma={sigma:.7g} switch_sigma={cutoff:.7g} "
+                      f"selected_rows={[p.shape[1] for p in prompts]}", flush=True)
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         beat_refs = transformer_options.get(BEAT_REFS_KEY)
@@ -529,7 +544,7 @@ def make_context_wrapper(policy: ContextPolicy):
         full_layout = payload.get("layout")
         if full_layout is None:
             from comfy.ldm.minimax.model import PackedLayout
-            full_layout = PackedLayout(max(c.shape[1] for c in prompts), total_t, padded_h, padded_w,
+            full_layout = PackedLayout(max(c.shape[1] for c in native_prompts), total_t, padded_h, padded_w,
                                        audio_t, keyframes=payload.get("keyframes"), refs=payload.get("refs"))
         frame_cuts = None
         ranges = []
@@ -606,6 +621,11 @@ def make_context_wrapper(policy: ContextPolicy):
                 video_shape=(v1 - v0, padded_h, padded_w), audio_t=audio_t,
                 video_range=(v0, v1), audio_range=(in_a0, in_a1),
                 keyframes=payload.get("keyframes"), refs=payload.get("refs"), ref_keep=ref_keep)
+            if handover is not None and local_context.shape[1] > full_layout.signature[0]:
+                # Fit the longer caption before the native reference/target origin. Translating
+                # its temporal RoPE coordinates left keeps every shared row and beat one fixed.
+                text_len = local_context.shape[1]
+                local_layout.position_ids[:text_len, 0] -= text_len - full_layout.signature[0]
             local_payload = {**(payload if ref_keep is None else filter_payload(payload, ref_keep)),
                              "layout": local_layout}
             if tags is not None:

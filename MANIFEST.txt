@@ -12,6 +12,7 @@
 ./h3forge/beat_refs.py
 ./h3forge/context.py
 ./h3forge/control.py
+./h3forge/handover.py
 ./h3forge/layout.py
 ./h3forge/nag.py
 ./h3forge/nodes.py
@@ -26,6 +27,7 @@
 ./tests/test_attention_math.py
 ./tests/test_beat_refs.py
 ./tests/test_context_math.py
+./tests/test_handover.py
 ./tests/test_layout_windows.py
 ./tests/test_nag.py
 ./tests/test_nodes.py
