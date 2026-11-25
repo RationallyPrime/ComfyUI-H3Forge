@@ -18,6 +18,15 @@ replaces, so it fails loudly on a different version. Back the two files up first
 | `seam_metrics.py`, `m3.sh` | Overlap sharpness, flicker and largest frame-to-frame difference per take. |
 | `p11.py`, `p12.py`, `p21.py` | The prompt texts that removed the hand-over jump without any of the above. |
 
+## Reading the seam measures
+
+For each span of a 24 fps take, `flick` measures shimmer across the whole frame with a pixel median.
+A moving foreground figure can jump while that median stays zero. `local_peak` finds the largest
+mean absolute change between consecutive frames in any 32 × 32 tile of the 544 × 960 analysis
+image, then takes the maximum across the span. It prints the later frame (zero-based) and its time
+in seconds. Values range from 0 to 255 in grayscale levels. Inspect the frame on either side of
+the peak to distinguish a seam jump from intended motion or a cut.
+
 ## What was learned
 
 With one-way handoff (lead 0.5, the default since #27) a take can still jump by one frame at
