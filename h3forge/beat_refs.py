@@ -97,17 +97,26 @@ def parse_beat_refs(text: str, mods) -> BeatRefs | None:
     return BeatRefs(names=names, shapes=tuple(mod_shape(mod) for mod in mods), beats=tuple(beats))
 
 
-def beat_ref_keeps(refs, spec: BeatRefs | None, beat_count: int):
+def beat_ref_keeps(refs, spec: BeatRefs | None, beat_count: int, *, positive: bool = True):
     """Per-beat keep lists over ``refs``, or ``None`` when nothing is filtered.
+
+    With a spec set, a positive pass must receive the bridge's RefMod blocks:
+    none arriving raises instead of sampling as a reference-free baseline. A
+    negative (unconditional) pass carries no references and passes through.
 
     Each entry is ``None`` (the beat sees every reference) or the ascending
     positions in ``refs`` that beat keeps.
     """
-    if spec is None or not refs:
+    if spec is None:
         return None
-    marked = [i for i, block in enumerate(refs) if isinstance(block, dict) and block.get("refmod")]
+    marked = [i for i, block in enumerate(refs or ()) if isinstance(block, dict) and block.get("refmod")]
     if not marked:
-        return None
+        if not positive:
+            return None
+        raise ValueError(
+            f"{LOG} per-beat RefMods were set up for {len(spec.names)} reference(s) but the sampler received 0. "
+            "Without them this take would run as a reference-free baseline. Connect the same 'mods' the RefMod "
+            "bridge uses, keep the bridge enabled with its retention above 0 and leave its scramble_seed at -1.")
     if len(marked) != len(spec.names):
         raise ValueError(
             f"{LOG} per-beat RefMods were set up for {len(spec.names)} reference(s) but the sampler received "

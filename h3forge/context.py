@@ -511,7 +511,9 @@ def make_context_wrapper(policy: ContextPolicy):
         window = min(total_t, policy.window_frames)
         overlap = min(policy.overlap_frames, window - 1) if total_t > window else 0
         beat_refs = transformer_options.get(BEAT_REFS_KEY)
-        ref_keeps = beat_ref_keeps(payload.get("refs"), beat_refs, len(prompts))
+        # ComfyUI marks unconditional forwards with a nonzero flag; they carry no references by design.
+        positive = not any(flag != 0 for flag in (transformer_options.get("cond_or_uncond") or ()))
+        ref_keeps = beat_ref_keeps(payload.get("refs"), beat_refs, len(prompts), positive=positive)
         if ref_keeps is not None and step == 0:
             print(f"{LOG} per-beat RefMods: {beat_refs.describe()}", flush=True)
         if total_t <= window and not segmented:
